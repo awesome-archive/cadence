@@ -33,22 +33,8 @@ func TestCassandraHistoryV2Persistence(t *testing.T) {
 	suite.Run(t, s)
 }
 
-func TestCassandraHistoryPersistence(t *testing.T) {
-	s := new(HistoryPersistenceSuite)
-	s.TestBase = NewTestBaseWithCassandra(&TestBaseOptions{})
-	s.TestBase.Setup()
-	suite.Run(t, s)
-}
-
 func TestCassandraMatchingPersistence(t *testing.T) {
 	s := new(MatchingPersistenceSuite)
-	s.TestBase = NewTestBaseWithCassandra(&TestBaseOptions{})
-	s.TestBase.Setup()
-	suite.Run(t, s)
-}
-
-func TestCassandraMetadataPersistence(t *testing.T) {
-	s := new(MetadataPersistenceSuite)
 	s.TestBase = NewTestBaseWithCassandra(&TestBaseOptions{})
 	s.TestBase.Setup()
 	suite.Run(t, s)
@@ -84,6 +70,13 @@ func TestCassandraExecutionManager(t *testing.T) {
 
 func TestCassandraExecutionManagerWithEventsV2(t *testing.T) {
 	s := new(ExecutionManagerSuiteForEventsV2)
+	s.TestBase = NewTestBaseWithCassandra(&TestBaseOptions{})
+	s.TestBase.Setup()
+	suite.Run(t, s)
+}
+
+func TestQueuePersistence(t *testing.T) {
+	s := new(QueuePersistenceSuite)
 	s.TestBase = NewTestBaseWithCassandra(&TestBaseOptions{})
 	s.TestBase.Setup()
 	suite.Run(t, s)

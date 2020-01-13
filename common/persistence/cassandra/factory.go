@@ -23,7 +23,12 @@ package cassandra
 import (
 	"sync"
 
+	"github.com/uber/cadence/common/cassandra"
+
+	"github.com/uber/cadence/common"
+
 	"github.com/gocql/gocql"
+
 	"github.com/uber/cadence/common/log"
 	p "github.com/uber/cadence/common/persistence"
 	"github.com/uber/cadence/common/service/config"
@@ -64,28 +69,13 @@ func (f *Factory) NewShardStore() (p.ShardStore, error) {
 	return newShardPersistence(f.cfg, f.clusterName, f.logger)
 }
 
-// NewHistoryStore returns a new history store
-func (f *Factory) NewHistoryStore() (p.HistoryStore, error) {
-	return newHistoryPersistence(f.cfg, f.logger)
-}
-
 // NewHistoryV2Store returns a new history store
-func (f *Factory) NewHistoryV2Store() (p.HistoryV2Store, error) {
+func (f *Factory) NewHistoryV2Store() (p.HistoryStore, error) {
 	return newHistoryV2Persistence(f.cfg, f.logger)
 }
 
-// NewMetadataStore returns a new metadata store
+// NewMetadataStore returns a metadata store that understands only v2
 func (f *Factory) NewMetadataStore() (p.MetadataStore, error) {
-	return newMetadataManagerProxy(f.cfg, f.clusterName, f.logger)
-}
-
-// NewMetadataStoreV1 returns a metadatastore that understands only v1
-func (f *Factory) NewMetadataStoreV1() (p.MetadataStore, error) {
-	return newMetadataPersistence(f.cfg, f.clusterName, f.logger)
-}
-
-// NewMetadataStoreV2 returns a metadatastore that understands only v2
-func (f *Factory) NewMetadataStoreV2() (p.MetadataStore, error) {
 	return newMetadataPersistenceV2(f.cfg, f.clusterName, f.logger)
 }
 
@@ -101,6 +91,11 @@ func (f *Factory) NewExecutionStore(shardID int) (p.ExecutionStore, error) {
 // NewVisibilityStore returns a visibility store
 func (f *Factory) NewVisibilityStore() (p.VisibilityStore, error) {
 	return newVisibilityPersistence(f.cfg, f.logger)
+}
+
+// NewQueue returns a new queue backed by cassandra
+func (f *Factory) NewQueue(queueType common.QueueType) (p.Queue, error) {
+	return newQueue(f.cfg, f.logger, queueType)
 }
 
 // Close closes the factory
@@ -135,15 +130,11 @@ func (f *Factory) executionStoreFactory() (*executionStoreFactory, error) {
 
 // newExecutionStoreFactory is used to create an instance of ExecutionStoreFactory implementation
 func newExecutionStoreFactory(cfg config.Cassandra, logger log.Logger) (*executionStoreFactory, error) {
-	cluster := NewCassandraCluster(cfg.Hosts, cfg.Port, cfg.User, cfg.Password, cfg.Datacenter)
-	cluster.Keyspace = cfg.Keyspace
+	cluster := cassandra.NewCassandraCluster(cfg)
 	cluster.ProtoVersion = cassandraProtoVersion
 	cluster.Consistency = gocql.LocalQuorum
 	cluster.SerialConsistency = gocql.LocalSerial
 	cluster.Timeout = defaultSessionTimeout
-	if cfg.MaxConns > 0 {
-		cluster.NumConns = cfg.MaxConns
-	}
 	session, err := cluster.CreateSession()
 	if err != nil {
 		return nil, err

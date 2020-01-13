@@ -23,209 +23,125 @@
 package history
 
 import (
-	"errors"
-	"sync"
+	"sync/atomic"
 
 	"github.com/pborman/uuid"
+
 	"github.com/uber/cadence/.gen/go/shared"
 )
 
+const (
+	queryTerminationTypeCompleted queryTerminationType = iota
+	queryTerminationTypeUnblocked
+	queryTerminationTypeFailed
+)
+
 var (
-	// ErrAlreadyTerminal indicates event cannot be applied to query because query is already in terminal state.
-	ErrAlreadyTerminal = errors.New("query has already reached terminal state cannot post any new events")
-	// ErrInvalidEvent indicates event cannot be applied to query in state.
-	ErrInvalidEvent = errors.New("event cannot be applied to query in state")
-	// ErrResultAlreadyRecorded indicates query cannot make state transition because result has already been recorded.
-	ErrResultAlreadyRecorded = errors.New("result already recorded cannot make state transition")
-	// ErrFailedToInvokeQueryRegistryCallback indicates that notifying query registry of its state transition failed.
-	ErrFailedToInvokeQueryRegistryCallback = errors.New("notifying query registry of state transition failed")
-)
-
-const (
-	// QueryStateBuffered indicates query is ready to be dispatched to worker.
-	QueryStateBuffered QueryState = iota
-	// QueryStateStarted indicates query has been dispatched to worker but query is not yet ready to return to caller.
-	QueryStateStarted
-	// QueryStateCompleted indicates query has been completed, this means result has been recorded and any
-	// dependent history events have been persisted.
-	QueryStateCompleted
-	// QueryStateExpired means the query expired.
-	QueryStateExpired
-)
-
-const (
-	// QueryEventRebuffer event to move query from started back to buffered.
-	QueryEventRebuffer QueryEvent = iota
-	// QueryEventStart event to move query from buffered to started.
-	QueryEventStart
-	// QueryEventRecordResult event to record a query result, this may result in query entering complete state.
-	QueryEventRecordResult
-	// QueryEventPersistenceConditionSatisfied event to record that dependent history events have been persisted.
-	QueryEventPersistenceConditionSatisfied
-	// QueryEventExpire event to move query from buffered or started to expired.
-	QueryEventExpire
+	errTerminationStateInvalid = &shared.InternalServiceError{Message: "query termination state invalid"}
+	errAlreadyInTerminalState  = &shared.InternalServiceError{Message: "query already in terminal state"}
+	errQueryNotInTerminalState = &shared.InternalServiceError{Message: "query not in terminal state"}
 )
 
 type (
-	// QueryState represents the state of the query.
-	QueryState int
+	queryTerminationType int
 
-	// QueryEvent represents an event that can be posted to a query potentially updating the state that it is in.
-	QueryEvent int
-
-	// Query represents a query state machine.
-	Query interface {
-		ID() string
-		QueryInput() *shared.WorkflowQuery
-		QueryResult() *shared.WorkflowQueryResult
-		State() QueryState
-		TerminationCh() <-chan struct{}
-
-		RecordEvent(QueryEvent, *shared.WorkflowQueryResult) (bool, error)
+	query interface {
+		getQueryID() string
+		getQueryTermCh() <-chan struct{}
+		getQueryInput() *shared.WorkflowQuery
+		getTerminationState() (*queryTerminationState, error)
+		setTerminationState(*queryTerminationState) error
 	}
 
-	query struct {
-		sync.RWMutex
+	queryImpl struct {
+		id         string
+		queryInput *shared.WorkflowQuery
+		termCh     chan struct{}
 
-		id                            string
-		queryInput                    *shared.WorkflowQuery
-		queryResult                   *shared.WorkflowQueryResult
-		persistenceConditionSatisfied bool
-		termCh                        chan struct{}
-		state                         QueryState
+		terminationState atomic.Value
+	}
 
-		bufferedToStartedCallback func(string) error
-		startedToBufferedCallback func(string) error
-		terminalStateCallback     func(string)
+	queryTerminationState struct {
+		queryTerminationType queryTerminationType
+		queryResult          *shared.WorkflowQueryResult
+		failure              error
 	}
 )
 
-// newQuery is used to construct a new Query. Query should always be constructed
-// by calling QueryRegistry.BufferQuery, queries constructed directly by calling this method
-// will no be accessible through query registry and are therefore not useful.
-func newQuery(
-	queryInput *shared.WorkflowQuery,
-	bufferedToStartedCallback func(string) error,
-	startedToBufferedCallback func(string) error,
-	terminalStateCallback func(string),
-) Query {
-	return &query{
-		id:                            uuid.New(),
-		queryInput:                    queryInput,
-		queryResult:                   nil,
-		persistenceConditionSatisfied: false,
-		termCh:                        make(chan struct{}),
-		state:                         QueryStateBuffered,
-
-		bufferedToStartedCallback: bufferedToStartedCallback,
-		startedToBufferedCallback: startedToBufferedCallback,
-		terminalStateCallback:     terminalStateCallback,
+func newQuery(queryInput *shared.WorkflowQuery) query {
+	return &queryImpl{
+		id:         uuid.New(),
+		queryInput: queryInput,
+		termCh:     make(chan struct{}),
 	}
 }
 
-// Id returns the unique identifier for this query.
-func (q *query) ID() string {
+func (q *queryImpl) getQueryID() string {
 	return q.id
 }
 
-// QueryInput returns the query input.
-func (q *query) QueryInput() *shared.WorkflowQuery {
-	return q.queryInput
-}
-
-// QueryResult returns the query result.
-// This will be nil if a result has not already been recorded for this query.
-// A query having a result does not mean the query is ready to unblock, use TerminationCh to know when query has entered terminal state.
-func (q *query) QueryResult() *shared.WorkflowQueryResult {
-	q.RLock()
-	defer q.RUnlock()
-
-	return q.queryResult
-}
-
-// State returns the state of the query.
-func (q *query) State() QueryState {
-	q.RLock()
-	defer q.RUnlock()
-
-	return q.state
-}
-
-// TerminationCh returns a channel that is closed once query enters terminal state.
-func (q *query) TerminationCh() <-chan struct{} {
+func (q *queryImpl) getQueryTermCh() <-chan struct{} {
 	return q.termCh
 }
 
-// RecordEvent records an event against query.
-// Returns an error if event could not be applied.
-// Returns true if state transitions, otherwise false.
-// QueryResult can only be specified if event is QueryEventRecordResult.
-// After a result is recorded it cannot be rerecorded and QueryEventRebuffer cannot be applied.
-func (q *query) RecordEvent(event QueryEvent, queryResult *shared.WorkflowQueryResult) (bool, error) {
-	q.Lock()
-	defer q.Unlock()
-
-	if q.state == QueryStateCompleted || q.state == QueryStateExpired {
-		return false, ErrAlreadyTerminal
-	}
-
-	if event != QueryEventRecordResult && queryResult != nil {
-		return false, ErrInvalidEvent
-	}
-
-	switch event {
-	case QueryEventRebuffer:
-		if q.state != QueryStateStarted {
-			return false, ErrInvalidEvent
-		}
-		if q.queryResult != nil {
-			return false, ErrResultAlreadyRecorded
-		}
-		if err := q.startedToBufferedCallback(q.id); err != nil {
-			return false, ErrFailedToInvokeQueryRegistryCallback
-		}
-		q.state = QueryStateBuffered
-		return true, nil
-	case QueryEventStart:
-		if q.state != QueryStateBuffered {
-			return false, ErrInvalidEvent
-		}
-		if err := q.bufferedToStartedCallback(q.id); err != nil {
-			return false, ErrFailedToInvokeQueryRegistryCallback
-		}
-		q.state = QueryStateStarted
-		return true, nil
-	case QueryEventRecordResult:
-		if q.state != QueryStateStarted {
-			return false, ErrInvalidEvent
-		}
-		if queryResult == nil {
-			return false, ErrInvalidEvent
-		}
-		if q.queryResult != nil {
-			return false, ErrResultAlreadyRecorded
-		}
-		q.queryResult = queryResult
-		return q.handleComplete(), nil
-	case QueryEventPersistenceConditionSatisfied:
-		q.persistenceConditionSatisfied = true
-		return q.handleComplete(), nil
-	case QueryEventExpire:
-		q.terminalStateCallback(q.id)
-		q.state = QueryStateExpired
-		close(q.termCh)
-		return true, nil
-	default:
-		return false, ErrInvalidEvent
-	}
+func (q *queryImpl) getQueryInput() *shared.WorkflowQuery {
+	return q.queryInput
 }
 
-func (q *query) handleComplete() bool {
-	if q.queryResult == nil || !q.persistenceConditionSatisfied {
-		return false
+func (q *queryImpl) getTerminationState() (*queryTerminationState, error) {
+	ts := q.terminationState.Load()
+	if ts == nil {
+		return nil, errQueryNotInTerminalState
 	}
-	q.terminalStateCallback(q.id)
-	q.state = QueryStateCompleted
+	return ts.(*queryTerminationState), nil
+}
+
+func (q *queryImpl) setTerminationState(terminationState *queryTerminationState) error {
+	if err := q.validateTerminationState(terminationState); err != nil {
+		return err
+	}
+	currTerminationState, _ := q.getTerminationState()
+	if currTerminationState != nil {
+		return errAlreadyInTerminalState
+	}
+	q.terminationState.Store(terminationState)
 	close(q.termCh)
-	return true
+	return nil
+}
+
+func (q *queryImpl) validateTerminationState(
+	terminationState *queryTerminationState,
+) error {
+	if terminationState == nil {
+		return errTerminationStateInvalid
+	}
+	switch terminationState.queryTerminationType {
+	case queryTerminationTypeCompleted:
+		if terminationState.queryResult == nil || terminationState.failure != nil {
+			return errTerminationStateInvalid
+		}
+		queryResult := terminationState.queryResult
+		validAnswered := queryResult.GetResultType().Equals(shared.QueryResultTypeAnswered) &&
+			queryResult.Answer != nil &&
+			queryResult.ErrorMessage == nil
+		validFailed := queryResult.GetResultType().Equals(shared.QueryResultTypeFailed) &&
+			queryResult.Answer == nil &&
+			queryResult.ErrorMessage != nil
+		if !validAnswered && !validFailed {
+			return errTerminationStateInvalid
+		}
+		return nil
+	case queryTerminationTypeUnblocked:
+		if terminationState.queryResult != nil || terminationState.failure != nil {
+			return errTerminationStateInvalid
+		}
+		return nil
+	case queryTerminationTypeFailed:
+		if terminationState.queryResult != nil || terminationState.failure == nil {
+			return errTerminationStateInvalid
+		}
+		return nil
+	default:
+		return errTerminationStateInvalid
+	}
 }

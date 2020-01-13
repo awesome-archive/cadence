@@ -18,6 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -copyright_file ../../LICENSE -package $GOPACKAGE -source $GOFILE -destination mutableState_mock.go
+
 package history
 
 import (
@@ -26,6 +28,7 @@ import (
 	h "github.com/uber/cadence/.gen/go/history"
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/definition"
 	"github.com/uber/cadence/common/persistence"
 )
 
@@ -67,9 +70,9 @@ type (
 		AddChildWorkflowExecutionTerminatedEvent(int64, *workflow.WorkflowExecution, *workflow.WorkflowExecutionTerminatedEventAttributes) (*workflow.HistoryEvent, error)
 		AddChildWorkflowExecutionTimedOutEvent(int64, *workflow.WorkflowExecution, *workflow.WorkflowExecutionTimedOutEventAttributes) (*workflow.HistoryEvent, error)
 		AddCompletedWorkflowEvent(int64, *workflow.CompleteWorkflowExecutionDecisionAttributes) (*workflow.HistoryEvent, error)
-		AddContinueAsNewEvent(int64, int64, *cache.DomainCacheEntry, string, *workflow.ContinueAsNewWorkflowExecutionDecisionAttributes, int32) (*workflow.HistoryEvent, mutableState, error)
+		AddContinueAsNewEvent(int64, int64, string, *workflow.ContinueAsNewWorkflowExecutionDecisionAttributes) (*workflow.HistoryEvent, mutableState, error)
 		AddDecisionTaskCompletedEvent(int64, int64, *workflow.RespondDecisionTaskCompletedRequest, int) (*workflow.HistoryEvent, error)
-		AddDecisionTaskFailedEvent(scheduleEventID int64, startedEventID int64, cause workflow.DecisionTaskFailedCause, details []byte, identity, reason, baseRunID, newRunID string, forkEventVersion int64) (*workflow.HistoryEvent, error)
+		AddDecisionTaskFailedEvent(scheduleEventID int64, startedEventID int64, cause workflow.DecisionTaskFailedCause, details []byte, identity, reason, binChecksum, baseRunID, newRunID string, forkEventVersion int64) (*workflow.HistoryEvent, error)
 		AddDecisionTaskScheduleToStartTimeoutEvent(int64) (*workflow.HistoryEvent, error)
 		AddFirstDecisionTaskScheduled(*workflow.HistoryEvent) error
 		AddDecisionTaskScheduledEvent(bypassTaskGeneration bool) (*decisionInfo, error)
@@ -88,16 +91,16 @@ type (
 		AddSignalRequested(requestID string)
 		AddStartChildWorkflowExecutionFailedEvent(int64, workflow.ChildWorkflowExecutionFailedCause, *workflow.StartChildWorkflowExecutionInitiatedEventAttributes) (*workflow.HistoryEvent, error)
 		AddStartChildWorkflowExecutionInitiatedEvent(int64, string, *workflow.StartChildWorkflowExecutionDecisionAttributes) (*workflow.HistoryEvent, *persistence.ChildExecutionInfo, error)
-		AddTimeoutWorkflowEvent() (*workflow.HistoryEvent, error)
+		AddTimeoutWorkflowEvent(int64) (*workflow.HistoryEvent, error)
 		AddTimerCanceledEvent(int64, *workflow.CancelTimerDecisionAttributes, string) (*workflow.HistoryEvent, error)
-		AddTimerFiredEvent(int64, string) (*workflow.HistoryEvent, error)
+		AddTimerFiredEvent(string) (*workflow.HistoryEvent, error)
 		AddTimerStartedEvent(int64, *workflow.StartTimerDecisionAttributes) (*workflow.HistoryEvent, *persistence.TimerInfo, error)
 		AddUpsertWorkflowSearchAttributesEvent(int64, *workflow.UpsertWorkflowSearchAttributesDecisionAttributes) (*workflow.HistoryEvent, error)
 		AddWorkflowExecutionCancelRequestedEvent(string, *h.RequestCancelWorkflowExecutionRequest) (*workflow.HistoryEvent, error)
 		AddWorkflowExecutionCanceledEvent(int64, *workflow.CancelWorkflowExecutionDecisionAttributes) (*workflow.HistoryEvent, error)
 		AddWorkflowExecutionSignaled(signalName string, input []byte, identity string) (*workflow.HistoryEvent, error)
-		AddWorkflowExecutionStartedEvent(*cache.DomainCacheEntry, workflow.WorkflowExecution, *h.StartWorkflowExecutionRequest) (*workflow.HistoryEvent, error)
-		AddWorkflowExecutionTerminatedEvent(reason string, details []byte, identity string) (*workflow.HistoryEvent, error)
+		AddWorkflowExecutionStartedEvent(workflow.WorkflowExecution, *h.StartWorkflowExecutionRequest) (*workflow.HistoryEvent, error)
+		AddWorkflowExecutionTerminatedEvent(firstEventID int64, reason string, details []byte, identity string) (*workflow.HistoryEvent, error)
 		ClearStickyness()
 		CheckResettable() error
 		CopyToPersistence() *persistence.WorkflowMutableState
@@ -105,33 +108,28 @@ type (
 		CreateNewHistoryEvent(eventType workflow.EventType) *workflow.HistoryEvent
 		CreateNewHistoryEventWithTimestamp(eventType workflow.EventType, timestamp int64) *workflow.HistoryEvent
 		CreateTransientDecisionEvents(di *decisionInfo, identity string) (*workflow.HistoryEvent, *workflow.HistoryEvent)
-		DeleteActivity(int64) error
 		DeleteDecision()
-		DeletePendingChildExecution(int64)
-		DeletePendingRequestCancel(int64)
 		DeleteSignalRequested(requestID string)
-		DeletePendingSignal(int64)
-		DeleteUserTimer(string)
 		FailDecision(bool)
 		FlushBufferedEvents() error
 		GetActivityByActivityID(string) (*persistence.ActivityInfo, bool)
 		GetActivityInfo(int64) (*persistence.ActivityInfo, bool)
-		GetActivityScheduledEvent(int64) (*workflow.HistoryEvent, bool)
+		GetActivityScheduledEvent(int64) (*workflow.HistoryEvent, error)
 		GetChildExecutionInfo(int64) (*persistence.ChildExecutionInfo, bool)
-		GetChildExecutionInitiatedEvent(int64) (*workflow.HistoryEvent, bool)
-		GetCompletionEvent() (*workflow.HistoryEvent, bool)
+		GetChildExecutionInitiatedEvent(int64) (*workflow.HistoryEvent, error)
+		GetCompletionEvent() (*workflow.HistoryEvent, error)
 		GetDecisionInfo(int64) (*decisionInfo, bool)
-		GetDomainName() string
-		GetStartEvent() (*workflow.HistoryEvent, bool)
-		GetCurrentBranch() []byte
+		GetDomainEntry() *cache.DomainCacheEntry
+		GetStartEvent() (*workflow.HistoryEvent, error)
+		GetCurrentBranchToken() ([]byte, error)
+		GetVersionHistories() *persistence.VersionHistories
 		GetCurrentVersion() int64
 		GetExecutionInfo() *persistence.WorkflowExecutionInfo
-		GetEventStoreVersion() int32
 		GetHistoryBuilder() *historyBuilder
 		GetInFlightDecision() (*decisionInfo, bool)
 		GetPendingDecision() (*decisionInfo, bool)
 		GetLastFirstEventID() int64
-		GetLastWriteVersion() int64
+		GetLastWriteVersion() (int64, error)
 		GetNextEventID() int64
 		GetPreviousStartedEventID() int64
 		GetPendingActivityInfos() map[int64]*persistence.ActivityInfo
@@ -143,20 +141,25 @@ type (
 		GetRequestCancelInfo(int64) (*persistence.RequestCancelInfo, bool)
 		GetRetryBackoffDuration(errReason string) time.Duration
 		GetCronBackoffDuration() (time.Duration, error)
-		GetScheduleIDByActivityID(string) (int64, bool)
 		GetSignalInfo(int64) (*persistence.SignalInfo, bool)
-		GetStartVersion() int64
-		GetUserTimer(string) (bool, *persistence.TimerInfo)
+		GetStartVersion() (int64, error)
+		GetUserTimerInfoByEventID(int64) (*persistence.TimerInfo, bool)
+		GetUserTimerInfo(string) (*persistence.TimerInfo, bool)
 		GetWorkflowType() *workflow.WorkflowType
+		GetWorkflowStateCloseStatus() (int, int)
+		GetQueryRegistry() queryRegistry
 		HasBufferedEvents() bool
 		HasInFlightDecision() bool
 		HasParentExecution() bool
 		HasPendingDecision() bool
 		HasProcessedOrPendingDecision() bool
 		IsCancelRequested() (bool, string)
+		IsCurrentWorkflowGuaranteed() bool
 		IsSignalRequested(requestID string) bool
 		IsStickyTaskListEnabled() bool
 		IsWorkflowExecutionRunning() bool
+		IsResourceDuplicated(resourceDedupKey definition.DeduplicationID) bool
+		UpdateDuplicatedResource(resourceDedupKey definition.DeduplicationID)
 		Load(*persistence.WorkflowMutableState)
 		ReplicateActivityInfo(*h.SyncActivityRequest, bool) error
 		ReplicateActivityTaskCancelRequestedEvent(*workflow.HistoryEvent) error
@@ -180,9 +183,9 @@ type (
 		ReplicateExternalWorkflowExecutionCancelRequested(*workflow.HistoryEvent) error
 		ReplicateExternalWorkflowExecutionSignaled(*workflow.HistoryEvent) error
 		ReplicateRequestCancelExternalWorkflowExecutionFailedEvent(*workflow.HistoryEvent) error
-		ReplicateRequestCancelExternalWorkflowExecutionInitiatedEvent(*workflow.HistoryEvent, string) (*persistence.RequestCancelInfo, error)
+		ReplicateRequestCancelExternalWorkflowExecutionInitiatedEvent(int64, *workflow.HistoryEvent, string) (*persistence.RequestCancelInfo, error)
 		ReplicateSignalExternalWorkflowExecutionFailedEvent(*workflow.HistoryEvent) error
-		ReplicateSignalExternalWorkflowExecutionInitiatedEvent(*workflow.HistoryEvent, string) (*persistence.SignalInfo, error)
+		ReplicateSignalExternalWorkflowExecutionInitiatedEvent(int64, *workflow.HistoryEvent, string) (*persistence.SignalInfo, error)
 		ReplicateStartChildWorkflowExecutionFailedEvent(*workflow.HistoryEvent) error
 		ReplicateStartChildWorkflowExecutionInitiatedEvent(int64, *workflow.HistoryEvent, string) (*persistence.ChildExecutionInfo, error)
 		ReplicateTimerCanceledEvent(*workflow.HistoryEvent) error
@@ -196,24 +199,28 @@ type (
 		ReplicateWorkflowExecutionContinuedAsNewEvent(int64, string, *workflow.HistoryEvent) error
 		ReplicateWorkflowExecutionFailedEvent(int64, *workflow.HistoryEvent) error
 		ReplicateWorkflowExecutionSignaled(*workflow.HistoryEvent) error
-		ReplicateWorkflowExecutionStartedEvent(*cache.DomainCacheEntry, *string, workflow.WorkflowExecution, string, *workflow.HistoryEvent) error
+		ReplicateWorkflowExecutionStartedEvent(*string, workflow.WorkflowExecution, string, *workflow.HistoryEvent) error
 		ReplicateWorkflowExecutionTerminatedEvent(int64, *workflow.HistoryEvent) error
 		ReplicateWorkflowExecutionTimedoutEvent(int64, *workflow.HistoryEvent) error
+		SetCurrentBranchToken(branchToken []byte) error
 		SetHistoryBuilder(hBuilder *historyBuilder)
 		SetHistoryTree(treeID string) error
+		SetVersionHistories(*persistence.VersionHistories) error
 		UpdateActivity(*persistence.ActivityInfo) error
 		UpdateActivityProgress(ai *persistence.ActivityInfo, request *workflow.RecordActivityTaskHeartbeatRequest)
-		UpdateReplicationPolicy(cache.ReplicationPolicy)
 		UpdateDecision(*decisionInfo)
 		UpdateReplicationStateVersion(int64, bool)
 		UpdateReplicationStateLastEventID(int64, int64)
-		UpdateUserTimer(string, *persistence.TimerInfo)
+		UpdateUserTimer(*persistence.TimerInfo) error
+		UpdateCurrentVersion(version int64, forceUpdate bool) error
+		UpdateWorkflowStateCloseStatus(state int, closeStatus int) error
 
 		AddTransferTasks(transferTasks ...persistence.Task)
 		AddTimerTasks(timerTasks ...persistence.Task)
 		SetUpdateCondition(int64)
 		GetUpdateCondition() int64
 
+		StartTransaction(entry *cache.DomainCacheEntry) (bool, error)
 		CloseTransactionAsMutation(now time.Time, transactionPolicy transactionPolicy) (*persistence.WorkflowMutation, []*persistence.WorkflowEvents, error)
 		CloseTransactionAsSnapshot(now time.Time, transactionPolicy transactionPolicy) (*persistence.WorkflowSnapshot, []*persistence.WorkflowEvents, error)
 	}

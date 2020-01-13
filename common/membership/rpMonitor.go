@@ -21,32 +21,40 @@
 package membership
 
 import (
-	"sync"
+	"sync/atomic"
 
+	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
-	ringpop "github.com/uber/ringpop-go"
 )
 
 type ringpopMonitor struct {
-	started  bool
-	stopped  bool
-	services []string
-	rp       *ringpop.Ringpop
-	rings    map[string]*ringpopServiceResolver
-	logger   log.Logger
-	mutex    sync.Mutex
+	status int32
+
+	serviceName string
+	services    []string
+	rp          *RingPop
+	rings       map[string]*ringpopServiceResolver
+	logger      log.Logger
 }
 
 var _ Monitor = (*ringpopMonitor)(nil)
 
 // NewRingpopMonitor returns a ringpop-based membership monitor
-func NewRingpopMonitor(services []string, rp *ringpop.Ringpop, logger log.Logger) Monitor {
+func NewRingpopMonitor(
+	serviceName string,
+	services []string,
+	rp *RingPop,
+	logger log.Logger,
+) Monitor {
+
 	rpo := &ringpopMonitor{
-		services: services,
-		rp:       rp,
-		logger:   logger,
-		rings:    make(map[string]*ringpopServiceResolver),
+		status:      common.DaemonStatusInitialized,
+		serviceName: serviceName,
+		services:    services,
+		rp:          rp,
+		logger:      logger,
+		rings:       make(map[string]*ringpopServiceResolver),
 	}
 	for _, service := range services {
 		rpo.rings[service] = newRingpopServiceResolver(service, rp, logger)
@@ -54,42 +62,45 @@ func NewRingpopMonitor(services []string, rp *ringpop.Ringpop, logger log.Logger
 	return rpo
 }
 
-func (rpo *ringpopMonitor) Start() error {
-	rpo.mutex.Lock()
-	defer rpo.mutex.Unlock()
-
-	if rpo.started {
-		return nil
+func (rpo *ringpopMonitor) Start() {
+	if !atomic.CompareAndSwapInt32(
+		&rpo.status,
+		common.DaemonStatusInitialized,
+		common.DaemonStatusStarted,
+	) {
+		return
 	}
 
-	for service, ring := range rpo.rings {
-		err := ring.Start()
-		if err != nil {
-			rpo.logger.Error("Failed to initialize ring.", tag.Service(service))
-			return err
-		}
+	rpo.rp.Start()
+
+	labels, err := rpo.rp.Labels()
+	if err != nil {
+		rpo.logger.Fatal("unable to get ring pop labels", tag.Error(err))
 	}
 
-	rpo.started = true
-	return nil
+	if err = labels.Set(RoleKey, rpo.serviceName); err != nil {
+		rpo.logger.Fatal("unable to set ring pop labels", tag.Error(err))
+	}
+
+	for _, ring := range rpo.rings {
+		ring.Start()
+	}
 }
 
 func (rpo *ringpopMonitor) Stop() {
-	rpo.mutex.Lock()
-	defer rpo.mutex.Unlock()
-
-	if rpo.stopped {
+	if !atomic.CompareAndSwapInt32(
+		&rpo.status,
+		common.DaemonStatusStarted,
+		common.DaemonStatusStopped,
+	) {
 		return
 	}
 
 	for _, ring := range rpo.rings {
 		ring.Stop()
 	}
-	rpo.stopped = true
 
-	if rpo.rp != nil {
-		rpo.rp.Destroy()
-	}
+	rpo.rp.Stop()
 }
 
 func (rpo *ringpopMonitor) WhoAmI() (*HostInfo, error) {
@@ -134,4 +145,8 @@ func (rpo *ringpopMonitor) RemoveListener(service string, name string) error {
 		return err
 	}
 	return ring.RemoveListener(name)
+}
+
+func (rpo *ringpopMonitor) GetReachableMembers() ([]string, error) {
+	return rpo.rp.GetReachableMembers()
 }

@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 // 
-// Copyright (c) 2017 Uber Technologies, Inc.
+// Copyright (c) 2019 Uber Technologies, Inc.
 // 
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -29,7 +29,6 @@ import (
 	context "context"
 	gomock "github.com/golang/mock/gomock"
 	workflowserviceclient "github.com/uber/cadence/.gen/go/cadence/workflowserviceclient"
-	replicator "github.com/uber/cadence/.gen/go/replicator"
 	shared "github.com/uber/cadence/.gen/go/shared"
 	yarpc "go.uber.org/yarpc"
 )
@@ -228,37 +227,35 @@ func (mr *_MockClientRecorder) DescribeWorkflowExecution(
 	return mr.mock.ctrl.RecordCall(mr.mock, "DescribeWorkflowExecution", args...)
 }
 
-// GetReplicationMessages responds to a GetReplicationMessages call based on the mock expectations. This
+// GetClusterInfo responds to a GetClusterInfo call based on the mock expectations. This
 // call will fail if the mock does not expect this call. Use EXPECT to expect
 // a call to this function.
 //
-// 	client.EXPECT().GetReplicationMessages(gomock.Any(), ...).Return(...)
-// 	... := client.GetReplicationMessages(...)
-func (m *MockClient) GetReplicationMessages(
+// 	client.EXPECT().GetClusterInfo(gomock.Any(), ...).Return(...)
+// 	... := client.GetClusterInfo(...)
+func (m *MockClient) GetClusterInfo(
 	ctx context.Context,
-	_Request *replicator.GetReplicationMessagesRequest,
 	opts ...yarpc.CallOption,
-) (success *replicator.GetReplicationMessagesResponse, err error) {
+) (success *shared.ClusterInfo, err error) {
 
-	args := []interface{}{ctx, _Request}
+	args := []interface{}{ctx}
 	for _, o := range opts {
 		args = append(args, o)
 	}
 	i := 0
-	ret := m.ctrl.Call(m, "GetReplicationMessages", args...)
-	success, _ = ret[i].(*replicator.GetReplicationMessagesResponse)
+	ret := m.ctrl.Call(m, "GetClusterInfo", args...)
+	success, _ = ret[i].(*shared.ClusterInfo)
 	i++
 	err, _ = ret[i].(error)
 	return
 }
 
-func (mr *_MockClientRecorder) GetReplicationMessages(
+func (mr *_MockClientRecorder) GetClusterInfo(
 	ctx interface{},
-	_Request interface{},
 	opts ...interface{},
 ) *gomock.Call {
-	args := append([]interface{}{ctx, _Request}, opts...)
-	return mr.mock.ctrl.RecordCall(mr.mock, "GetReplicationMessages", args...)
+	args := append([]interface{}{ctx}, opts...)
+	return mr.mock.ctrl.RecordCall(mr.mock, "GetClusterInfo", args...)
 }
 
 // GetSearchAttributes responds to a GetSearchAttributes call based on the mock expectations. This
@@ -455,6 +452,39 @@ func (mr *_MockClientRecorder) ListOpenWorkflowExecutions(
 ) *gomock.Call {
 	args := append([]interface{}{ctx, _ListRequest}, opts...)
 	return mr.mock.ctrl.RecordCall(mr.mock, "ListOpenWorkflowExecutions", args...)
+}
+
+// ListTaskListPartitions responds to a ListTaskListPartitions call based on the mock expectations. This
+// call will fail if the mock does not expect this call. Use EXPECT to expect
+// a call to this function.
+//
+// 	client.EXPECT().ListTaskListPartitions(gomock.Any(), ...).Return(...)
+// 	... := client.ListTaskListPartitions(...)
+func (m *MockClient) ListTaskListPartitions(
+	ctx context.Context,
+	_Request *shared.ListTaskListPartitionsRequest,
+	opts ...yarpc.CallOption,
+) (success *shared.ListTaskListPartitionsResponse, err error) {
+
+	args := []interface{}{ctx, _Request}
+	for _, o := range opts {
+		args = append(args, o)
+	}
+	i := 0
+	ret := m.ctrl.Call(m, "ListTaskListPartitions", args...)
+	success, _ = ret[i].(*shared.ListTaskListPartitionsResponse)
+	i++
+	err, _ = ret[i].(error)
+	return
+}
+
+func (mr *_MockClientRecorder) ListTaskListPartitions(
+	ctx interface{},
+	_Request interface{},
+	opts ...interface{},
+) *gomock.Call {
+	args := append([]interface{}{ctx, _Request}, opts...)
+	return mr.mock.ctrl.RecordCall(mr.mock, "ListTaskListPartitions", args...)
 }
 
 // ListWorkflowExecutions responds to a ListWorkflowExecutions call based on the mock expectations. This

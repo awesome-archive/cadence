@@ -24,6 +24,9 @@ import (
 	"context"
 	"time"
 
+	"go.uber.org/cadence/activity"
+	"golang.org/x/time/rate"
+
 	"github.com/uber/cadence/.gen/go/history"
 	"github.com/uber/cadence/.gen/go/history/historyserviceclient"
 	"github.com/uber/cadence/.gen/go/shared"
@@ -32,8 +35,6 @@ import (
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 	p "github.com/uber/cadence/common/persistence"
-	"go.uber.org/cadence/activity"
-	"golang.org/x/time/rate"
 )
 
 type (
@@ -48,7 +49,7 @@ type (
 
 	// Scavenger is the type that holds the state for history scavenger daemon
 	Scavenger struct {
-		db       p.HistoryV2Manager
+		db       p.HistoryManager
 		client   historyserviceclient.Interface
 		hbd      ScavengerHeartbeatDetails
 		rps      int
@@ -75,7 +76,11 @@ const (
 	rpsPerConcurrency = 50
 	pageSize          = 1000
 	// only clean up history branches that older than this threshold
-	cleanUpThreshold = time.Hour * 24
+	// we double the MaxWorkflowRetentionPeriodInDays to avoid racing condition with history archival.
+	// Our history archiver delete mutable state, and then upload history to blob store and then delete history.
+	// This scanner will face racing condition with archiver because it relys on describe mutable state returning entityNotExist error.
+	// That's why we need to keep MaxWorkflowRetentionPeriodInDays stable and not decreasing all the time.
+	cleanUpThreshold = time.Hour * 24 * common.MaxWorkflowRetentionPeriodInDays * 2
 )
 
 // NewScavenger returns an instance of history scavenger daemon
@@ -86,7 +91,7 @@ const (
 //  - describe the corresponding workflow execution
 //  - deletion of history itself, if there are no workflow execution
 func NewScavenger(
-	db p.HistoryV2Manager,
+	db p.HistoryManager,
 	rps int,
 	client historyserviceclient.Interface,
 	hbd ScavengerHeartbeatDetails,

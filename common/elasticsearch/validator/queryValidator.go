@@ -22,13 +22,15 @@ package validator
 
 import (
 	"errors"
+	"fmt"
 	"strings"
+
+	"github.com/xwb1989/sqlparser"
 
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/definition"
 	"github.com/uber/cadence/common/service/dynamicconfig"
-	"github.com/xwb1989/sqlparser"
 )
 
 // VisibilityQueryValidator for sql query validation
@@ -71,20 +73,26 @@ func (qv *VisibilityQueryValidator) ValidateCountRequestForQuery(countRequest *w
 // it also adds attr prefix for customized fields
 func (qv *VisibilityQueryValidator) validateListOrCountRequestForQuery(whereClause string) (string, error) {
 	if len(whereClause) != 0 {
-		var sqlQuery string
+		// Build a placeholder query that allows us to easily parse the contents of the where clause.
+		// IMPORTANT: This query is never executed, it is just used to parse and validate whereClause
+		var placeholderQuery string
 		whereClause := strings.TrimSpace(whereClause)
+		// #nosec
 		if common.IsJustOrderByClause(whereClause) { // just order by
-			sqlQuery = "SELECT * FROM dummy " + whereClause
+			placeholderQuery = fmt.Sprintf("SELECT * FROM dummy %s", whereClause)
 		} else {
-			sqlQuery = "SELECT * FROM dummy WHERE " + whereClause
+			placeholderQuery = fmt.Sprintf("SELECT * FROM dummy WHERE %s", whereClause)
 		}
 
-		stmt, err := sqlparser.Parse(sqlQuery)
+		stmt, err := sqlparser.Parse(placeholderQuery)
 		if err != nil {
 			return "", &workflow.BadRequestError{Message: "Invalid query."}
 		}
 
-		sel := stmt.(*sqlparser.Select)
+		sel, ok := stmt.(*sqlparser.Select)
+		if !ok {
+			return "", &workflow.BadRequestError{Message: "Invalid select query."}
+		}
 		buf := sqlparser.NewTrackedBuffer(nil)
 		// validate where expr
 		if sel.Where != nil {
@@ -111,7 +119,7 @@ func (qv *VisibilityQueryValidator) validateWhereExpr(expr sqlparser.Expr) error
 		return nil
 	}
 
-	switch expr.(type) {
+	switch expr := expr.(type) {
 	case *sqlparser.AndExpr, *sqlparser.OrExpr:
 		return qv.validateAndOrExpr(expr)
 	case *sqlparser.ComparisonExpr:
@@ -119,28 +127,24 @@ func (qv *VisibilityQueryValidator) validateWhereExpr(expr sqlparser.Expr) error
 	case *sqlparser.RangeCond:
 		return qv.validateRangeExpr(expr)
 	case *sqlparser.ParenExpr:
-		parentExpr := expr.(*sqlparser.ParenExpr)
-		return qv.validateWhereExpr(parentExpr.Expr)
+		return qv.validateWhereExpr(expr.Expr)
 	default:
 		return errors.New("invalid where clause")
 	}
 
-	return nil
 }
 
 func (qv *VisibilityQueryValidator) validateAndOrExpr(expr sqlparser.Expr) error {
 	var leftExpr sqlparser.Expr
 	var rightExpr sqlparser.Expr
 
-	switch expr.(type) {
+	switch expr := expr.(type) {
 	case *sqlparser.AndExpr:
-		andExpr := expr.(*sqlparser.AndExpr)
-		leftExpr = andExpr.Left
-		rightExpr = andExpr.Right
+		leftExpr = expr.Left
+		rightExpr = expr.Right
 	case *sqlparser.OrExpr:
-		orExpr := expr.(*sqlparser.OrExpr)
-		leftExpr = orExpr.Left
-		rightExpr = orExpr.Right
+		leftExpr = expr.Left
+		rightExpr = expr.Right
 	}
 
 	if err := qv.validateWhereExpr(leftExpr); err != nil {

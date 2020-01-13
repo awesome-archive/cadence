@@ -25,39 +25,26 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/uber-go/tally"
+
 	workflow "github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/client"
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/clock"
-	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/log/loggerimpl"
-	"github.com/uber/cadence/common/messaging"
-	"github.com/uber/cadence/common/metrics"
-	"github.com/uber/cadence/common/mocks"
 	"github.com/uber/cadence/common/persistence"
-	"github.com/uber/cadence/common/service"
 	"github.com/uber/cadence/common/service/dynamicconfig"
 )
 
 type (
 	historyCacheSuite struct {
 		suite.Suite
-		// override suite.Suite.Assertions with require.Assertions; this means that s.NotNil(nil) will stop the test,
-		// not merely log an error
 		*require.Assertions
-		logger              log.Logger
-		mockExecutionMgr    *mocks.ExecutionManager
-		mockClusterMetadata *mocks.ClusterMetadata
-		mockProducer        *mocks.KafkaProducer
-		mockMessagingClient messaging.Client
-		mockClientBean      *client.MockClientBean
-		mockService         service.Service
-		mockShard           *shardContextImpl
-		cache               *historyCache
+
+		controller *gomock.Controller
+		mockShard  *shardContextTest
+
+		cache *historyCache
 	}
 )
 
@@ -67,47 +54,32 @@ func TestHistoryCacheSuite(t *testing.T) {
 }
 
 func (s *historyCacheSuite) SetupSuite() {
-
 }
 
 func (s *historyCacheSuite) TearDownSuite() {
-
 }
 
 func (s *historyCacheSuite) SetupTest() {
-	s.logger = loggerimpl.NewDevelopmentForTest(s.Suite)
 	// Have to define our overridden assertions in the test setup. If we did it earlier, s.T() will return nil
 	s.Assertions = require.New(s.T())
-	s.mockExecutionMgr = &mocks.ExecutionManager{}
-	s.mockClusterMetadata = &mocks.ClusterMetadata{}
-	s.mockProducer = &mocks.KafkaProducer{}
-	s.mockMessagingClient = mocks.NewMockMessagingClient(s.mockProducer, nil)
-	metricsClient := metrics.NewClient(tally.NoopScope, metrics.History)
-	s.mockClientBean = &client.MockClientBean{}
-	s.mockService = service.NewTestService(s.mockClusterMetadata, s.mockMessagingClient, metricsClient, s.mockClientBean, nil, nil)
-	s.mockShard = &shardContextImpl{
-		service:                   s.mockService,
-		shardInfo:                 &persistence.ShardInfo{ShardID: 0, RangeID: 1, TransferAckLevel: 0},
-		clusterMetadata:           s.mockClusterMetadata,
-		transferSequenceNumber:    1,
-		executionManager:          s.mockExecutionMgr,
-		shardManager:              &mocks.ShardManager{},
-		maxTransferSequenceNumber: 100000,
-		closeCh:                   make(chan int, 100),
-		config:                    NewDynamicConfigForTest(),
-		logger:                    s.logger,
-		metricsClient:             metricsClient,
-		timeSource:                clock.NewRealTimeSource(),
-	}
-	s.cache = newHistoryCache(s.mockShard)
 
-	s.mockClusterMetadata.On("IsGlobalDomainEnabled").Return(false)
+	s.controller = gomock.NewController(s.T())
+	s.mockShard = newTestShardContext(
+		s.controller,
+		&persistence.ShardInfo{
+			ShardID:          0,
+			RangeID:          1,
+			TransferAckLevel: 0,
+		},
+		NewDynamicConfigForTest(),
+	)
+
+	s.mockShard.resource.ClusterMetadata.EXPECT().IsGlobalDomainEnabled().Return(false).AnyTimes()
 }
 
 func (s *historyCacheSuite) TearDownTest() {
-	s.mockExecutionMgr.AssertExpectations(s.T())
-	s.mockProducer.AssertExpectations(s.T())
-	s.mockClientBean.AssertExpectations(s.T())
+	s.controller.Finish()
+	s.mockShard.Finish(s.T())
 }
 
 func (s *historyCacheSuite) TestHistoryCacheBasic() {
@@ -118,14 +90,14 @@ func (s *historyCacheSuite) TestHistoryCacheBasic() {
 		WorkflowId: common.StringPtr("some random workflow ID"),
 		RunId:      common.StringPtr(uuid.New()),
 	}
-	mockMS1 := &mockMutableState{}
+	mockMS1 := NewMockmutableState(s.controller)
 	context, release, err := s.cache.getOrCreateWorkflowExecutionForBackground(domainID, execution1)
 	s.Nil(err)
-	context.(*workflowExecutionContextImpl).msBuilder = mockMS1
+	context.(*workflowExecutionContextImpl).mutableState = mockMS1
 	release(nil)
 	context, release, err = s.cache.getOrCreateWorkflowExecutionForBackground(domainID, execution1)
 	s.Nil(err)
-	s.Equal(mockMS1, context.(*workflowExecutionContextImpl).msBuilder)
+	s.Equal(mockMS1, context.(*workflowExecutionContextImpl).mutableState)
 	release(nil)
 
 	execution2 := workflow.WorkflowExecution{
@@ -134,7 +106,7 @@ func (s *historyCacheSuite) TestHistoryCacheBasic() {
 	}
 	context, release, err = s.cache.getOrCreateWorkflowExecutionForBackground(domainID, execution2)
 	s.Nil(err)
-	s.NotEqual(mockMS1, context.(*workflowExecutionContextImpl).msBuilder)
+	s.NotEqual(mockMS1, context.(*workflowExecutionContextImpl).mutableState)
 	release(nil)
 }
 
@@ -186,21 +158,21 @@ func (s *historyCacheSuite) TestHistoryCacheClear() {
 	s.Nil(err)
 	// since we are just testing whether the release function will clear the cache
 	// all we need is a fake msBuilder
-	context.(*workflowExecutionContextImpl).msBuilder = &mutableStateBuilder{}
+	context.(*workflowExecutionContextImpl).mutableState = &mutableStateBuilder{}
 	release(nil)
 
 	// since last time, the release function receive a nil error
 	// the ms builder will not be cleared
 	context, release, err = s.cache.getOrCreateWorkflowExecutionForBackground(domainID, we)
 	s.Nil(err)
-	s.NotNil(context.(*workflowExecutionContextImpl).msBuilder)
+	s.NotNil(context.(*workflowExecutionContextImpl).mutableState)
 	release(errors.New("some random error message"))
 
 	// since last time, the release function receive a non-nil error
 	// the ms builder will be cleared
 	context, release, err = s.cache.getOrCreateWorkflowExecutionForBackground(domainID, we)
 	s.Nil(err)
-	s.Nil(context.(*workflowExecutionContextImpl).msBuilder)
+	s.Nil(context.(*workflowExecutionContextImpl).mutableState)
 	release(nil)
 }
 
@@ -221,10 +193,10 @@ func (s *historyCacheSuite) TestHistoryCacheConcurrentAccess() {
 		context, release, err := s.cache.getOrCreateWorkflowExecutionForBackground(domainID, we)
 		s.Nil(err)
 		// since each time the builder is reset to nil
-		s.Nil(context.(*workflowExecutionContextImpl).msBuilder)
+		s.Nil(context.(*workflowExecutionContextImpl).mutableState)
 		// since we are just testing whether the release function will clear the cache
 		// all we need is a fake msBuilder
-		context.(*workflowExecutionContextImpl).msBuilder = &mutableStateBuilder{}
+		context.(*workflowExecutionContextImpl).mutableState = &mutableStateBuilder{}
 		release(errors.New("some random error message"))
 		waitGroup.Done()
 	}
@@ -240,6 +212,6 @@ func (s *historyCacheSuite) TestHistoryCacheConcurrentAccess() {
 	s.Nil(err)
 	// since we are just testing whether the release function will clear the cache
 	// all we need is a fake msBuilder
-	s.Nil(context.(*workflowExecutionContextImpl).msBuilder)
+	s.Nil(context.(*workflowExecutionContextImpl).mutableState)
 	release(nil)
 }

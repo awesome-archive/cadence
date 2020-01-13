@@ -25,14 +25,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/uber/cadence/common/client"
+
 	"github.com/stretchr/testify/require"
+	"go.uber.org/yarpc"
+
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/service/history"
 	"github.com/uber/cadence/service/matching"
-	"go.uber.org/yarpc"
 )
 
 type (
@@ -75,22 +78,56 @@ func (p *TaskPoller) PollAndProcessDecisionTaskWithoutRetry(dumpHistory bool, dr
 }
 
 // PollAndProcessDecisionTaskWithAttempt for decision tasks
-func (p *TaskPoller) PollAndProcessDecisionTaskWithAttempt(dumpHistory bool, dropTask bool,
-	pollStickyTaskList bool, respondStickyTaskList bool, decisionAttempt int64) (isQueryTask bool, err error) {
-	return p.PollAndProcessDecisionTaskWithAttemptAndRetry(dumpHistory, dropTask, pollStickyTaskList,
-		respondStickyTaskList, decisionAttempt, 5)
+func (p *TaskPoller) PollAndProcessDecisionTaskWithAttempt(
+	dumpHistory bool,
+	dropTask bool,
+	pollStickyTaskList bool,
+	respondStickyTaskList bool,
+	decisionAttempt int64,
+) (isQueryTask bool, err error) {
+
+	return p.PollAndProcessDecisionTaskWithAttemptAndRetry(
+		dumpHistory,
+		dropTask,
+		pollStickyTaskList,
+		respondStickyTaskList,
+		decisionAttempt,
+		5)
 }
 
 // PollAndProcessDecisionTaskWithAttemptAndRetry for decision tasks
-func (p *TaskPoller) PollAndProcessDecisionTaskWithAttemptAndRetry(dumpHistory bool, dropTask bool,
-	pollStickyTaskList bool, respondStickyTaskList bool, decisionAttempt int64, retryCount int) (isQueryTask bool, err error) {
-	isQueryTask, _, err = p.PollAndProcessDecisionTaskWithAttemptAndRetryAndForceNewDecision(dumpHistory, dropTask, pollStickyTaskList, respondStickyTaskList, decisionAttempt, retryCount, false)
+func (p *TaskPoller) PollAndProcessDecisionTaskWithAttemptAndRetry(
+	dumpHistory bool,
+	dropTask bool,
+	pollStickyTaskList bool,
+	respondStickyTaskList bool,
+	decisionAttempt int64,
+	retryCount int,
+) (isQueryTask bool, err error) {
+
+	isQueryTask, _, err = p.PollAndProcessDecisionTaskWithAttemptAndRetryAndForceNewDecision(
+		dumpHistory,
+		dropTask,
+		pollStickyTaskList,
+		respondStickyTaskList,
+		decisionAttempt,
+		retryCount,
+		false,
+		nil)
 	return isQueryTask, err
 }
 
 // PollAndProcessDecisionTaskWithAttemptAndRetryAndForceNewDecision for decision tasks
-func (p *TaskPoller) PollAndProcessDecisionTaskWithAttemptAndRetryAndForceNewDecision(dumpHistory bool, dropTask bool,
-	pollStickyTaskList bool, respondStickyTaskList bool, decisionAttempt int64, retryCount int, forceCreateNewDecision bool) (isQueryTask bool, newTask *workflow.RespondDecisionTaskCompletedResponse, err error) {
+func (p *TaskPoller) PollAndProcessDecisionTaskWithAttemptAndRetryAndForceNewDecision(
+	dumpHistory bool,
+	dropTask bool,
+	pollStickyTaskList bool,
+	respondStickyTaskList bool,
+	decisionAttempt int64,
+	retryCount int,
+	forceCreateNewDecision bool,
+	queryResult *workflow.WorkflowQueryResult,
+) (isQueryTask bool, newTask *workflow.RespondDecisionTaskCompletedResponse, err error) {
 Loop:
 	for attempt := 0; attempt < retryCount; attempt++ {
 
@@ -218,6 +255,7 @@ Loop:
 				Decisions:                  decisions,
 				ReturnNewDecisionTask:      common.BoolPtr(forceCreateNewDecision),
 				ForceCreateNewDecisionTask: common.BoolPtr(forceCreateNewDecision),
+				QueryResults:               getQueryResults(response.GetQueries(), queryResult),
 			})
 			return false, newTask, err
 		}
@@ -235,10 +273,11 @@ Loop:
 				},
 				ReturnNewDecisionTask:      common.BoolPtr(forceCreateNewDecision),
 				ForceCreateNewDecisionTask: common.BoolPtr(forceCreateNewDecision),
+				QueryResults:               getQueryResults(response.GetQueries(), queryResult),
 			},
 			yarpc.WithHeader(common.LibraryVersionHeaderName, "0.0.1"),
-			yarpc.WithHeader(common.FeatureVersionHeaderName, "1.0.0"),
-			yarpc.WithHeader(common.ClientImplHeaderName, "go"),
+			yarpc.WithHeader(common.FeatureVersionHeaderName, client.GoWorkerConsistentQueryVersion),
+			yarpc.WithHeader(common.ClientImplHeaderName, client.GoSDK),
 		)
 
 		return false, newTask, err
@@ -264,22 +303,6 @@ func (p *TaskPoller) HandlePartialDecision(response *workflow.PollForDecisionTas
 	events = history.Events
 	if events == nil || len(events) == 0 {
 		p.Logger.Fatal("History Events are empty")
-	}
-
-	nextPageToken := response.NextPageToken
-	for nextPageToken != nil {
-		resp, err2 := p.Engine.GetWorkflowExecutionHistory(createContext(), &workflow.GetWorkflowExecutionHistoryRequest{
-			Domain:        common.StringPtr(p.Domain),
-			Execution:     response.WorkflowExecution,
-			NextPageToken: nextPageToken,
-		})
-
-		if err2 != nil {
-			return nil, err2
-		}
-
-		events = append(events, resp.History.Events...)
-		nextPageToken = resp.NextPageToken
 	}
 
 	executionCtx, decisions, err := p.DecisionHandler(response.WorkflowExecution, response.WorkflowType,
@@ -312,8 +335,8 @@ func (p *TaskPoller) HandlePartialDecision(response *workflow.PollForDecisionTas
 			ForceCreateNewDecisionTask: common.BoolPtr(true),
 		},
 		yarpc.WithHeader(common.LibraryVersionHeaderName, "0.0.1"),
-		yarpc.WithHeader(common.FeatureVersionHeaderName, "1.0.0"),
-		yarpc.WithHeader(common.ClientImplHeaderName, "go"),
+		yarpc.WithHeader(common.FeatureVersionHeaderName, client.GoWorkerConsistentQueryVersion),
+		yarpc.WithHeader(common.ClientImplHeaderName, client.GoSDK),
 	)
 
 	return newTask, err
@@ -456,4 +479,12 @@ retry:
 func createContext() context.Context {
 	ctx, _ := context.WithTimeout(context.Background(), 90*time.Second)
 	return ctx
+}
+
+func getQueryResults(queries map[string]*workflow.WorkflowQuery, queryResult *workflow.WorkflowQueryResult) map[string]*workflow.WorkflowQueryResult {
+	result := make(map[string]*workflow.WorkflowQueryResult)
+	for k := range queries {
+		result[k] = queryResult
+	}
+	return result
 }

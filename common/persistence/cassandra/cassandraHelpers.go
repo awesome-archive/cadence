@@ -26,46 +26,26 @@ import (
 	"os"
 	"strings"
 
+	"github.com/uber/cadence/common/auth"
+
 	"github.com/gocql/gocql"
 	log "github.com/sirupsen/logrus"
+
 	"github.com/uber/cadence/tools/cassandra"
 	"github.com/uber/cadence/tools/common/schema"
 )
 
 const cassandraPersistenceName = "cassandra"
 
-// NewCassandraCluster creates a cassandra cluster given comma separated list of clusterHosts
-func NewCassandraCluster(clusterHosts string, port int, user, password, dc string) *gocql.ClusterConfig {
-	var hosts []string
-	for _, h := range strings.Split(clusterHosts, ",") {
-		if host := strings.TrimSpace(h); len(host) > 0 {
-			hosts = append(hosts, host)
-		}
-	}
-
-	cluster := gocql.NewCluster(hosts...)
-	cluster.ProtoVersion = 4
-	if port > 0 {
-		cluster.Port = port
-	}
-	if user != "" && password != "" {
-		cluster.Authenticator = gocql.PasswordAuthenticator{
-			Username: user,
-			Password: password,
-		}
-	}
-	if dc != "" {
-		cluster.HostFilter = gocql.DataCentreHostFilter(dc)
-	}
-	cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
-	return cluster
-}
-
 // CreateCassandraKeyspace creates the keyspace using this session for given replica count
 func CreateCassandraKeyspace(s *gocql.Session, keyspace string, replicas int, overwrite bool) (err error) {
 	// if overwrite flag is set, drop the keyspace and create a new one
 	if overwrite {
-		DropCassandraKeyspace(s, keyspace)
+		err = DropCassandraKeyspace(s, keyspace)
+		if err != nil {
+			log.Error(`drop keyspace error`, err)
+			return
+		}
 	}
 	err = s.Query(fmt.Sprintf(`CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {
 		'class' : 'SimpleStrategy', 'replication_factor' : %d}`, keyspace, replicas)).Exec()
@@ -89,9 +69,15 @@ func DropCassandraKeyspace(s *gocql.Session, keyspace string) (err error) {
 	return
 }
 
-// LoadCassandraSchema loads the schema from the given .cql files on this keyspace
-func LoadCassandraSchema(
-	dir string, fileNames []string, hosts []string, port int, keyspace string, override bool,
+// loadCassandraSchema loads the schema from the given .cql files on this keyspace
+func loadCassandraSchema(
+	dir string,
+	fileNames []string,
+	hosts []string,
+	port int,
+	keyspace string,
+	override bool,
+	tls *auth.TLS,
 ) (err error) {
 
 	tmpFile, err := ioutil.TempFile("", "_cadence_")
@@ -101,12 +87,17 @@ func LoadCassandraSchema(
 	defer os.Remove(tmpFile.Name())
 
 	for _, file := range fileNames {
+		// Flagged for potential file inclusion via variable. No user supplied input is included here - this just reads
+		// schema files.
+		// #nosec
 		content, err := ioutil.ReadFile(dir + "/" + file)
 		if err != nil {
 			return fmt.Errorf("error reading contents of file %v:%v", file, err.Error())
 		}
-		tmpFile.WriteString(string(content))
-		tmpFile.WriteString("\n")
+		_, err = tmpFile.WriteString(string(content) + "\n")
+		if err != nil {
+			return fmt.Errorf("error writing string to file, err: %v", err.Error())
+		}
 	}
 
 	tmpFile.Close()
@@ -116,6 +107,7 @@ func LoadCassandraSchema(
 			Hosts:    strings.Join(hosts, ","),
 			Port:     port,
 			Keyspace: keyspace,
+			TLS:      tls,
 		},
 		SetupConfig: schema.SetupConfig{
 			SchemaFilePath:    tmpFile.Name(),

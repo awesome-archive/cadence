@@ -24,24 +24,26 @@ import "github.com/uber/cadence/.gen/go/shared"
 
 // valid indexed fields on ES
 const (
-	DomainID      = "DomainID"
-	WorkflowID    = "WorkflowID"
-	RunID         = "RunID"
-	WorkflowType  = "WorkflowType"
-	StartTime     = "StartTime"
-	ExecutionTime = "ExecutionTime"
-	CloseTime     = "CloseTime"
-	CloseStatus   = "CloseStatus"
-	HistoryLength = "HistoryLength"
-	Encoding      = "Encoding"
-	KafkaKey      = "KafkaKey"
+	DomainID        = "DomainID"
+	WorkflowID      = "WorkflowID"
+	RunID           = "RunID"
+	WorkflowType    = "WorkflowType"
+	StartTime       = "StartTime"
+	ExecutionTime   = "ExecutionTime"
+	CloseTime       = "CloseTime"
+	CloseStatus     = "CloseStatus"
+	HistoryLength   = "HistoryLength"
+	Encoding        = "Encoding"
+	KafkaKey        = "KafkaKey"
+	BinaryChecksums = "BinaryChecksums"
 
-	CustomStringField   = "CustomStringField"
-	CustomKeywordField  = "CustomKeywordField"
-	CustomIntField      = "CustomIntField"
-	CustomBoolField     = "CustomBoolField"
-	CustomDoubleField   = "CustomDoubleField"
-	CustomDatetimeField = "CustomDatetimeField"
+	CustomStringField    = "CustomStringField"
+	CustomKeywordField   = "CustomKeywordField"
+	CustomIntField       = "CustomIntField"
+	CustomBoolField      = "CustomBoolField"
+	CustomDoubleField    = "CustomDoubleField"
+	CustomDatetimeField  = "CustomDatetimeField"
+	CadenceChangeVersion = "CadenceChangeVersion"
 )
 
 // valid non-indexed fields on ES
@@ -57,12 +59,14 @@ var defaultIndexedKeys = createDefaultIndexedKeys()
 
 func createDefaultIndexedKeys() map[string]interface{} {
 	defaultIndexedKeys := map[string]interface{}{
-		CustomStringField:   shared.IndexedValueTypeString,
-		CustomKeywordField:  shared.IndexedValueTypeKeyword,
-		CustomIntField:      shared.IndexedValueTypeInt,
-		CustomBoolField:     shared.IndexedValueTypeBool,
-		CustomDoubleField:   shared.IndexedValueTypeDouble,
-		CustomDatetimeField: shared.IndexedValueTypeDatetime,
+		CustomStringField:    shared.IndexedValueTypeString,
+		CustomKeywordField:   shared.IndexedValueTypeKeyword,
+		CustomIntField:       shared.IndexedValueTypeInt,
+		CustomBoolField:      shared.IndexedValueTypeBool,
+		CustomDoubleField:    shared.IndexedValueTypeDouble,
+		CustomDatetimeField:  shared.IndexedValueTypeDatetime,
+		CadenceChangeVersion: shared.IndexedValueTypeKeyword,
+		BinaryChecksums:      shared.IndexedValueTypeKeyword,
 	}
 	for k, v := range systemIndexedKeys {
 		defaultIndexedKeys[k] = v

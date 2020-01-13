@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
 	"github.com/uber/cadence/common/backoff"
 	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/persistence"
@@ -37,9 +38,7 @@ func Test_NextRetry(t *testing.T) {
 	identity := "some-worker-identity"
 
 	// no retry without retry policy
-	var version int64 = 59
 	ai := &persistence.ActivityInfo{
-		Version:                version,
 		ScheduleToStartTimeout: 5,
 		ScheduleToCloseTimeout: 30,
 		StartToCloseTimeout:    25,
@@ -220,7 +219,6 @@ func Test_NextRetry(t *testing.T) {
 	))
 
 	// extend expiration, next interval should be 10s
-	version += 10
 	ai.ExpirationTime = now.Add(time.Minute)
 	a.Equal(time.Second*10, getBackoffInterval(
 		now,

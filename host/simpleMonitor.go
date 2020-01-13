@@ -41,8 +41,7 @@ func newSimpleMonitor(serviceName string, hosts map[string][]string) membership.
 	return &simpleMonitor{hostInfo, resolvers}
 }
 
-func (s *simpleMonitor) Start() error {
-	return nil
+func (s *simpleMonitor) Start() {
 }
 
 func (s *simpleMonitor) Stop() {
@@ -70,4 +69,8 @@ func (s *simpleMonitor) AddListener(service string, name string, notifyChannel c
 
 func (s *simpleMonitor) RemoveListener(service string, name string) error {
 	return nil
+}
+
+func (s *simpleMonitor) GetReachableMembers() ([]string, error) {
+	return nil, nil
 }

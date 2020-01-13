@@ -21,12 +21,13 @@
 package sql
 
 import (
+	"fmt"
 	"sync"
 
+	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/log"
 	p "github.com/uber/cadence/common/persistence"
-	"github.com/uber/cadence/common/persistence/sql/storage"
-	"github.com/uber/cadence/common/persistence/sql/storage/sqldb"
+	"github.com/uber/cadence/common/persistence/sql/sqlplugin"
 	"github.com/uber/cadence/common/service/config"
 )
 
@@ -44,7 +45,7 @@ type (
 	// additional reference counting
 	dbConn struct {
 		sync.Mutex
-		sqldb.Interface
+		sqlplugin.DB
 		refCnt int
 		cfg    *config.SQL
 	}
@@ -79,17 +80,8 @@ func (f *Factory) NewShardStore() (p.ShardStore, error) {
 	return newShardPersistence(conn, f.clusterName, f.logger)
 }
 
-// NewHistoryStore returns a new history store
-func (f *Factory) NewHistoryStore() (p.HistoryStore, error) {
-	conn, err := f.dbConn.get()
-	if err != nil {
-		return nil, err
-	}
-	return newHistoryPersistence(conn, f.logger)
-}
-
 // NewHistoryV2Store returns a new history store
-func (f *Factory) NewHistoryV2Store() (p.HistoryV2Store, error) {
+func (f *Factory) NewHistoryV2Store() (p.HistoryStore, error) {
 	conn, err := f.dbConn.get()
 	if err != nil {
 		return nil, err
@@ -106,16 +98,6 @@ func (f *Factory) NewMetadataStore() (p.MetadataStore, error) {
 	return newMetadataPersistenceV2(conn, f.clusterName, f.logger)
 }
 
-// NewMetadataStoreV1 returns the default metadatastore
-func (f *Factory) NewMetadataStoreV1() (p.MetadataStore, error) {
-	return f.NewMetadataStore()
-}
-
-// NewMetadataStoreV2 returns the default metadatastore
-func (f *Factory) NewMetadataStoreV2() (p.MetadataStore, error) {
-	return f.NewMetadataStore()
-}
-
 // NewExecutionStore returns an ExecutionStore for a given shardID
 func (f *Factory) NewExecutionStore(shardID int) (p.ExecutionStore, error) {
 	conn, err := f.dbConn.get()
@@ -128,6 +110,16 @@ func (f *Factory) NewExecutionStore(shardID int) (p.ExecutionStore, error) {
 // NewVisibilityStore returns a visibility store
 func (f *Factory) NewVisibilityStore() (p.VisibilityStore, error) {
 	return NewSQLVisibilityStore(f.cfg, f.logger)
+}
+
+// NewQueue returns a new queue backed by sql
+func (f *Factory) NewQueue(queueType common.QueueType) (p.Queue, error) {
+	conn, err := f.dbConn.get()
+	if err != nil {
+		return nil, err
+	}
+
+	return newQueue(conn, f.logger, queueType)
 }
 
 // Close closes the factory
@@ -146,15 +138,15 @@ func newRefCountedDBConn(cfg *config.SQL) dbConn {
 // get returns a mysql db connection and increments a reference count
 // this method will create a new connection, if an existing connection
 // does not exist
-func (c *dbConn) get() (sqldb.Interface, error) {
+func (c *dbConn) get() (sqlplugin.DB, error) {
 	c.Lock()
 	defer c.Unlock()
 	if c.refCnt == 0 {
-		conn, err := storage.NewSQLDB(c.cfg)
+		conn, err := NewSQLDB(c.cfg)
 		if err != nil {
 			return nil, err
 		}
-		c.Interface = conn
+		c.DB = conn
 	}
 	c.refCnt++
 	return c, nil
@@ -164,8 +156,12 @@ func (c *dbConn) get() (sqldb.Interface, error) {
 func (c *dbConn) forceClose() {
 	c.Lock()
 	defer c.Unlock()
-	if c.Interface != nil {
-		c.Interface.Close()
+	if c.DB != nil {
+		err := c.DB.Close()
+		if err != nil {
+			fmt.Println("failed to close database connection, may leak some connection", err)
+		}
+
 	}
 	c.refCnt = 0
 }
@@ -176,8 +172,8 @@ func (c *dbConn) Close() error {
 	defer c.Unlock()
 	c.refCnt--
 	if c.refCnt == 0 {
-		err := c.Interface.Close()
-		c.Interface = nil
+		err := c.DB.Close()
+		c.DB = nil
 		return err
 	}
 	return nil

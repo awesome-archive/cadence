@@ -21,18 +21,17 @@
 package history
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/archiver"
-	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/definition"
-	"github.com/uber/cadence/common/log/loggerimpl"
+	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
-	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
+	persistenceClient "github.com/uber/cadence/common/persistence/client"
 	espersistence "github.com/uber/cadence/common/persistence/elasticsearch"
-	persistencefactory "github.com/uber/cadence/common/persistence/persistence-factory"
+	"github.com/uber/cadence/common/resource"
 	"github.com/uber/cadence/common/service"
 	"github.com/uber/cadence/common/service/config"
 	"github.com/uber/cadence/common/service/dynamicconfig"
@@ -42,6 +41,7 @@ import (
 type Config struct {
 	NumberOfShards int
 
+	EnableNDC                       dynamicconfig.BoolPropertyFnWithDomainFilter
 	RPS                             dynamicconfig.IntPropertyFn
 	MaxIDLengthLimit                dynamicconfig.IntPropertyFn
 	PersistenceMaxQPS               dynamicconfig.IntPropertyFn
@@ -53,6 +53,7 @@ type Config struct {
 	EmitShardDiffLog                dynamicconfig.BoolPropertyFn
 	MaxAutoResetPoints              dynamicconfig.IntPropertyFnWithDomainFilter
 	ThrottledLogRPS                 dynamicconfig.IntPropertyFn
+	EnableStickyQuery               dynamicconfig.BoolPropertyFnWithDomainFilter
 
 	// HistoryCache settings
 	// Change of these configs require shard restart
@@ -67,11 +68,14 @@ type Config struct {
 	EventsCacheTTL         dynamicconfig.DurationPropertyFn
 
 	// ShardController settings
-	RangeSizeBits        uint
-	AcquireShardInterval dynamicconfig.DurationPropertyFn
+	RangeSizeBits           uint
+	AcquireShardInterval    dynamicconfig.DurationPropertyFn
+	AcquireShardConcurrency dynamicconfig.IntPropertyFn
 
 	// the artificial delay added to standby cluster's view of active cluster's time
-	StandbyClusterDelay dynamicconfig.DurationPropertyFn
+	StandbyClusterDelay                  dynamicconfig.DurationPropertyFn
+	StandbyTaskMissingEventsResendDelay  dynamicconfig.DurationPropertyFn
+	StandbyTaskMissingEventsDiscardDelay dynamicconfig.DurationPropertyFn
 
 	// TimerQueueProcessor settings
 	TimerTaskBatchSize                               dynamicconfig.IntPropertyFn
@@ -88,7 +92,7 @@ type Config struct {
 	TimerProcessorMaxPollIntervalJitterCoefficient   dynamicconfig.FloatPropertyFn
 	TimerProcessorMaxTimeShift                       dynamicconfig.DurationPropertyFn
 	TimerProcessorHistoryArchivalSizeLimit           dynamicconfig.IntPropertyFn
-	TimerProcessorHistoryArchivalTimeLimit           dynamicconfig.DurationPropertyFn
+	TimerProcessorArchivalTimeLimit                  dynamicconfig.DurationPropertyFn
 
 	// TransferQueueProcessor settings
 	TransferTaskBatchSize                               dynamicconfig.IntPropertyFn
@@ -126,7 +130,8 @@ type Config struct {
 	// ShardUpdateMinInterval the minimal time interval which the shard info can be updated
 	ShardUpdateMinInterval dynamicconfig.DurationPropertyFn
 	// ShardSyncMinInterval the minimal time interval which the shard info should be sync to remote
-	ShardSyncMinInterval dynamicconfig.DurationPropertyFn
+	ShardSyncMinInterval            dynamicconfig.DurationPropertyFn
+	ShardSyncTimerJitterCoefficient dynamicconfig.FloatPropertyFn
 
 	// Time to hold a poll request before returning an empty response
 	// right now only used by GetMutableState
@@ -134,10 +139,8 @@ type Config struct {
 
 	// encoding the history events
 	EventEncodingType dynamicconfig.StringPropertyFnWithDomainFilter
-	// whether or not using eventsV2
-	EnableEventsV2 dynamicconfig.BoolPropertyFnWithDomainFilter
-	// whether or not using Terminate as default ParentClosePolicy, otherwise use Abandon for backward compatibility
-	UseTerminateAsDefaultParentClosePolicy dynamicconfig.BoolPropertyFnWithDomainFilter
+	// whether or not using ParentClosePolicy
+	EnableParentClosePolicy dynamicconfig.BoolPropertyFnWithDomainFilter
 	// whether or not enable system workers for processing parent close policy task
 	EnableParentClosePolicyWorker dynamicconfig.BoolPropertyFn
 	// parent close policy will be processed by sys workers(if enabled) if
@@ -173,6 +176,27 @@ type Config struct {
 	DecisionHeartbeatTimeout dynamicconfig.DurationPropertyFnWithDomainFilter
 	// MaxDecisionStartToCloseSeconds is the StartToCloseSeconds for decision
 	MaxDecisionStartToCloseSeconds dynamicconfig.IntPropertyFnWithDomainFilter
+
+	// The following is used by the new RPC replication stack
+	ReplicationTaskFetcherParallelism                dynamicconfig.IntPropertyFn
+	ReplicationTaskFetcherAggregationInterval        dynamicconfig.DurationPropertyFn
+	ReplicationTaskFetcherTimerJitterCoefficient     dynamicconfig.FloatPropertyFn
+	ReplicationTaskFetcherErrorRetryWait             dynamicconfig.DurationPropertyFn
+	ReplicationTaskProcessorErrorRetryWait           dynamicconfig.DurationPropertyFn
+	ReplicationTaskProcessorErrorRetryMaxAttempts    dynamicconfig.IntPropertyFn
+	ReplicationTaskProcessorNoTaskRetryWait          dynamicconfig.DurationPropertyFn
+	ReplicationTaskProcessorCleanupInterval          dynamicconfig.DurationPropertyFn
+	ReplicationTaskProcessorCleanupJitterCoefficient dynamicconfig.FloatPropertyFn
+
+	// The following are used by consistent query
+	EnableConsistentQuery         dynamicconfig.BoolPropertyFn
+	EnableConsistentQueryByDomain dynamicconfig.BoolPropertyFnWithDomainFilter
+	MaxBufferedQueryCount         dynamicconfig.IntPropertyFn
+
+	// Data integrity check related config knobs
+	MutableStateChecksumGenProbability    dynamicconfig.IntPropertyFnWithDomainFilter
+	MutableStateChecksumVerifyProbability dynamicconfig.IntPropertyFnWithDomainFilter
+	MutableStateChecksumInvalidateBefore  dynamicconfig.FloatPropertyFn
 }
 
 const (
@@ -183,6 +207,7 @@ const (
 func NewConfig(dc *dynamicconfig.Collection, numberOfShards int, storeType string, isAdvancedVisConfigExist bool) *Config {
 	cfg := &Config{
 		NumberOfShards:                                        numberOfShards,
+		EnableNDC:                                             dc.GetBoolPropertyFnWithDomainFilter(dynamicconfig.EnableNDC, false),
 		RPS:                                                   dc.GetIntProperty(dynamicconfig.HistoryRPS, 3000),
 		MaxIDLengthLimit:                                      dc.GetIntProperty(dynamicconfig.MaxIDLengthLimit, 1000),
 		PersistenceMaxQPS:                                     dc.GetIntProperty(dynamicconfig.HistoryPersistenceMaxQPS, 9000),
@@ -202,7 +227,10 @@ func NewConfig(dc *dynamicconfig.Collection, numberOfShards int, storeType strin
 		EventsCacheTTL:                                        dc.GetDurationProperty(dynamicconfig.EventsCacheTTL, time.Hour),
 		RangeSizeBits:                                         20, // 20 bits for sequencer, 2^20 sequence number for any range
 		AcquireShardInterval:                                  dc.GetDurationProperty(dynamicconfig.AcquireShardInterval, time.Minute),
-		StandbyClusterDelay:                                   dc.GetDurationProperty(dynamicconfig.AcquireShardInterval, 5*time.Minute),
+		AcquireShardConcurrency:                               dc.GetIntProperty(dynamicconfig.AcquireShardConcurrency, 1),
+		StandbyClusterDelay:                                   dc.GetDurationProperty(dynamicconfig.StandbyClusterDelay, 5*time.Minute),
+		StandbyTaskMissingEventsResendDelay:                   dc.GetDurationProperty(dynamicconfig.StandbyTaskMissingEventsResendDelay, 15*time.Minute),
+		StandbyTaskMissingEventsDiscardDelay:                  dc.GetDurationProperty(dynamicconfig.StandbyTaskMissingEventsDiscardDelay, 25*time.Minute),
 		TimerTaskBatchSize:                                    dc.GetIntProperty(dynamicconfig.TimerTaskBatchSize, 100),
 		TimerTaskWorkerCount:                                  dc.GetIntProperty(dynamicconfig.TimerTaskWorkerCount, 10),
 		TimerTaskMaxRetryCount:                                dc.GetIntProperty(dynamicconfig.TimerTaskMaxRetryCount, 100),
@@ -217,7 +245,7 @@ func NewConfig(dc *dynamicconfig.Collection, numberOfShards int, storeType strin
 		TimerProcessorMaxPollIntervalJitterCoefficient:        dc.GetFloat64Property(dynamicconfig.TimerProcessorMaxPollIntervalJitterCoefficient, 0.15),
 		TimerProcessorMaxTimeShift:                            dc.GetDurationProperty(dynamicconfig.TimerProcessorMaxTimeShift, 1*time.Second),
 		TimerProcessorHistoryArchivalSizeLimit:                dc.GetIntProperty(dynamicconfig.TimerProcessorHistoryArchivalSizeLimit, 500*1024),
-		TimerProcessorHistoryArchivalTimeLimit:                dc.GetDurationProperty(dynamicconfig.TimerProcessorHistoryArchivalTimeLimit, 1*time.Second),
+		TimerProcessorArchivalTimeLimit:                       dc.GetDurationProperty(dynamicconfig.TimerProcessorArchivalTimeLimit, 1*time.Second),
 		TransferTaskBatchSize:                                 dc.GetIntProperty(dynamicconfig.TransferTaskBatchSize, 100),
 		TransferProcessorFailoverMaxPollRPS:                   dc.GetIntProperty(dynamicconfig.TransferProcessorFailoverMaxPollRPS, 1),
 		TransferProcessorMaxPollRPS:                           dc.GetIntProperty(dynamicconfig.TransferProcessorMaxPollRPS, 20),
@@ -229,7 +257,7 @@ func NewConfig(dc *dynamicconfig.Collection, numberOfShards int, storeType strin
 		TransferProcessorUpdateAckInterval:                    dc.GetDurationProperty(dynamicconfig.TransferProcessorUpdateAckInterval, 30*time.Second),
 		TransferProcessorUpdateAckIntervalJitterCoefficient:   dc.GetFloat64Property(dynamicconfig.TransferProcessorUpdateAckIntervalJitterCoefficient, 0.15),
 		TransferProcessorCompleteTransferInterval:             dc.GetDurationProperty(dynamicconfig.TransferProcessorCompleteTransferInterval, 60*time.Second),
-		TransferProcessorVisibilityArchivalTimeLimit:          dc.GetDurationProperty(dynamicconfig.TransferProcessorVisibilityArchivalTimeLimit, 1*time.Second),
+		TransferProcessorVisibilityArchivalTimeLimit:          dc.GetDurationProperty(dynamicconfig.TransferProcessorVisibilityArchivalTimeLimit, 200*time.Millisecond),
 		ReplicatorTaskBatchSize:                               dc.GetIntProperty(dynamicconfig.ReplicatorTaskBatchSize, 100),
 		ReplicatorTaskWorkerCount:                             dc.GetIntProperty(dynamicconfig.ReplicatorTaskWorkerCount, 10),
 		ReplicatorTaskMaxRetryCount:                           dc.GetIntProperty(dynamicconfig.ReplicatorTaskMaxRetryCount, 100),
@@ -245,15 +273,15 @@ func NewConfig(dc *dynamicconfig.Collection, numberOfShards int, storeType strin
 		MaximumSignalsPerExecution:                            dc.GetIntPropertyFilteredByDomain(dynamicconfig.MaximumSignalsPerExecution, 0),
 		ShardUpdateMinInterval:                                dc.GetDurationProperty(dynamicconfig.ShardUpdateMinInterval, 5*time.Minute),
 		ShardSyncMinInterval:                                  dc.GetDurationProperty(dynamicconfig.ShardSyncMinInterval, 5*time.Minute),
+		ShardSyncTimerJitterCoefficient:                       dc.GetFloat64Property(dynamicconfig.TransferProcessorMaxPollIntervalJitterCoefficient, 0.15),
 
 		// history client: client/history/client.go set the client timeout 30s
-		LongPollExpirationInterval:             dc.GetDurationPropertyFilteredByDomain(dynamicconfig.HistoryLongPollExpirationInterval, time.Second*20),
-		EventEncodingType:                      dc.GetStringPropertyFnWithDomainFilter(dynamicconfig.DefaultEventEncoding, string(common.EncodingTypeThriftRW)),
-		EnableEventsV2:                         dc.GetBoolPropertyFnWithDomainFilter(dynamicconfig.EnableEventsV2, true),
-		UseTerminateAsDefaultParentClosePolicy: dc.GetBoolPropertyFnWithDomainFilter(dynamicconfig.UseTerminateAsDefaultParentClosePolicy, false),
-		NumParentClosePolicySystemWorkflows:    dc.GetIntProperty(dynamicconfig.NumParentClosePolicySystemWorkflows, 10),
-		EnableParentClosePolicyWorker:          dc.GetBoolProperty(dynamicconfig.EnableParentClosePolicyWorker, true),
-		ParentClosePolicyThreshold:             dc.GetIntPropertyFilteredByDomain(dynamicconfig.ParentClosePolicyThreshold, 10),
+		LongPollExpirationInterval:          dc.GetDurationPropertyFilteredByDomain(dynamicconfig.HistoryLongPollExpirationInterval, time.Second*20),
+		EventEncodingType:                   dc.GetStringPropertyFnWithDomainFilter(dynamicconfig.DefaultEventEncoding, string(common.EncodingTypeThriftRW)),
+		EnableParentClosePolicy:             dc.GetBoolPropertyFnWithDomainFilter(dynamicconfig.EnableParentClosePolicy, true),
+		NumParentClosePolicySystemWorkflows: dc.GetIntProperty(dynamicconfig.NumParentClosePolicySystemWorkflows, 10),
+		EnableParentClosePolicyWorker:       dc.GetBoolProperty(dynamicconfig.EnableParentClosePolicyWorker, true),
+		ParentClosePolicyThreshold:          dc.GetIntPropertyFilteredByDomain(dynamicconfig.ParentClosePolicyThreshold, 10),
 
 		NumArchiveSystemWorkflows: dc.GetIntProperty(dynamicconfig.NumArchiveSystemWorkflows, 1000),
 		ArchiveRequestRPS:         dc.GetIntProperty(dynamicconfig.ArchiveRequestRPS, 300), // should be much smaller than frontend RPS
@@ -265,7 +293,8 @@ func NewConfig(dc *dynamicconfig.Collection, numberOfShards int, storeType strin
 		HistoryCountLimitError: dc.GetIntPropertyFilteredByDomain(dynamicconfig.HistoryCountLimitError, 200*1024),
 		HistoryCountLimitWarn:  dc.GetIntPropertyFilteredByDomain(dynamicconfig.HistoryCountLimitWarn, 50*1024),
 
-		ThrottledLogRPS: dc.GetIntProperty(dynamicconfig.HistoryThrottledLogRPS, 4),
+		ThrottledLogRPS:   dc.GetIntProperty(dynamicconfig.HistoryThrottledLogRPS, 4),
+		EnableStickyQuery: dc.GetBoolPropertyFnWithDomainFilter(dynamicconfig.EnableStickyQuery, true),
 
 		ValidSearchAttributes:             dc.GetMapProperty(dynamicconfig.ValidSearchAttributes, definition.GetDefaultIndexedKeys()),
 		SearchAttributesNumberOfKeysLimit: dc.GetIntPropertyFilteredByDomain(dynamicconfig.SearchAttributesNumberOfKeysLimit, 100),
@@ -273,6 +302,23 @@ func NewConfig(dc *dynamicconfig.Collection, numberOfShards int, storeType strin
 		SearchAttributesTotalSizeLimit:    dc.GetIntPropertyFilteredByDomain(dynamicconfig.SearchAttributesTotalSizeLimit, 40*1024),
 		StickyTTL:                         dc.GetDurationPropertyFilteredByDomain(dynamicconfig.StickyTTL, time.Hour*24*365),
 		DecisionHeartbeatTimeout:          dc.GetDurationPropertyFilteredByDomain(dynamicconfig.DecisionHeartbeatTimeout, time.Minute*30),
+
+		ReplicationTaskFetcherParallelism:                dc.GetIntProperty(dynamicconfig.ReplicationTaskFetcherParallelism, 1),
+		ReplicationTaskFetcherAggregationInterval:        dc.GetDurationProperty(dynamicconfig.ReplicationTaskFetcherAggregationInterval, 2*time.Second),
+		ReplicationTaskFetcherTimerJitterCoefficient:     dc.GetFloat64Property(dynamicconfig.ReplicationTaskFetcherTimerJitterCoefficient, 0.15),
+		ReplicationTaskFetcherErrorRetryWait:             dc.GetDurationProperty(dynamicconfig.ReplicationTaskFetcherErrorRetryWait, time.Second),
+		ReplicationTaskProcessorErrorRetryWait:           dc.GetDurationProperty(dynamicconfig.ReplicationTaskProcessorErrorRetryWait, time.Second),
+		ReplicationTaskProcessorErrorRetryMaxAttempts:    dc.GetIntProperty(dynamicconfig.ReplicationTaskProcessorErrorRetryMaxAttempts, 20),
+		ReplicationTaskProcessorNoTaskRetryWait:          dc.GetDurationProperty(dynamicconfig.ReplicationTaskProcessorNoTaskInitialWait, 2*time.Second),
+		ReplicationTaskProcessorCleanupInterval:          dc.GetDurationProperty(dynamicconfig.ReplicationTaskProcessorCleanupInterval, 5*time.Minute),
+		ReplicationTaskProcessorCleanupJitterCoefficient: dc.GetFloat64Property(dynamicconfig.ReplicationTaskProcessorCleanupJitterCoefficient, 0.15),
+
+		EnableConsistentQuery:                 dc.GetBoolProperty(dynamicconfig.EnableConsistentQuery, true),
+		EnableConsistentQueryByDomain:         dc.GetBoolPropertyFnWithDomainFilter(dynamicconfig.EnableConsistentQueryByDomain, false),
+		MaxBufferedQueryCount:                 dc.GetIntProperty(dynamicconfig.MaxBufferedQueryCount, 1),
+		MutableStateChecksumGenProbability:    dc.GetIntPropertyFilteredByDomain(dynamicconfig.MutableStateChecksumGenProbability, 0),
+		MutableStateChecksumVerifyProbability: dc.GetIntPropertyFilteredByDomain(dynamicconfig.MutableStateChecksumVerifyProbability, 0),
+		MutableStateChecksumInvalidateBefore:  dc.GetFloat64Property(dynamicconfig.MutableStateChecksumInvalidateBefore, 0),
 	}
 
 	return cfg
@@ -285,134 +331,107 @@ func (config *Config) GetShardID(workflowID string) int {
 
 // Service represents the cadence-history service
 type Service struct {
-	stopC         chan struct{}
-	params        *service.BootstrapParams
-	config        *Config
-	metricsClient metrics.Client
+	resource.Resource
+
+	status  int32
+	handler *Handler
+	stopC   chan struct{}
+	params  *service.BootstrapParams
+	config  *Config
 }
 
 // NewService builds a new cadence-history service
-func NewService(params *service.BootstrapParams) common.Daemon {
-	config := NewConfig(dynamicconfig.NewCollection(params.DynamicConfig, params.Logger),
+func NewService(
+	params *service.BootstrapParams,
+) (resource.Resource, error) {
+	serviceConfig := NewConfig(dynamicconfig.NewCollection(params.DynamicConfig, params.Logger),
 		params.PersistenceConfig.NumHistoryShards,
 		params.PersistenceConfig.DefaultStoreType(),
 		params.PersistenceConfig.IsAdvancedVisibilityConfigExist())
-	params.ThrottledLogger = loggerimpl.NewThrottledLogger(params.Logger, config.ThrottledLogRPS)
-	params.UpdateLoggerWithServiceName(common.HistoryServiceName)
-	return &Service{
-		params: params,
-		stopC:  make(chan struct{}),
-		config: config,
+
+	params.PersistenceConfig.HistoryMaxConns = serviceConfig.HistoryMgrNumConns()
+	params.PersistenceConfig.SetMaxQPS(params.PersistenceConfig.DefaultStore, serviceConfig.PersistenceMaxQPS())
+	params.PersistenceConfig.VisibilityConfig = &config.VisibilityConfig{
+		VisibilityOpenMaxQPS:            serviceConfig.VisibilityOpenMaxQPS,
+		VisibilityClosedMaxQPS:          serviceConfig.VisibilityClosedMaxQPS,
+		EnableSampling:                  serviceConfig.EnableVisibilitySampling,
+		EnableReadFromClosedExecutionV2: serviceConfig.EnableReadFromClosedExecutionV2,
 	}
+
+	visibilityManagerInitializer := func(
+		persistenceBean persistenceClient.Bean,
+		logger log.Logger,
+	) (persistence.VisibilityManager, error) {
+		visibilityFromDB := persistenceBean.GetVisibilityManager()
+
+		var visibilityFromES persistence.VisibilityManager
+		if params.ESConfig != nil {
+			visibilityProducer, err := params.MessagingClient.NewProducer(common.VisibilityAppName)
+			if err != nil {
+				logger.Fatal("Creating visibility producer failed", tag.Error(err))
+			}
+			visibilityFromES = espersistence.NewESVisibilityManager("", nil, nil, visibilityProducer,
+				params.MetricsClient, logger)
+		}
+		return persistence.NewVisibilityManagerWrapper(
+			visibilityFromDB,
+			visibilityFromES,
+			dynamicconfig.GetBoolPropertyFnFilteredByDomain(false), // history visibility never read
+			serviceConfig.AdvancedVisibilityWritingMode,
+		), nil
+	}
+
+	serviceResource, err := resource.New(
+		params,
+		common.HistoryServiceName,
+		serviceConfig.ThrottledLogRPS,
+		visibilityManagerInitializer,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Service{
+		Resource: serviceResource,
+		status:   common.DaemonStatusInitialized,
+		stopC:    make(chan struct{}),
+		params:   params,
+		config:   serviceConfig,
+	}, nil
 }
 
 // Start starts the service
 func (s *Service) Start() {
-
-	var params = s.params
-	var log = params.Logger
-
-	log.Info("elastic search config", tag.ESConfig(params.ESConfig))
-	log.Info("starting", tag.Service(common.HistoryServiceName))
-
-	base := service.New(params)
-
-	s.metricsClient = base.GetMetricsClient()
-
-	pConfig := params.PersistenceConfig
-	pConfig.HistoryMaxConns = s.config.HistoryMgrNumConns()
-	pConfig.SetMaxQPS(pConfig.DefaultStore, s.config.PersistenceMaxQPS())
-	pConfig.VisibilityConfig = &config.VisibilityConfig{
-		VisibilityOpenMaxQPS:            s.config.VisibilityOpenMaxQPS,
-		VisibilityClosedMaxQPS:          s.config.VisibilityClosedMaxQPS,
-		EnableSampling:                  s.config.EnableVisibilitySampling,
-		EnableReadFromClosedExecutionV2: s.config.EnableReadFromClosedExecutionV2,
-	}
-	pFactory := persistencefactory.New(&pConfig, params.ClusterMetadata.GetCurrentClusterName(), s.metricsClient, log)
-
-	shardMgr, err := pFactory.NewShardManager()
-	if err != nil {
-		log.Fatal("failed to create shard manager", tag.Error(err))
+	if !atomic.CompareAndSwapInt32(&s.status, common.DaemonStatusInitialized, common.DaemonStatusStarted) {
+		return
 	}
 
-	metadata, err := pFactory.NewMetadataManager(persistencefactory.MetadataV1V2)
-	if err != nil {
-		log.Fatal("failed to create metadata manager", tag.Error(err))
-	}
+	logger := s.GetLogger()
+	logger.Info("elastic search config", tag.ESConfig(s.params.ESConfig))
+	logger.Info("history starting")
 
-	visibility, err := pFactory.NewVisibilityManager()
-	if err != nil {
-		log.Fatal("failed to create visibility manager", tag.Error(err))
-	}
+	s.handler = NewHandler(s.Resource, s.config)
+	s.handler.RegisterHandler()
 
-	var esVisibility persistence.VisibilityManager
-	if params.ESConfig != nil {
-		visibilityProducer, err := s.params.MessagingClient.NewProducer(common.VisibilityAppName)
-		if err != nil {
-			log.Fatal("Creating visibility producer failed", tag.Error(err))
-		}
-		esVisibility = espersistence.NewESVisibilityManager("", nil, nil, visibilityProducer,
-			s.metricsClient, log)
-	}
-	visibility = persistence.NewVisibilityManagerWrapper(
-		visibility,
-		esVisibility,
-		dynamicconfig.GetBoolPropertyFnFilteredByDomain(false), // history visibility never read
-		s.config.AdvancedVisibilityWritingMode,
-	)
+	// must start resource first
+	s.Resource.Start()
+	s.handler.Start()
 
-	history, err := pFactory.NewHistoryManager()
-	if err != nil {
-		log.Fatal("Creating history manager persistence failed", tag.Error(err))
-	}
-
-	historyV2, err := pFactory.NewHistoryV2Manager()
-	if err != nil {
-		log.Fatal("Creating historyV2 manager persistence failed", tag.Error(err))
-	}
-
-	domainCache := cache.NewDomainCache(metadata, base.GetClusterMetadata(), base.GetMetricsClient(), base.GetLogger())
-
-	historyArchiverBootstrapContainer := &archiver.HistoryBootstrapContainer{
-		HistoryManager:   history,
-		HistoryV2Manager: historyV2,
-		Logger:           base.GetLogger(),
-		MetricsClient:    base.GetMetricsClient(),
-		ClusterMetadata:  base.GetClusterMetadata(),
-		DomainCache:      domainCache,
-	}
-	visibilityArchvierBootstrapContainer := &archiver.VisibilityBootstrapContainer{
-		Logger:          base.GetLogger(),
-		MetricsClient:   base.GetMetricsClient(),
-		ClusterMetadata: base.GetClusterMetadata(),
-		DomainCache:     domainCache,
-	}
-	err = params.ArchiverProvider.RegisterBootstrapContainer(common.HistoryServiceName, historyArchiverBootstrapContainer, visibilityArchvierBootstrapContainer)
-	if err != nil {
-		log.Fatal("Failed to register archiver bootstrap container", tag.Error(err))
-	}
-
-	handler := NewHandler(base, s.config, shardMgr, metadata, visibility, history, historyV2, pFactory, domainCache, params.PublicClient)
-	handler.RegisterHandler()
-
-	// must start base service first
-	base.Start()
-	err = handler.Start()
-	if err != nil {
-		log.Fatal("History handler failed to start", tag.Error(err))
-	}
-
-	log.Info("started", tag.Service(common.HistoryServiceName))
+	logger.Info("history started")
 
 	<-s.stopC
-	base.Stop()
 }
 
 // Stop stops the service
 func (s *Service) Stop() {
-	select {
-	case s.stopC <- struct{}{}:
-	default:
+	if !atomic.CompareAndSwapInt32(&s.status, common.DaemonStatusStarted, common.DaemonStatusStopped) {
+		return
 	}
-	s.params.Logger.Info("stopped", tag.Service(common.HistoryServiceName))
+
+	close(s.stopC)
+
+	s.handler.Stop()
+	s.Resource.Stop()
+
+	s.GetLogger().Info("history stopped")
 }

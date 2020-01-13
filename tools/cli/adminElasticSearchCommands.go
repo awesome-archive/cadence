@@ -25,8 +25,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/uber/cadence/common/clock"
-	"github.com/uber/cadence/common/tokenbucket"
 	"math"
 	"net/http"
 	"os"
@@ -34,12 +32,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/uber/cadence/common/clock"
+	"github.com/uber/cadence/common/tokenbucket"
+
 	"github.com/olekukonko/tablewriter"
 	"github.com/olivere/elastic"
+	"github.com/urfave/cli"
+
 	"github.com/uber/cadence/.gen/go/indexer"
 	es "github.com/uber/cadence/common/elasticsearch"
 	"github.com/uber/cadence/common/elasticsearch/esql"
-	"github.com/urfave/cli"
 )
 
 const (
@@ -214,6 +216,8 @@ func AdminDelete(c *cli.Context) {
 	rps := c.Int(FlagRPS)
 	ratelimiter := tokenbucket.New(rps, clock.NewRealTimeSource())
 
+	// This is only executed from the CLI by an admin user
+	// #nosec
 	file, err := os.Open(inputFileName)
 	if err != nil {
 		ErrorAndExit("Cannot open input file", nil)
@@ -260,6 +264,8 @@ func AdminDelete(c *cli.Context) {
 }
 
 func parseIndexerMessage(fileName string) (messages []*indexer.Message, err error) {
+	// Executed from the CLI to parse existing elastiseach files
+	// #nosec
 	file, err := os.Open(fileName)
 	if err != nil {
 		return nil, err
@@ -489,7 +495,10 @@ func generateCSVReport(reportFileName string, headers []string, tableData [][]st
 	for _, data := range tableData {
 		csvContent += strings.Join(data, ",") + "\n"
 	}
-	f.WriteString(csvContent)
+	_, err = f.WriteString(csvContent)
+	if err != nil {
+		fmt.Printf("Error write to file, err: %v", err)
+	}
 	f.Close()
 }
 
@@ -541,6 +550,8 @@ func generateHTMLReport(reportFileName string, numBuckKeys int, sorted bool, hea
 	htmlContent = wrapWithTag(htmlContent, "table", "")
 	htmlContent = wrapWithTag(htmlContent, "body", "")
 	htmlContent = wrapWithTag(htmlContent, "html", "")
+
+	//nolint:errcheck
 	f.WriteString("<!DOCTYPE html>\n")
 	f.WriteString(`<head>
 	<style>

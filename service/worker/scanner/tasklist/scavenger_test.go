@@ -29,11 +29,12 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
+	"go.uber.org/zap"
+
 	"github.com/uber/cadence/common/log/loggerimpl"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/mocks"
 	p "github.com/uber/cadence/common/persistence"
-	"go.uber.org/zap"
 )
 
 type (
@@ -63,7 +64,6 @@ func (s *ScavengerTestSuite) SetupTest() {
 	logger := loggerimpl.NewLogger(zapLogger)
 	s.scvgr = NewScavenger(s.taskMgr, metrics.NewClient(tally.NoopScope, metrics.Worker), logger)
 	maxTasksPerJob = 4
-	nWorkers = 4
 	executorPollInterval = time.Millisecond * 50
 }
 

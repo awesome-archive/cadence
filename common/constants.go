@@ -68,6 +68,9 @@ const (
 type (
 	// EncodingType is an enum that represents various data encoding types
 	EncodingType string
+
+	// QueueType is an enum that represents various queue types
+	QueueType int
 )
 
 // MaxTaskTimeout is maximum task timeout allowed. 366 days in seconds
@@ -83,6 +86,9 @@ const (
 	VisibilityAppName = "visibility"
 )
 
+// This was flagged by salus as potentially hardcoded credentials. This is a false positive by the scanner and should be
+// disregarded.
+// #nosec
 const (
 	// SystemGlobalDomainName is global domain name for cadence system workflows running globally
 	SystemGlobalDomainName = "cadence-system-global"
@@ -103,6 +109,10 @@ const (
 	// CriticalLongPollTimeout is a threshold for the context timeout passed into long poll API,
 	// below which a warning will be logged
 	CriticalLongPollTimeout = time.Second * 20
+	// MaxWorkflowRetentionPeriodInDays is the maximum of workflow retention when registering domain
+	// !!! Do NOT simply decrease this number, because it is being used by history scavenger to avoid race condition against history archival.
+	// Check more details in history scanner(scavenger)
+	MaxWorkflowRetentionPeriodInDays = 30
 )
 
 const (
@@ -117,6 +127,11 @@ const (
 	ArchivalDisabled = "disabled"
 	// ArchivalPaused is the status for pausing archival
 	ArchivalPaused = "paused"
+)
+
+// Queue types used in queue table
+const (
+	DomainReplicationQueueType QueueType = 1
 )
 
 // enum for dynamic config AdvancedVisibilityWritingMode

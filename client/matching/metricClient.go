@@ -24,10 +24,11 @@ import (
 	"context"
 	"strings"
 
+	"go.uber.org/yarpc"
+
 	m "github.com/uber/cadence/.gen/go/matching"
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/metrics"
-	"go.uber.org/yarpc"
 )
 
 var _ Client = (*metricClient)(nil)
@@ -210,6 +211,23 @@ func (c *metricClient) DescribeTaskList(
 
 	if err != nil {
 		c.metricsClient.IncCounter(metrics.MatchingClientDescribeTaskListScope, metrics.CadenceClientFailures)
+	}
+
+	return resp, err
+}
+
+func (c *metricClient) ListTaskListPartitions(
+	ctx context.Context,
+	request *m.ListTaskListPartitionsRequest,
+	opts ...yarpc.CallOption) (*workflow.ListTaskListPartitionsResponse, error) {
+	c.metricsClient.IncCounter(metrics.MatchingClientListTaskListPartitionsScope, metrics.CadenceClientRequests)
+
+	sw := c.metricsClient.StartTimer(metrics.MatchingClientListTaskListPartitionsScope, metrics.CadenceClientLatency)
+	resp, err := c.client.ListTaskListPartitions(ctx, request, opts...)
+	sw.Stop()
+
+	if err != nil {
+		c.metricsClient.IncCounter(metrics.MatchingClientListTaskListPartitionsScope, metrics.CadenceClientFailures)
 	}
 
 	return resp, err

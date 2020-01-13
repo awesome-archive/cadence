@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 
 	"github.com/pborman/uuid"
+
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/backoff"
@@ -49,6 +50,8 @@ type (
 		config           *Config
 	}
 )
+
+var noopReleaseFn releaseWorkflowExecutionFunc = func(err error) {}
 
 const (
 	cacheNotReleased int32 = 0
@@ -120,7 +123,7 @@ func (c *historyCache) getAndCreateWorkflowExecution(
 	contextFromCache, cacheHit := c.Get(key).(workflowExecutionContext)
 	// TODO This will create a closure on every request.
 	//  Consider revisiting this if it causes too much GC activity
-	releaseFunc := func(error) {}
+	releaseFunc := noopReleaseFn
 	// If cache hit, we need to lock the cache to prevent race condition
 	if cacheHit {
 		if err := contextFromCache.lock(ctx); err != nil {
@@ -130,7 +133,7 @@ func (c *historyCache) getAndCreateWorkflowExecution(
 			c.metricsClient.IncCounter(metrics.HistoryCacheGetAndCreateScope, metrics.AcquireLockFailedCounter)
 			return nil, nil, nil, false, err
 		}
-		releaseFunc = c.makeReleaseFunc(key, cacheNotReleased, contextFromCache, false)
+		releaseFunc = c.makeReleaseFunc(key, contextFromCache, false)
 	} else {
 		c.metricsClient.IncCounter(metrics.HistoryCacheGetAndCreateScope, metrics.CacheMissCounter)
 	}
@@ -178,12 +181,12 @@ func (c *historyCache) getOrCreateWorkflowExecutionInternal(
 	domainID string,
 	execution workflow.WorkflowExecution,
 	scope int,
-	forceClearCache bool,
+	forceClearContext bool,
 ) (workflowExecutionContext, releaseWorkflowExecutionFunc, error) {
 
 	// Test hook for disabling the cache
 	if c.disabled {
-		return newWorkflowExecutionContext(domainID, execution, c.shard, c.executionManager, c.logger), func(error) {}, nil
+		return newWorkflowExecutionContext(domainID, execution, c.shard, c.executionManager, c.logger), noopReleaseFn, nil
 	}
 
 	key := definition.NewWorkflowIdentifier(domainID, execution.GetWorkflowId(), execution.GetRunId())
@@ -202,7 +205,7 @@ func (c *historyCache) getOrCreateWorkflowExecutionInternal(
 
 	// TODO This will create a closure on every request.
 	//  Consider revisiting this if it causes too much GC activity
-	releaseFunc := c.makeReleaseFunc(key, cacheNotReleased, workflowCtx, forceClearCache)
+	releaseFunc := c.makeReleaseFunc(key, workflowCtx, forceClearContext)
 
 	if err := workflowCtx.lock(ctx); err != nil {
 		// ctx is done before lock can be acquired
@@ -243,19 +246,26 @@ func (c *historyCache) validateWorkflowExecutionInfo(
 
 func (c *historyCache) makeReleaseFunc(
 	key definition.WorkflowIdentifier,
-	status int32,
 	context workflowExecutionContext,
-	forceClearCache bool,
+	forceClearContext bool,
 ) func(error) {
 
+	status := cacheNotReleased
 	return func(err error) {
 		if atomic.CompareAndSwapInt32(&status, cacheNotReleased, cacheReleased) {
-			if err != nil || forceClearCache {
-				// TODO see issue #668, there are certain type or errors which can bypass the clear
+			if rec := recover(); rec != nil {
 				context.clear()
+				context.unlock()
+				c.Release(key)
+				panic(rec)
+			} else {
+				if err != nil || forceClearContext {
+					// TODO see issue #668, there are certain type or errors which can bypass the clear
+					context.clear()
+				}
+				context.unlock()
+				c.Release(key)
 			}
-			context.unlock()
-			c.Release(key)
 		}
 	}
 }

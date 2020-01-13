@@ -77,6 +77,9 @@ type (
 		// Replication task related methods
 		GetReplicationTasks(request *GetReplicationTasksRequest) (*GetReplicationTasksResponse, error)
 		CompleteReplicationTask(request *CompleteReplicationTaskRequest) error
+		RangeCompleteReplicationTask(request *RangeCompleteReplicationTaskRequest) error
+		PutReplicationTaskToDLQ(request *PutReplicationTaskToDLQRequest) error
+		GetReplicationTasksFromDLQ(request *GetReplicationTasksFromDLQRequest) (*GetReplicationTasksFromDLQResponse, error)
 
 		// Timer related methods.
 		GetTimerIndexTasks(request *GetTimerIndexTasksRequest) (*GetTimerIndexTasksResponse, error)
@@ -87,23 +90,8 @@ type (
 		DeleteTask(request *DeleteTaskRequest) error
 	}
 
-	// HistoryStore is used to manage Workflow Execution HistoryEventBatch for Persistence layer
-	// DEPRECATED: use HistoryV2Store instead
+	// HistoryStore is to manager workflow history events
 	HistoryStore interface {
-		Closeable
-		GetName() string
-		//The below two APIs are related to serialization/deserialization
-
-		//DEPRECATED in favor of V2 APIs-AppendHistoryNodes
-		AppendHistoryEvents(request *InternalAppendHistoryEventsRequest) error
-		//DEPRECATED in favor of V2 APIs-ReadHistoryBranch
-		GetWorkflowExecutionHistory(request *InternalGetWorkflowExecutionHistoryRequest) (*InternalGetWorkflowExecutionHistoryResponse, error)
-		//DEPRECATED in favor of V2 APIs-DeleteHistoryBranch
-		DeleteWorkflowExecutionHistory(request *DeleteWorkflowExecutionHistoryRequest) error
-	}
-
-	// HistoryV2Store is to manager workflow history events
-	HistoryV2Store interface {
 		Closeable
 		GetName() string
 
@@ -118,8 +106,6 @@ type (
 		ForkHistoryBranch(request *InternalForkHistoryBranchRequest) (*InternalForkHistoryBranchResponse, error)
 		// DeleteHistoryBranch removes a branch
 		DeleteHistoryBranch(request *InternalDeleteHistoryBranchRequest) error
-		// UpdateHistoryBranch update a branch
-		CompleteForkBranch(request *InternalCompleteForkBranchRequest) error
 		// GetHistoryTree returns all branch information of a tree
 		GetHistoryTree(request *GetHistoryTreeRequest) (*GetHistoryTreeResponse, error)
 		// GetAllHistoryTreeBranches returns all branches of all trees
@@ -147,6 +133,22 @@ type (
 		CountWorkflowExecutions(request *CountWorkflowExecutionsRequest) (*CountWorkflowExecutionsResponse, error)
 	}
 
+	// Queue is a store to enqueue and get messages
+	Queue interface {
+		Closeable
+		EnqueueMessage(messagePayload []byte) error
+		ReadMessages(lastMessageID int, maxCount int) ([]*QueueMessage, error)
+		DeleteMessagesBefore(messageID int) error
+		UpdateAckLevel(messageID int, clusterName string) error
+		GetAckLevels() (map[string]int, error)
+	}
+
+	// QueueMessage is the message that stores in the queue
+	QueueMessage struct {
+		ID      int
+		Payload []byte
+	}
+
 	// DataBlob represents a blob for any binary data.
 	// It contains raw data, and metadata(right now only encoding) in other field
 	// Note that it should be only used for Persistence layer, below dataInterface and application(historyEngine/etc)
@@ -159,7 +161,7 @@ type (
 	InternalCreateWorkflowExecutionRequest struct {
 		RangeID int64
 
-		CreateWorkflowMode int
+		Mode CreateWorkflowMode
 
 		PreviousRunID            string
 		PreviousLastWriteVersion int64
@@ -181,7 +183,7 @@ type (
 		TaskList                           string
 		WorkflowTypeName                   string
 		WorkflowTimeout                    int32
-		DecisionTimeoutValue               int32
+		DecisionStartToCloseTimeout        int32
 		ExecutionContext                   []byte
 		State                              int
 		CloseStatus                        int
@@ -219,13 +221,11 @@ type (
 		ExpirationTime     time.Time
 		MaximumAttempts    int32
 		NonRetriableErrors []string
-		// events V2 related
-		EventStoreVersion int32
-		BranchToken       []byte
-		CronSchedule      string
-		ExpirationSeconds int32
-		Memo              map[string][]byte
-		SearchAttributes  map[string][]byte
+		BranchToken        []byte
+		CronSchedule       string
+		ExpirationSeconds  int32
+		Memo               map[string][]byte
+		SearchAttributes   map[string][]byte
 
 		// attributes which are not related to mutable state at all
 		HistorySize int64
@@ -233,14 +233,16 @@ type (
 
 	// InternalWorkflowMutableState indicates workflow related state for Persistence Interface
 	InternalWorkflowMutableState struct {
-		ActivitInfos        map[int64]*InternalActivityInfo
+		ExecutionInfo    *InternalWorkflowExecutionInfo
+		ReplicationState *ReplicationState
+		VersionHistories *DataBlob
+		ActivityInfos    map[int64]*InternalActivityInfo
+
 		TimerInfos          map[string]*TimerInfo
 		ChildExecutionInfos map[int64]*InternalChildExecutionInfo
 		RequestCancelInfos  map[int64]*RequestCancelInfo
 		SignalInfos         map[int64]*SignalInfo
 		SignalRequestedIDs  map[string]struct{}
-		ExecutionInfo       *InternalWorkflowExecutionInfo
-		ReplicationState    *ReplicationState
 		BufferedEvents      []*DataBlob
 	}
 
@@ -304,6 +306,8 @@ type (
 	InternalUpdateWorkflowExecutionRequest struct {
 		RangeID int64
 
+		Mode UpdateWorkflowMode
+
 		UpdateWorkflowMutation InternalWorkflowMutation
 
 		NewWorkflowSnapshot *InternalWorkflowSnapshot
@@ -313,16 +317,20 @@ type (
 	InternalConflictResolveWorkflowExecutionRequest struct {
 		RangeID int64
 
-		// previous workflow information
-		PrevRunID            string
-		PrevLastWriteVersion int64
-		PrevState            int
+		Mode ConflictResolveWorkflowMode
 
 		// workflow to be resetted
 		ResetWorkflowSnapshot InternalWorkflowSnapshot
 
+		// maybe new workflow
+		NewWorkflowSnapshot *InternalWorkflowSnapshot
+
 		// current workflow
 		CurrentWorkflowMutation *InternalWorkflowMutation
+
+		// TODO deprecate this once nDC migration is completed
+		//  basically should use CurrentWorkflowMutation instead
+		CurrentWorkflowCAS *CurrentWorkflowCAS
 	}
 
 	// InternalResetWorkflowExecutionRequest is used to reset workflow execution state for Persistence Interface
@@ -348,10 +356,13 @@ type (
 	InternalWorkflowMutation struct {
 		ExecutionInfo    *InternalWorkflowExecutionInfo
 		ReplicationState *ReplicationState
+		VersionHistories *DataBlob
+		StartVersion     int64
+		LastWriteVersion int64
 
 		UpsertActivityInfos       []*InternalActivityInfo
 		DeleteActivityInfos       []int64
-		UpserTimerInfos           []*TimerInfo
+		UpsertTimerInfos          []*TimerInfo
 		DeleteTimerInfos          []string
 		UpsertChildExecutionInfos []*InternalChildExecutionInfo
 		DeleteChildExecutionInfo  *int64
@@ -375,6 +386,9 @@ type (
 	InternalWorkflowSnapshot struct {
 		ExecutionInfo    *InternalWorkflowExecutionInfo
 		ReplicationState *ReplicationState
+		VersionHistories *DataBlob
+		StartVersion     int64
+		LastWriteVersion int64
 
 		ActivityInfos       []*InternalActivityInfo
 		TimerInfos          []*TimerInfo
@@ -423,33 +437,6 @@ type (
 	// InternalGetWorkflowExecutionResponse is the response to GetworkflowExecutionRequest for Persistence Interface
 	InternalGetWorkflowExecutionResponse struct {
 		State *InternalWorkflowMutableState
-	}
-
-	// InternalGetWorkflowExecutionHistoryRequest is used to retrieve history of a workflow execution
-	InternalGetWorkflowExecutionHistoryRequest struct {
-		// an extra field passing from GetWorkflowExecutionHistoryRequest
-		LastEventBatchVersion int64
-
-		DomainID  string
-		Execution workflow.WorkflowExecution
-		// Get the history events from FirstEventID. Inclusive.
-		FirstEventID int64
-		// Get the history events upto NextEventID.  Not Inclusive.
-		NextEventID int64
-		// Maximum number of history append transactions per page
-		PageSize int
-		// Token to continue reading next page of history append transactions.  Pass in empty slice for first page
-		NextPageToken []byte
-	}
-
-	// InternalGetWorkflowExecutionHistoryResponse is the response to GetWorkflowExecutionHistoryRequest for Persistence Interface
-	InternalGetWorkflowExecutionHistoryResponse struct {
-		History []*DataBlob
-		// Token to read next page if there are more events beyond page size.
-		// Use this to set NextPageToken on GetworkflowExecutionHistoryRequest to read the next page.
-		NextPageToken []byte
-		// an extra field passing to DataInterface
-		LastEventBatchVersion int64
 	}
 
 	// InternalForkHistoryBranchRequest is used to fork a history branch
@@ -630,7 +617,6 @@ type (
 		FailoverVersion             int64
 		FailoverNotificationVersion int64
 		NotificationVersion         int64
-		TableVersion                int
 	}
 
 	// InternalUpdateDomainRequest is used to update domain
@@ -642,7 +628,6 @@ type (
 		FailoverVersion             int64
 		FailoverNotificationVersion int64
 		NotificationVersion         int64
-		TableVersion                int
 	}
 
 	// InternalListDomainsResponse is the response for GetDomain
@@ -689,5 +674,41 @@ func (d *DataBlob) GetEncoding() common.EncodingType {
 		return common.EncodingTypeEmpty
 	default:
 		return common.EncodingTypeUnknown
+	}
+}
+
+// ToThrift convert data blob to thrift representation
+func (d *DataBlob) ToThrift() *workflow.DataBlob {
+	switch d.Encoding {
+	case common.EncodingTypeJSON:
+		return &workflow.DataBlob{
+			EncodingType: workflow.EncodingTypeJSON.Ptr(),
+			Data:         d.Data,
+		}
+	case common.EncodingTypeThriftRW:
+		return &workflow.DataBlob{
+			EncodingType: workflow.EncodingTypeThriftRW.Ptr(),
+			Data:         d.Data,
+		}
+	default:
+		panic(fmt.Sprintf("DataBlob seeing unsupported enconding type: %v", d.Encoding))
+	}
+}
+
+// NewDataBlobFromThrift convert data blob from thrift representation
+func NewDataBlobFromThrift(blob *workflow.DataBlob) *DataBlob {
+	switch blob.GetEncodingType() {
+	case workflow.EncodingTypeJSON:
+		return &DataBlob{
+			Encoding: common.EncodingTypeJSON,
+			Data:     blob.Data,
+		}
+	case workflow.EncodingTypeThriftRW:
+		return &DataBlob{
+			Encoding: common.EncodingTypeThriftRW,
+			Data:     blob.Data,
+		}
+	default:
+		panic(fmt.Sprintf("NewDataBlobFromThrift seeing unsupported enconding type: %v", blob.GetEncodingType()))
 	}
 }

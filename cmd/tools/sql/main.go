@@ -21,10 +21,13 @@
 package main
 
 import (
-	"github.com/uber/cadence/tools/sql"
 	"os"
+
+	_ "github.com/uber/cadence/common/persistence/sql/sqlplugin/mysql"    // needed to load mysql plugin
+	_ "github.com/uber/cadence/common/persistence/sql/sqlplugin/postgres" // needed to load postgres plugin
+	"github.com/uber/cadence/tools/sql"
 )
 
 func main() {
-	sql.RunTool(os.Args)
+	sql.RunTool(os.Args) //nolint:errcheck
 }

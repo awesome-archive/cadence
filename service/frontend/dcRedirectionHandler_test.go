@@ -26,21 +26,15 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/uber-go/tally"
+
 	"github.com/uber/cadence/.gen/go/cadence/workflowservicetest"
 	"github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/client"
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/archiver"
-	"github.com/uber/cadence/common/archiver/provider"
-	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/cluster"
-	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/log/loggerimpl"
 	"github.com/uber/cadence/common/metrics"
-	"github.com/uber/cadence/common/mocks"
-	"github.com/uber/cadence/common/service"
+	"github.com/uber/cadence/common/resource"
 	"github.com/uber/cadence/common/service/config"
 	"github.com/uber/cadence/common/service/dynamicconfig"
 )
@@ -48,27 +42,23 @@ import (
 type (
 	dcRedirectionHandlerSuite struct {
 		suite.Suite
-		logger                 log.Logger
+		*require.Assertions
+
+		controller               *gomock.Controller
+		mockResource             *resource.Test
+		mockFrontendHandler      *MockWorkflowHandler
+		mockRemoteFrontendClient *workflowservicetest.MockClient
+		mockClusterMetadata      *cluster.MockMetadata
+
+		mockDCRedirectionPolicy *MockDCRedirectionPolicy
+
 		domainName             string
 		domainID               string
 		currentClusterName     string
 		alternativeClusterName string
 		config                 *Config
-		service                service.Service
-		domainCache            cache.DomainCache
 
-		controller               *gomock.Controller
-		mockDCRedirectionPolicy  *MockDCRedirectionPolicy
-		mockClusterMetadata      *mocks.ClusterMetadata
-		mockMetadataMgr          *mocks.MetadataManager
-		mockClientBean           *client.MockClientBean
-		mockFrontendHandler      *MockWorkflowHandler
-		mockRemoteFrontendClient *workflowservicetest.MockClient
-		mockArchivalMetadata     *archiver.MockArchivalMetadata
-		mockArchiverProvider     *provider.MockArchiverProvider
-
-		frontendHandler *WorkflowHandler
-		handler         *DCRedirectionHandlerImpl
+		handler *DCRedirectionHandlerImpl
 	}
 )
 
@@ -84,46 +74,36 @@ func (s *dcRedirectionHandlerSuite) TearDownSuite() {
 }
 
 func (s *dcRedirectionHandlerSuite) SetupTest() {
-	var err error
-	s.logger, err = loggerimpl.NewDevelopment()
-	s.Require().NoError(err)
+	s.Assertions = require.New(s.T())
+
 	s.domainName = "some random domain name"
 	s.domainID = "some random domain ID"
 	s.currentClusterName = cluster.TestCurrentClusterName
 	s.alternativeClusterName = cluster.TestAlternativeClusterName
-	s.config = NewConfig(dynamicconfig.NewCollection(dynamicconfig.NewNopClient(), s.logger), 0, false)
-	s.mockMetadataMgr = &mocks.MetadataManager{}
 
-	s.mockClusterMetadata = &mocks.ClusterMetadata{}
-	s.mockClusterMetadata.On("GetCurrentClusterName").Return(s.currentClusterName)
-	s.mockClusterMetadata.On("IsGlobalDomainEnabled").Return(true)
-	metricsClient := metrics.NewClient(tally.NoopScope, metrics.Frontend)
-	s.mockClientBean = &client.MockClientBean{}
-	s.controller = gomock.NewController(s.T())
-	s.mockRemoteFrontendClient = workflowservicetest.NewMockClient(s.controller)
-	s.mockArchivalMetadata = &archiver.MockArchivalMetadata{}
-	s.mockArchiverProvider = &provider.MockArchiverProvider{}
-	s.mockClientBean.On("GetRemoteFrontendClient", s.alternativeClusterName).Return(s.mockRemoteFrontendClient)
-	s.service = service.NewTestService(s.mockClusterMetadata, nil, metricsClient, s.mockClientBean, s.mockArchivalMetadata, s.mockArchiverProvider)
-
-	s.domainCache = cache.NewDomainCache(s.mockMetadataMgr, s.service.GetClusterMetadata(), s.service.GetMetricsClient(), s.service.GetLogger())
-	frontendHandler := NewWorkflowHandler(s.service, s.config, s.mockMetadataMgr, nil, nil, nil, nil, s.domainCache)
-	frontendHandler.metricsClient = metricsClient
-	frontendHandler.startWG.Done()
-
-	s.handler = NewDCRedirectionHandler(frontendHandler, config.DCRedirectionPolicy{})
 	s.mockDCRedirectionPolicy = &MockDCRedirectionPolicy{}
+
+	s.controller = gomock.NewController(s.T())
+	s.mockResource = resource.NewTest(s.controller, metrics.Frontend)
+	s.mockClusterMetadata = s.mockResource.ClusterMetadata
+	s.mockRemoteFrontendClient = s.mockResource.RemoteFrontendClient
+
+	s.mockClusterMetadata.EXPECT().GetCurrentClusterName().Return(s.currentClusterName).AnyTimes()
+	s.mockClusterMetadata.EXPECT().IsGlobalDomainEnabled().Return(true).AnyTimes()
+
+	s.config = NewConfig(dynamicconfig.NewCollection(dynamicconfig.NewNopClient(), s.mockResource.GetLogger()), 0, false)
+	frontendHandler := NewWorkflowHandler(s.mockResource, s.config, nil)
+
 	s.mockFrontendHandler = NewMockWorkflowHandler(s.controller)
+	s.handler = NewDCRedirectionHandler(frontendHandler, config.DCRedirectionPolicy{})
 	s.handler.frontendHandler = s.mockFrontendHandler
 	s.handler.redirectionPolicy = s.mockDCRedirectionPolicy
 }
 
 func (s *dcRedirectionHandlerSuite) TearDownTest() {
-	s.mockMetadataMgr.AssertExpectations(s.T())
-	s.mockDCRedirectionPolicy.AssertExpectations(s.T())
-	s.mockArchivalMetadata.AssertExpectations(s.T())
-	s.mockArchiverProvider.AssertExpectations(s.T())
 	s.controller.Finish()
+	s.mockResource.Finish(s.T())
+	s.mockDCRedirectionPolicy.AssertExpectations(s.T())
 }
 
 func (s *dcRedirectionHandlerSuite) TestDescribeTaskList() {
@@ -817,6 +797,33 @@ func (s *dcRedirectionHandlerSuite) TestTerminateWorkflowExecution() {
 	err = callFn(s.currentClusterName)
 	s.Nil(err)
 	s.mockRemoteFrontendClient.EXPECT().TerminateWorkflowExecution(gomock.Any(), req).Return(nil).Times(1)
+	err = callFn(s.alternativeClusterName)
+	s.Nil(err)
+}
+
+func (s *dcRedirectionHandlerSuite) TestListTaskListPartitions() {
+	apiName := "ListTaskListPartitions"
+
+	s.mockDCRedirectionPolicy.On("WithDomainNameRedirect",
+		s.domainName, apiName, mock.Anything).Return(nil).Times(1)
+
+	req := &shared.ListTaskListPartitionsRequest{
+		Domain: common.StringPtr(s.domainName),
+		TaskList: &shared.TaskList{
+			Name: common.StringPtr("test_tesk_list"),
+			Kind: common.TaskListKindPtr(0),
+		},
+	}
+	resp, err := s.handler.ListTaskListPartitions(context.Background(), req)
+	s.Nil(err)
+	// the resp is initialized to nil, since inner function is not called
+	s.Nil(resp)
+
+	callFn := s.mockDCRedirectionPolicy.Calls[0].Arguments[2].(func(string) error)
+	s.mockFrontendHandler.EXPECT().ListTaskListPartitions(gomock.Any(), req).Return(&shared.ListTaskListPartitionsResponse{}, nil).Times(1)
+	err = callFn(s.currentClusterName)
+	s.Nil(err)
+	s.mockRemoteFrontendClient.EXPECT().ListTaskListPartitions(gomock.Any(), req).Return(&shared.ListTaskListPartitionsResponse{}, nil).Times(1)
 	err = callFn(s.alternativeClusterName)
 	s.Nil(err)
 }

@@ -25,21 +25,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/uber/cadence/common/checksum"
+
 	"github.com/pborman/uuid"
+
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/codec"
-)
-
-// TODO remove this table version
-const (
-	// this is a temp version indicating where is the domain resides
-	// either V1 or V2
-	DomainTableVersionV1 = 1
-	DomainTableVersionV2 = 2
-
-	// 0/1 or empty are all considered as V1
-	EventStoreVersionV2 = 2
 )
 
 // Domain status
@@ -49,17 +41,57 @@ const (
 	DomainStatusDeleted
 )
 
+const (
+	// EventStoreVersion is already deprecated, this is used for forward
+	// compatibility (so that rollback is possible).
+	// TODO we can remove it after fixing all the query templates and when
+	// we decide the compatibility is no longer needed.
+	EventStoreVersion = 2
+)
+
+// CreateWorkflowMode workflow creation mode
+type CreateWorkflowMode int
+
 // Create Workflow Execution Mode
 const (
 	// Fail if current record exists
 	// Only applicable for CreateWorkflowExecution
-	CreateWorkflowModeBrandNew = iota
+	CreateWorkflowModeBrandNew CreateWorkflowMode = iota
 	// Update current record only if workflow is closed
 	// Only applicable for CreateWorkflowExecution
 	CreateWorkflowModeWorkflowIDReuse
 	// Update current record only if workflow is open
 	// Only applicable for UpdateWorkflowExecution
 	CreateWorkflowModeContinueAsNew
+	// Do not update current record since workflow to
+	// applicable for CreateWorkflowExecution, UpdateWorkflowExecution
+	CreateWorkflowModeZombie
+)
+
+// UpdateWorkflowMode update mode
+type UpdateWorkflowMode int
+
+// Update Workflow Execution Mode
+const (
+	// Update workflow, including current record
+	// NOTE: update on current record is a condition update
+	UpdateWorkflowModeUpdateCurrent UpdateWorkflowMode = iota
+	// Update workflow, without current record
+	// NOTE: current record CANNOT point to the workflow to be updated
+	UpdateWorkflowModeBypassCurrent
+)
+
+// ConflictResolveWorkflowMode conflict resolve mode
+type ConflictResolveWorkflowMode int
+
+// Conflict Resolve Workflow Mode
+const (
+	// Conflict resolve workflow, including current record
+	// NOTE: update on current record is a condition update
+	ConflictResolveWorkflowModeUpdateCurrent ConflictResolveWorkflowMode = iota
+	// Conflict resolve workflow, without current record
+	// NOTE: current record CANNOT point to the workflow to be updated
+	ConflictResolveWorkflowModeBypassCurrent
 )
 
 // Workflow execution states
@@ -67,6 +99,9 @@ const (
 	WorkflowStateCreated = iota
 	WorkflowStateRunning
 	WorkflowStateCompleted
+	WorkflowStateZombie
+	WorkflowStateVoid
+	WorkflowStateCorrupted
 )
 
 // Workflow execution close status
@@ -141,6 +176,9 @@ const (
 	// TransferTaskTransferTargetRunID is the the dummy run ID for transfer tasks of types
 	// that do not have a target workflow
 	TransferTaskTransferTargetRunID = "30000000-0000-f000-f000-000000000002"
+
+	// indicate invalid workflow state transition
+	invalidStateTransitionMsg = "unable to change workflow state from %v to %v, close status %v"
 )
 
 const numItemsInGarbageInfo = 3
@@ -242,7 +280,7 @@ type (
 		TaskList                           string
 		WorkflowTypeName                   string
 		WorkflowTimeout                    int32
-		DecisionTimeoutValue               int32
+		DecisionStartToCloseTimeout        int32
 		ExecutionContext                   []byte
 		State                              int
 		CloseStatus                        int
@@ -282,9 +320,7 @@ type (
 		ExpirationTime     time.Time
 		MaximumAttempts    int32
 		NonRetriableErrors []string
-		// events V2 related
-		EventStoreVersion int32
-		BranchToken       []byte
+		BranchToken        []byte
 		// Cron
 		CronSchedule      string
 		ExpirationSeconds int32
@@ -325,21 +361,21 @@ type (
 
 	// ReplicationTaskInfo describes the replication task created for replication of history events
 	ReplicationTaskInfo struct {
-		DomainID                string
-		WorkflowID              string
-		RunID                   string
-		TaskID                  int64
-		TaskType                int
-		FirstEventID            int64
-		NextEventID             int64
-		Version                 int64
-		LastReplicationInfo     map[string]*ReplicationInfo
-		ScheduledID             int64
-		EventStoreVersion       int32
-		BranchToken             []byte
-		NewRunEventStoreVersion int32
-		NewRunBranchToken       []byte
-		ResetWorkflow           bool
+		DomainID          string
+		WorkflowID        string
+		RunID             string
+		TaskID            int64
+		TaskType          int
+		FirstEventID      int64
+		NextEventID       int64
+		Version           int64
+		ScheduledID       int64
+		BranchToken       []byte
+		NewRunBranchToken []byte
+		ResetWorkflow     bool
+
+		// TODO deprecate when NDC is fully released && migrated
+		LastReplicationInfo map[string]*ReplicationInfo
 	}
 
 	// TimerTaskInfo describes a timer task.
@@ -538,17 +574,17 @@ type (
 
 	// HistoryReplicationTask is the replication task created for shipping history replication events to other clusters
 	HistoryReplicationTask struct {
-		VisibilityTimestamp     time.Time
-		TaskID                  int64
-		FirstEventID            int64
-		NextEventID             int64
-		Version                 int64
-		LastReplicationInfo     map[string]*ReplicationInfo
-		EventStoreVersion       int32
-		BranchToken             []byte
-		ResetWorkflow           bool
-		NewRunEventStoreVersion int32
-		NewRunBranchToken       []byte
+		VisibilityTimestamp time.Time
+		TaskID              int64
+		FirstEventID        int64
+		NextEventID         int64
+		Version             int64
+		BranchToken         []byte
+		NewRunBranchToken   []byte
+
+		// TODO when 2DC is deprecated remove these 2 attributes
+		ResetWorkflow       bool
+		LastReplicationInfo map[string]*ReplicationInfo
 	}
 
 	// SyncActivityTask is the replication task created for shipping activity info to other clusters
@@ -565,6 +601,24 @@ type (
 		LastEventID int64
 	}
 
+	// VersionHistoryItem contains the event id and the associated version
+	VersionHistoryItem struct {
+		EventID int64
+		Version int64
+	}
+
+	// VersionHistory provides operations on version history
+	VersionHistory struct {
+		BranchToken []byte
+		Items       []*VersionHistoryItem
+	}
+
+	// VersionHistories contains a set of VersionHistory
+	VersionHistories struct {
+		CurrentVersionHistoryIndex int
+		Histories                  []*VersionHistory
+	}
+
 	// WorkflowMutableState indicates workflow related state
 	WorkflowMutableState struct {
 		ActivityInfos       map[int64]*ActivityInfo
@@ -577,6 +631,8 @@ type (
 		ExecutionStats      *ExecutionStats
 		ReplicationState    *ReplicationState
 		BufferedEvents      []*workflow.HistoryEvent
+		VersionHistories    *VersionHistories
+		Checksum            checksum.Checksum
 	}
 
 	// ActivityInfo details.
@@ -589,6 +645,7 @@ type (
 		StartedID                int64
 		StartedEvent             *workflow.HistoryEvent
 		StartedTime              time.Time
+		DomainID                 string
 		ActivityID               string
 		RequestID                string
 		Details                  []byte
@@ -602,7 +659,6 @@ type (
 		TimerTaskStatus          int32
 		// For retry
 		Attempt            int32
-		DomainID           string
 		StartedIdentity    string
 		TaskList           string
 		HasRetryPolicy     bool
@@ -625,7 +681,7 @@ type (
 		TimerID    string
 		StartedID  int64
 		ExpiryTime time.Time
-		TaskID     int64
+		TaskStatus int64
 	}
 
 	// ChildExecutionInfo has details for pending child executions.
@@ -688,7 +744,7 @@ type (
 	CreateWorkflowExecutionRequest struct {
 		RangeID int64
 
-		CreateWorkflowMode int
+		Mode CreateWorkflowMode
 
 		PreviousRunID            string
 		PreviousLastWriteVersion int64
@@ -731,6 +787,8 @@ type (
 	UpdateWorkflowExecutionRequest struct {
 		RangeID int64
 
+		Mode UpdateWorkflowMode
+
 		UpdateWorkflowMutation WorkflowMutation
 
 		NewWorkflowSnapshot *WorkflowSnapshot
@@ -742,18 +800,30 @@ type (
 	ConflictResolveWorkflowExecutionRequest struct {
 		RangeID int64
 
-		// previous workflow information
-		PrevRunID            string
-		PrevLastWriteVersion int64
-		PrevState            int
+		Mode ConflictResolveWorkflowMode
 
 		// workflow to be resetted
 		ResetWorkflowSnapshot WorkflowSnapshot
 
+		// maybe new workflow
+		NewWorkflowSnapshot *WorkflowSnapshot
+
 		// current workflow
 		CurrentWorkflowMutation *WorkflowMutation
 
+		// TODO deprecate this once nDC migration is completed
+		//  basically should use CurrentWorkflowMutation instead
+		CurrentWorkflowCAS *CurrentWorkflowCAS
+
 		Encoding common.EncodingType // optional binary encoding type
+	}
+
+	// CurrentWorkflowCAS represent a compare and swap on current record
+	// TODO deprecate this once nDC migration is completed
+	CurrentWorkflowCAS struct {
+		PrevRunID            string
+		PrevLastWriteVersion int64
+		PrevState            int
 	}
 
 	// ResetWorkflowExecutionRequest is used to reset workflow execution state for current run and create new run
@@ -791,10 +861,11 @@ type (
 		ExecutionInfo    *WorkflowExecutionInfo
 		ExecutionStats   *ExecutionStats
 		ReplicationState *ReplicationState
+		VersionHistories *VersionHistories
 
 		UpsertActivityInfos       []*ActivityInfo
 		DeleteActivityInfos       []int64
-		UpserTimerInfos           []*TimerInfo
+		UpsertTimerInfos          []*TimerInfo
 		DeleteTimerInfos          []string
 		UpsertChildExecutionInfos []*ChildExecutionInfo
 		DeleteChildExecutionInfo  *int64
@@ -812,6 +883,7 @@ type (
 		TimerTasks       []Task
 
 		Condition int64
+		Checksum  checksum.Checksum
 	}
 
 	// WorkflowSnapshot is used as generic workflow execution state snapshot
@@ -819,6 +891,7 @@ type (
 		ExecutionInfo    *WorkflowExecutionInfo
 		ExecutionStats   *ExecutionStats
 		ReplicationState *ReplicationState
+		VersionHistories *VersionHistories
 
 		ActivityInfos       []*ActivityInfo
 		TimerInfos          []*TimerInfo
@@ -832,6 +905,7 @@ type (
 		TimerTasks       []Task
 
 		Condition int64
+		Checksum  checksum.Checksum
 	}
 
 	// DeleteWorkflowExecutionRequest is used to delete a workflow execution
@@ -899,6 +973,26 @@ type (
 	CompleteReplicationTaskRequest struct {
 		TaskID int64
 	}
+
+	// RangeCompleteReplicationTaskRequest is used to complete a range of task in the replication task queue
+	RangeCompleteReplicationTaskRequest struct {
+		InclusiveEndTaskID int64
+	}
+
+	// PutReplicationTaskToDLQRequest is used to put a replication task to dlq
+	PutReplicationTaskToDLQRequest struct {
+		SourceClusterName string
+		TaskInfo          *ReplicationTaskInfo
+	}
+
+	// GetReplicationTasksFromDLQRequest is used to get replication tasks from dlq
+	GetReplicationTasksFromDLQRequest struct {
+		SourceClusterName string
+		GetReplicationTasksRequest
+	}
+
+	// GetReplicationTasksFromDLQResponse is the response for GetReplicationTasksFromDLQ
+	GetReplicationTasksFromDLQResponse = GetReplicationTasksResponse
 
 	// RangeCompleteTimerTaskRequest is used to complete a range of tasks in the timer task queue
 	RangeCompleteTimerTaskRequest struct {
@@ -1017,68 +1111,6 @@ type (
 		NextPageToken []byte
 	}
 
-	// AppendHistoryEventsRequest is used to append new events to workflow execution history
-	// Deprecated: use v2 API-AppendHistoryNodes() instead
-	AppendHistoryEventsRequest struct {
-		DomainID          string
-		Execution         workflow.WorkflowExecution
-		FirstEventID      int64
-		EventBatchVersion int64
-		RangeID           int64
-		TransactionID     int64
-		Events            []*workflow.HistoryEvent
-		Overwrite         bool
-		Encoding          common.EncodingType // optional binary encoding type
-	}
-
-	// GetWorkflowExecutionHistoryRequest is used to retrieve history of a workflow execution
-	// Deprecated: use v2 API-AppendHistoryNodes() instead
-	GetWorkflowExecutionHistoryRequest struct {
-		DomainID  string
-		Execution workflow.WorkflowExecution
-		// Get the history events from FirstEventID. Inclusive.
-		FirstEventID int64
-		// Get the history events upto NextEventID.  Not Inclusive.
-		NextEventID int64
-		// Maximum number of history append transactions per page
-		PageSize int
-		// Token to continue reading next page of history append transactions.  Pass in empty slice for first page
-		NextPageToken []byte
-	}
-
-	// GetWorkflowExecutionHistoryResponse is the response to GetWorkflowExecutionHistoryRequest
-	// Deprecated: use V2 API instead-ReadHistoryBranch()
-	GetWorkflowExecutionHistoryResponse struct {
-		History *workflow.History
-		// Token to read next page if there are more events beyond page size.
-		// Use this to set NextPageToken on GetWorkflowExecutionHistoryRequest to read the next page.
-		NextPageToken []byte
-		// the first_event_id of last loaded batch
-		LastFirstEventID int64
-		// Size of history read from store
-		Size int
-	}
-
-	// GetWorkflowExecutionHistoryByBatchResponse is the response to GetWorkflowExecutionHistoryRequest
-	// Deprecated: use V2 API instead-ReadHistoryBranchByBatch()
-	GetWorkflowExecutionHistoryByBatchResponse struct {
-		History []*workflow.History
-		// Token to read next page if there are more events beyond page size.
-		// Use this to set NextPageToken on GetWorkflowExecutionHistoryRequest to read the next page.
-		NextPageToken []byte
-		// the first_event_id of last loaded batch
-		LastFirstEventID int64
-		// Size of history read from store
-		Size int
-	}
-
-	// DeleteWorkflowExecutionHistoryRequest is used to delete workflow execution history
-	// Deprecated: use v2 API-AppendHistoryNodes() instead
-	DeleteWorkflowExecutionHistoryRequest struct {
-		DomainID  string
-		Execution workflow.WorkflowExecution
-	}
-
 	// DomainInfo describes the domain entity
 	DomainInfo struct {
 		ID          string
@@ -1110,6 +1142,7 @@ type (
 	// ClusterReplicationConfig describes the cross DC cluster replication configuration
 	ClusterReplicationConfig struct {
 		ClusterName string
+		// Note: if adding new properties of non-primitive types, remember to update GetCopy()
 	}
 
 	// CreateDomainRequest is used to create the domain
@@ -1143,7 +1176,6 @@ type (
 		FailoverVersion             int64
 		FailoverNotificationVersion int64
 		NotificationVersion         int64
-		TableVersion                int
 	}
 
 	// UpdateDomainRequest is used to update domain
@@ -1155,7 +1187,6 @@ type (
 		FailoverVersion             int64
 		FailoverNotificationVersion int64
 		NotificationVersion         int64
-		TableVersion                int
 	}
 
 	// DeleteDomainRequest is used to delete domain entry from domains table
@@ -1379,8 +1410,7 @@ type (
 	// GetHistoryTreeResponse is a response to GetHistoryTreeRequest
 	GetHistoryTreeResponse struct {
 		// all branches of a tree
-		Branches                  []*workflow.HistoryBranch
-		ForkingInProgressBranches []HistoryBranchDetail
+		Branches []*workflow.HistoryBranch
 	}
 
 	// GetAllHistoryTreeBranchesRequest is a request of GetAllHistoryTreeBranches
@@ -1397,12 +1427,6 @@ type (
 		NextPageToken []byte
 		// all branches of all trees
 		Branches []HistoryBranchDetail
-	}
-
-	// AppendHistoryEventsResponse is response for AppendHistoryEventsRequest
-	// Deprecated: uses V2 API-AppendHistoryNodesRequest
-	AppendHistoryEventsResponse struct {
-		Size int
 	}
 
 	// Closeable is an interface for any entity that supports a close operation to release resources
@@ -1442,6 +1466,9 @@ type (
 		// Replication task related methods
 		GetReplicationTasks(request *GetReplicationTasksRequest) (*GetReplicationTasksResponse, error)
 		CompleteReplicationTask(request *CompleteReplicationTaskRequest) error
+		RangeCompleteReplicationTask(request *RangeCompleteReplicationTaskRequest) error
+		PutReplicationTaskToDLQ(request *PutReplicationTaskToDLQRequest) error
+		GetReplicationTasksFromDLQ(request *GetReplicationTasksFromDLQRequest) (*GetReplicationTasksFromDLQResponse, error)
 
 		// Timer related methods.
 		GetTimerIndexTasks(request *GetTimerIndexTasksRequest) (*GetTimerIndexTasksResponse, error)
@@ -1481,25 +1508,8 @@ type (
 		CompleteTasksLessThan(request *CompleteTasksLessThanRequest) (int, error)
 	}
 
-	// HistoryManager is used to manage Workflow Execution HistoryEventBatch
-	// Deprecated: use HistoryV2Manager instead
+	// HistoryManager is used to manager workflow history events
 	HistoryManager interface {
-		Closeable
-		GetName() string
-
-		// Deprecated: use v2 API-AppendHistoryNodes() instead
-		AppendHistoryEvents(request *AppendHistoryEventsRequest) (*AppendHistoryEventsResponse, error)
-		// GetWorkflowExecutionHistory retrieves the paginated list of history events for given execution
-		// Deprecated: use v2 API-ReadHistoryBranch() instead
-		GetWorkflowExecutionHistory(request *GetWorkflowExecutionHistoryRequest) (*GetWorkflowExecutionHistoryResponse, error)
-		// Deprecated: use v2 API-ReadHistoryBranchByBatch() instead
-		GetWorkflowExecutionHistoryByBatch(request *GetWorkflowExecutionHistoryRequest) (*GetWorkflowExecutionHistoryByBatchResponse, error)
-		// Deprecated: use v2 API-DeleteHistoryBranch instead
-		DeleteWorkflowExecutionHistory(request *DeleteWorkflowExecutionHistoryRequest) error
-	}
-
-	// HistoryV2Manager is used to manager workflow history events
-	HistoryV2Manager interface {
 		Closeable
 		GetName() string
 
@@ -1518,8 +1528,6 @@ type (
 		ReadRawHistoryBranch(request *ReadHistoryBranchRequest) (*ReadRawHistoryBranchResponse, error)
 		// ForkHistoryBranch forks a new branch from a old branch
 		ForkHistoryBranch(request *ForkHistoryBranchRequest) (*ForkHistoryBranchResponse, error)
-		// CompleteForkBranch will complete the forking process after update mutableState, this is to help preventing data leakage
-		CompleteForkBranch(request *CompleteForkBranchRequest) error
 		// DeleteHistoryBranch removes a branch
 		// If this is the last branch to delete, it will also remove the root node
 		DeleteHistoryBranch(request *DeleteHistoryBranchRequest) error
@@ -2364,6 +2372,12 @@ func (config *ClusterReplicationConfig) deserialize(input map[string]interface{}
 	config.ClusterName = input["cluster_name"].(string)
 }
 
+// GetCopy return a copy of ClusterReplicationConfig
+func (config *ClusterReplicationConfig) GetCopy() *ClusterReplicationConfig {
+	res := *config
+	return &res
+}
+
 // DBTimestampToUnixNano converts CQL timestamp to UnixNano
 func DBTimestampToUnixNano(milliseconds int64) int64 {
 	return milliseconds * 1000 * 1000 // Milliseconds are 10⁻³, nanoseconds are 10⁻⁹, (-3) - (-9) = 6, so multiply by 10⁶
@@ -2372,26 +2386,6 @@ func DBTimestampToUnixNano(milliseconds int64) int64 {
 // UnixNanoToDBTimestamp converts UnixNano to CQL timestamp
 func UnixNanoToDBTimestamp(timestamp int64) int64 {
 	return timestamp / (1000 * 1000) // Milliseconds are 10⁻³, nanoseconds are 10⁻⁹, (-9) - (-3) = -6, so divide by 10⁶
-}
-
-// SetNextEventID sets the nextEventID
-func (e *WorkflowExecutionInfo) SetNextEventID(id int64) {
-	e.NextEventID = id
-}
-
-// IncreaseNextEventID increase the nextEventID by 1
-func (e *WorkflowExecutionInfo) IncreaseNextEventID() {
-	e.NextEventID++
-}
-
-// SetLastFirstEventID set the LastFirstEventID
-func (e *WorkflowExecutionInfo) SetLastFirstEventID(id int64) {
-	e.LastFirstEventID = id
-}
-
-// GetCurrentBranch return the current branch token
-func (e *WorkflowExecutionInfo) GetCurrentBranch() []byte {
-	return e.BranchToken
 }
 
 var internalThriftEncoder = codec.NewThriftRWEncoder()
@@ -2462,4 +2456,23 @@ func SplitHistoryGarbageCleanupInfo(info string) (domainID, workflowID, runID st
 	workflowEnd := len(info) - len(runID) - 1
 	workflowID = info[len(domainID)+1 : workflowEnd]
 	return
+}
+
+// NewGetReplicationTasksFromDLQRequest creates a new GetReplicationTasksFromDLQRequest
+func NewGetReplicationTasksFromDLQRequest(
+	sourceClusterName string,
+	readLevel int64,
+	maxReadLevel int64,
+	batchSize int,
+	nextPageToken []byte,
+) *GetReplicationTasksFromDLQRequest {
+	return &GetReplicationTasksFromDLQRequest{
+		SourceClusterName: sourceClusterName,
+		GetReplicationTasksRequest: GetReplicationTasksRequest{
+			ReadLevel:     readLevel,
+			MaxReadLevel:  maxReadLevel,
+			BatchSize:     batchSize,
+			NextPageToken: nextPageToken,
+		},
+	}
 }

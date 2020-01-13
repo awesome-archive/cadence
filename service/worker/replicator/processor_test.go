@@ -27,28 +27,38 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
+
 	h "github.com/uber/cadence/.gen/go/history"
 	"github.com/uber/cadence/.gen/go/history/historyservicetest"
 	"github.com/uber/cadence/.gen/go/replicator"
 	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/codec"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/loggerimpl"
 	messageMocks "github.com/uber/cadence/common/messaging/mocks"
 	"github.com/uber/cadence/common/metrics"
+	"github.com/uber/cadence/common/persistence"
 	"github.com/uber/cadence/common/service/dynamicconfig"
 	"github.com/uber/cadence/common/task"
 	"github.com/uber/cadence/common/xdc"
-	"go.uber.org/zap"
 )
 
 type (
 	replicationTaskProcessorSuite struct {
 		suite.Suite
+		*require.Assertions
+
+		controller        *gomock.Controller
+		mockHistoryClient *historyservicetest.MockClient
+		mockDomainCache   *cache.MockDomainCache
+		mockNDCResender   *xdc.MockNDCHistoryResender
+
 		currentCluster string
 		sourceCluster  string
 		config         *Config
@@ -56,14 +66,13 @@ type (
 		metricsClient  metrics.Client
 		msgEncoder     codec.BinaryEncoder
 
-		mockMsg                     *messageMocks.Message
-		mockDomainReplicator        *MockDomainReplicator
-		mockHistoryClient           *historyservicetest.MockClient
-		mockRereplicator            *xdc.MockHistoryRereplicator
-		mockSequentialTaskProcessor *task.MockSequentialTaskProcessor
+		mockMsg              *messageMocks.Message
+		mockDomainReplicator *MockDomainReplicator
 
-		controller *gomock.Controller
-		processor  *replicationTaskProcessor
+		mockSequentialTaskProcessor *task.MockSequentialTaskProcessor
+		mockRereplicator            *xdc.MockHistoryRereplicator
+
+		processor *replicationTaskProcessor
 	}
 )
 
@@ -80,23 +89,46 @@ func (s *replicationTaskProcessorSuite) TearDownSuite() {
 }
 
 func (s *replicationTaskProcessorSuite) SetupTest() {
-	zapLogger, err := zap.NewDevelopment()
-	s.Require().NoError(err)
-	s.logger = loggerimpl.NewLogger(zapLogger)
+	s.Assertions = require.New(s.T())
+
+	s.controller = gomock.NewController(s.T())
+	s.controller = gomock.NewController(s.T())
+	s.mockHistoryClient = historyservicetest.NewMockClient(s.controller)
+	s.mockDomainCache = cache.NewMockDomainCache(s.controller)
+	s.mockNDCResender = xdc.NewMockNDCHistoryResender(s.controller)
+	s.mockDomainCache.EXPECT().GetDomainByID(gomock.Any()).Return(
+		cache.NewGlobalDomainCacheEntryForTest(
+			&persistence.DomainInfo{},
+			&persistence.DomainConfig{},
+			&persistence.DomainReplicationConfig{
+				ActiveClusterName: cluster.TestCurrentClusterName,
+				Clusters: []*persistence.ClusterReplicationConfig{
+					{ClusterName: cluster.TestCurrentClusterName},
+					{ClusterName: cluster.TestAlternativeClusterName},
+				},
+			},
+			123,
+			nil,
+		),
+		nil,
+	).AnyTimes()
+
+	s.logger = loggerimpl.NewDevelopmentForTest(s.Suite)
 	s.config = &Config{
 		ReplicatorTaskConcurrency: dynamicconfig.GetIntPropertyFn(10),
 	}
 	s.metricsClient = metrics.NewClient(tally.NoopScope, metrics.Worker)
 	s.msgEncoder = codec.NewThriftRWEncoder()
 
-	s.controller = gomock.NewController(s.T())
 	s.mockMsg = &messageMocks.Message{}
 	s.mockMsg.On("Partition").Return(int32(0))
 	s.mockMsg.On("Offset").Return(int64(0))
 	s.mockDomainReplicator = &MockDomainReplicator{}
-	s.mockHistoryClient = historyservicetest.NewMockClient(s.controller)
 	s.mockRereplicator = &xdc.MockHistoryRereplicator{}
 	s.mockSequentialTaskProcessor = &task.MockSequentialTaskProcessor{}
+
+	s.currentCluster = cluster.TestAlternativeClusterName
+	s.sourceCluster = cluster.TestCurrentClusterName
 
 	s.processor = newReplicationTaskProcessor(
 		s.currentCluster,
@@ -108,7 +140,9 @@ func (s *replicationTaskProcessorSuite) SetupTest() {
 		s.metricsClient,
 		s.mockDomainReplicator,
 		s.mockRereplicator,
+		s.mockNDCResender,
 		s.mockHistoryClient,
+		s.mockDomainCache,
 		s.mockSequentialTaskProcessor,
 	)
 }
@@ -238,7 +272,7 @@ func (s *replicationTaskProcessorSuite) TestDecodeMsgAndSubmit_SyncShard_FailedT
 }
 
 func (s *replicationTaskProcessorSuite) TestDecodeMsgAndSubmit_SyncActivity_Success() {
-	replicationAttr := &replicator.SyncActicvityTaskAttributes{
+	replicationAttr := &replicator.SyncActivityTaskAttributes{
 		DomainId:          common.StringPtr("some random domain ID"),
 		WorkflowId:        common.StringPtr("some random workflow ID"),
 		RunId:             common.StringPtr("some random run ID"),
@@ -252,8 +286,8 @@ func (s *replicationTaskProcessorSuite) TestDecodeMsgAndSubmit_SyncActivity_Succ
 		Attempt:           common.Int32Ptr(1048576),
 	}
 	replicationTask := &replicator.ReplicationTask{
-		TaskType:                    replicator.ReplicationTaskTypeSyncActivity.Ptr(),
-		SyncActicvityTaskAttributes: replicationAttr,
+		TaskType:                   replicator.ReplicationTaskTypeSyncActivity.Ptr(),
+		SyncActivityTaskAttributes: replicationAttr,
 	}
 	replicationTaskBinary, err := s.msgEncoder.Encode(replicationTask)
 	s.Nil(err)
@@ -264,7 +298,7 @@ func (s *replicationTaskProcessorSuite) TestDecodeMsgAndSubmit_SyncActivity_Succ
 }
 
 func (s *replicationTaskProcessorSuite) TestDecodeMsgAndSubmit_SyncActivity_FailedThenSuccess() {
-	replicationAttr := &replicator.SyncActicvityTaskAttributes{
+	replicationAttr := &replicator.SyncActivityTaskAttributes{
 		DomainId:          common.StringPtr("some random domain ID"),
 		WorkflowId:        common.StringPtr("some random workflow ID"),
 		RunId:             common.StringPtr("some random run ID"),
@@ -278,8 +312,8 @@ func (s *replicationTaskProcessorSuite) TestDecodeMsgAndSubmit_SyncActivity_Fail
 		Attempt:           common.Int32Ptr(1048576),
 	}
 	replicationTask := &replicator.ReplicationTask{
-		TaskType:                    replicator.ReplicationTaskTypeSyncActivity.Ptr(),
-		SyncActicvityTaskAttributes: replicationAttr,
+		TaskType:                   replicator.ReplicationTaskTypeSyncActivity.Ptr(),
+		SyncActivityTaskAttributes: replicationAttr,
 	}
 	replicationTaskBinary, err := s.msgEncoder.Encode(replicationTask)
 	s.Nil(err)
@@ -303,10 +337,8 @@ func (s *replicationTaskProcessorSuite) TestDecodeMsgAndSubmit_History_Success()
 		History: &shared.History{
 			Events: []*shared.HistoryEvent{&shared.HistoryEvent{EventId: common.Int64Ptr(1)}},
 		},
-		NewRunHistory:           nil,
-		EventStoreVersion:       common.Int32Ptr(144),
-		NewRunEventStoreVersion: nil,
-		ResetWorkflow:           common.BoolPtr(true),
+		NewRunHistory: nil,
+		ResetWorkflow: common.BoolPtr(true),
 	}
 	replicationTask := &replicator.ReplicationTask{
 		TaskType:              replicator.ReplicationTaskTypeHistory.Ptr(),
@@ -333,10 +365,8 @@ func (s *replicationTaskProcessorSuite) TestDecodeMsgAndSubmit_History_FailedThe
 		History: &shared.History{
 			Events: []*shared.HistoryEvent{&shared.HistoryEvent{EventId: common.Int64Ptr(1)}},
 		},
-		NewRunHistory:           nil,
-		EventStoreVersion:       common.Int32Ptr(144),
-		NewRunEventStoreVersion: nil,
-		ResetWorkflow:           common.BoolPtr(true),
+		NewRunHistory: nil,
+		ResetWorkflow: common.BoolPtr(true),
 	}
 	replicationTask := &replicator.ReplicationTask{
 		TaskType:              replicator.ReplicationTaskTypeHistory.Ptr(),

@@ -18,6 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -copyright_file ../../LICENSE -package $GOPACKAGE -source $GOFILE -destination workflowExecutionContext_mock.go
+
 package history
 
 import (
@@ -36,12 +38,15 @@ import (
 	"github.com/uber/cadence/common/persistence"
 )
 
+const (
+	defaultRemoteCallTimeout = 30 * time.Second
+)
+
 type (
 	workflowExecutionContext interface {
 		getDomainName() string
 		getDomainID() string
 		getExecution() *workflow.WorkflowExecution
-		getLogger() log.Logger
 
 		loadWorkflowExecution() (mutableState, error)
 		loadExecutionStats() (*persistence.ExecutionStats, error)
@@ -52,6 +57,10 @@ type (
 
 		getHistorySize() int64
 		setHistorySize(size int64)
+
+		reapplyEvents(
+			eventBatches []*persistence.WorkflowEvents,
+		) error
 
 		persistFirstWorkflowEvents(
 			workflowEvents *persistence.WorkflowEvents,
@@ -64,18 +73,21 @@ type (
 			newWorkflow *persistence.WorkflowSnapshot,
 			historySize int64,
 			now time.Time,
-			createMode int,
+			createMode persistence.CreateWorkflowMode,
 			prevRunID string,
 			prevLastWriteVersion int64,
 		) error
 		conflictResolveWorkflowExecution(
 			now time.Time,
-			prevRunID string,
-			prevLastWriteVersion int64,
-			prevState int,
+			conflictResolveMode persistence.ConflictResolveWorkflowMode,
 			resetMutableState mutableState,
-			resetHistorySize int64,
-		) (mutableState, error)
+			newContext workflowExecutionContext,
+			newMutableState mutableState,
+			currentContext workflowExecutionContext,
+			currentMutableState mutableState,
+			currentTransactionPolicy *transactionPolicy,
+			workflowCAS *persistence.CurrentWorkflowCAS,
+		) error
 		updateWorkflowExecutionAsActive(
 			now time.Time,
 		) error
@@ -94,6 +106,7 @@ type (
 		) error
 		updateWorkflowExecutionWithNew(
 			now time.Time,
+			updateMode persistence.UpdateWorkflowMode,
 			newContext workflowExecutionContext,
 			newMutableState mutableState,
 			currentWorkflowTransactionPolicy transactionPolicy,
@@ -114,8 +127,6 @@ type (
 			baseRunID string,
 			baseRunNextEventID int64,
 		) (retError error)
-
-		getQueryRegistry() QueryRegistry
 	}
 )
 
@@ -131,10 +142,9 @@ type (
 		timeSource        clock.TimeSource
 
 		mutex           locks.Mutex
-		msBuilder       mutableState
+		mutableState    mutableState
 		stats           *persistence.ExecutionStats
 		updateCondition int64
-		queryRegistry   QueryRegistry
 	}
 )
 
@@ -151,26 +161,19 @@ func newWorkflowExecutionContext(
 	executionManager persistence.ExecutionManager,
 	logger log.Logger,
 ) *workflowExecutionContextImpl {
-	lg := logger.WithTags(
-		tag.WorkflowID(execution.GetWorkflowId()),
-		tag.WorkflowRunID(execution.GetRunId()),
-		tag.WorkflowDomainID(domainID),
-	)
-
 	return &workflowExecutionContextImpl{
 		domainID:          domainID,
 		workflowExecution: execution,
 		shard:             shard,
 		engine:            shard.GetEngine(),
 		executionManager:  executionManager,
-		logger:            lg,
+		logger:            logger,
 		metricsClient:     shard.GetMetricsClient(),
 		timeSource:        shard.GetTimeSource(),
 		mutex:             locks.NewMutex(),
 		stats: &persistence.ExecutionStats{
 			HistorySize: 0,
 		},
-		queryRegistry: NewQueryRegistry(),
 	}
 }
 
@@ -184,8 +187,10 @@ func (c *workflowExecutionContextImpl) unlock() {
 
 func (c *workflowExecutionContextImpl) clear() {
 	c.metricsClient.IncCounter(metrics.WorkflowContextScope, metrics.WorkflowContextCleared)
-	c.msBuilder = nil
-	c.stats = nil
+	c.mutableState = nil
+	c.stats = &persistence.ExecutionStats{
+		HistorySize: 0,
+	}
 }
 
 func (c *workflowExecutionContextImpl) getDomainID() string {
@@ -194,10 +199,6 @@ func (c *workflowExecutionContextImpl) getDomainID() string {
 
 func (c *workflowExecutionContextImpl) getExecution() *workflow.WorkflowExecution {
 	return &c.workflowExecution
-}
-
-func (c *workflowExecutionContextImpl) getLogger() log.Logger {
-	return c.logger
 }
 
 func (c *workflowExecutionContextImpl) getDomainName() string {
@@ -225,87 +226,95 @@ func (c *workflowExecutionContextImpl) loadExecutionStats() (*persistence.Execut
 }
 
 func (c *workflowExecutionContextImpl) loadWorkflowExecution() (mutableState, error) {
-	err := c.loadWorkflowExecutionInternal()
+
+	domainEntry, err := c.shard.GetDomainCache().GetDomainByID(c.domainID)
 	if err != nil {
 		return nil, err
 	}
-	err = c.updateVersion()
-	if err != nil {
-		return nil, err
-	}
-	return c.msBuilder, nil
-}
 
-func (c *workflowExecutionContextImpl) loadWorkflowExecutionInternal() error {
-	if c.msBuilder != nil {
-		return nil
-	}
-
-	response, err := c.getWorkflowExecutionWithRetry(&persistence.GetWorkflowExecutionRequest{
-		DomainID:  c.domainID,
-		Execution: c.workflowExecution,
-	})
-	if err != nil {
-		return err
-	}
-
-	c.msBuilder = newMutableStateBuilder(
-		c.shard,
-		c.shard.GetEventsCache(),
-		c.logger,
-		c.getDomainName(),
-	)
-	c.msBuilder.Load(response.State)
-	c.stats = response.State.ExecutionStats
-	c.updateCondition = response.State.ExecutionInfo.NextEventID
-
-	// finally emit execution and session stats
-	emitWorkflowExecutionStats(
-		c.metricsClient,
-		c.getDomainName(),
-		response.MutableStateStats,
-		c.stats.HistorySize,
-	)
-	return nil
-}
-
-func (c *workflowExecutionContextImpl) updateVersion() error {
-	if c.shard.GetService().GetClusterMetadata().IsGlobalDomainEnabled() && c.msBuilder.GetReplicationState() != nil {
-		if !c.msBuilder.IsWorkflowExecutionRunning() {
-			// we should not update the version on mutable state when the workflow is finished
-			return nil
-		}
-		// Support for global domains is enabled and we are performing an update for global domain
-		domainEntry, err := c.shard.GetDomainCache().GetDomainByID(c.domainID)
+	if c.mutableState == nil {
+		response, err := c.getWorkflowExecutionWithRetry(&persistence.GetWorkflowExecutionRequest{
+			DomainID:  c.domainID,
+			Execution: c.workflowExecution,
+		})
 		if err != nil {
-			return err
+			return nil, err
 		}
-		c.msBuilder.UpdateReplicationStateVersion(domainEntry.GetFailoverVersion(), false)
 
-		// this is a hack, only create replication task if have # target cluster > 1, for more see #868
-		c.msBuilder.UpdateReplicationPolicy(domainEntry.GetReplicationPolicy())
+		c.mutableState = newMutableStateBuilder(
+			c.shard,
+			c.shard.GetEventsCache(),
+			c.logger,
+			domainEntry,
+		)
+
+		c.mutableState.Load(response.State)
+
+		c.stats = response.State.ExecutionStats
+		c.updateCondition = response.State.ExecutionInfo.NextEventID
+
+		// finally emit execution and session stats
+		emitWorkflowExecutionStats(
+			c.metricsClient,
+			c.getDomainName(),
+			response.MutableStateStats,
+			c.stats.HistorySize,
+		)
 	}
-	return nil
+
+	flushBeforeReady, err := c.mutableState.StartTransaction(domainEntry)
+	if err != nil {
+		return nil, err
+	}
+	if !flushBeforeReady {
+		return c.mutableState, nil
+	}
+
+	if err = c.updateWorkflowExecutionAsActive(
+		c.shard.GetTimeSource().Now(),
+	); err != nil {
+		return nil, err
+	}
+
+	flushBeforeReady, err = c.mutableState.StartTransaction(domainEntry)
+	if err != nil {
+		return nil, err
+	}
+	if flushBeforeReady {
+		return nil, &workflow.InternalServiceError{
+			Message: "workflowExecutionContext counter flushBeforeReady status after loading mutable state from DB",
+		}
+	}
+
+	return c.mutableState, nil
 }
 
 func (c *workflowExecutionContextImpl) createWorkflowExecution(
 	newWorkflow *persistence.WorkflowSnapshot,
 	historySize int64,
 	now time.Time,
-	createMode int,
+	createMode persistence.CreateWorkflowMode,
 	prevRunID string,
 	prevLastWriteVersion int64,
-) error {
+) (retError error) {
+
+	defer func() {
+		if retError != nil {
+			c.clear()
+		}
+	}()
 
 	createRequest := &persistence.CreateWorkflowExecutionRequest{
 		// workflow create mode & prev run ID & version
-		CreateWorkflowMode:       createMode,
+		Mode:                     createMode,
 		PreviousRunID:            prevRunID,
 		PreviousLastWriteVersion: prevLastWriteVersion,
 
 		NewWorkflowSnapshot: *newWorkflow,
 	}
 
+	historySize += c.getHistorySize()
+	c.setHistorySize(historySize)
 	createRequest.NewWorkflowSnapshot.ExecutionStats = &persistence.ExecutionStats{
 		HistorySize: historySize,
 	}
@@ -325,50 +334,168 @@ func (c *workflowExecutionContextImpl) createWorkflowExecution(
 
 func (c *workflowExecutionContextImpl) conflictResolveWorkflowExecution(
 	now time.Time,
-	prevRunID string,
-	prevLastWriteVersion int64,
-	prevState int,
+	conflictResolveMode persistence.ConflictResolveWorkflowMode,
 	resetMutableState mutableState,
-	resetHistorySize int64,
-) (mutableState, error) {
+	newContext workflowExecutionContext,
+	newMutableState mutableState,
+	currentContext workflowExecutionContext,
+	currentMutableState mutableState,
+	currentTransactionPolicy *transactionPolicy,
+	workflowCAS *persistence.CurrentWorkflowCAS,
+) (retError error) {
 
-	// this only resets one mutableState for a workflow
-	resetWorkflow, workflowEventsSeq, err := resetMutableState.CloseTransactionAsSnapshot(
+	defer func() {
+		if retError != nil {
+			c.clear()
+		}
+	}()
+
+	resetWorkflow, resetWorkflowEventsSeq, err := resetMutableState.CloseTransactionAsSnapshot(
 		now,
 		transactionPolicyPassive,
 	)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if len(workflowEventsSeq) != 0 {
-		return nil, &workflow.BadRequestError{
-			Message: "reset mutable state should not generate new events",
+	resetHistorySize := c.getHistorySize()
+	for _, workflowEvents := range resetWorkflowEventsSeq {
+		eventsSize, err := c.persistNonFirstWorkflowEvents(workflowEvents)
+		if err != nil {
+			return err
 		}
+		resetHistorySize += eventsSize
 	}
-
+	c.setHistorySize(resetHistorySize)
 	resetWorkflow.ExecutionStats = &persistence.ExecutionStats{
 		HistorySize: resetHistorySize,
 	}
 
+	var newWorkflow *persistence.WorkflowSnapshot
+	var newWorkflowEventsSeq []*persistence.WorkflowEvents
+	if newContext != nil && newMutableState != nil {
+
+		defer func() {
+			if retError != nil {
+				newContext.clear()
+			}
+		}()
+
+		newWorkflow, newWorkflowEventsSeq, err = newMutableState.CloseTransactionAsSnapshot(
+			now,
+			transactionPolicyPassive,
+		)
+		if err != nil {
+			return err
+		}
+		newWorkflowSizeSize := newContext.getHistorySize()
+		startEvents := newWorkflowEventsSeq[0]
+		eventsSize, err := c.persistFirstWorkflowEvents(startEvents)
+		if err != nil {
+			return err
+		}
+		newWorkflowSizeSize += eventsSize
+		newContext.setHistorySize(newWorkflowSizeSize)
+		newWorkflow.ExecutionStats = &persistence.ExecutionStats{
+			HistorySize: newWorkflowSizeSize,
+		}
+	}
+
+	var currentWorkflow *persistence.WorkflowMutation
+	var currentWorkflowEventsSeq []*persistence.WorkflowEvents
+	if currentContext != nil && currentMutableState != nil && currentTransactionPolicy != nil {
+
+		defer func() {
+			if retError != nil {
+				currentContext.clear()
+			}
+		}()
+
+		currentWorkflow, currentWorkflowEventsSeq, err = currentMutableState.CloseTransactionAsMutation(
+			now,
+			*currentTransactionPolicy,
+		)
+		if err != nil {
+			return err
+		}
+		currentWorkflowSize := currentContext.getHistorySize()
+		for _, workflowEvents := range currentWorkflowEventsSeq {
+			eventsSize, err := c.persistNonFirstWorkflowEvents(workflowEvents)
+			if err != nil {
+				return err
+			}
+			currentWorkflowSize += eventsSize
+		}
+		currentContext.setHistorySize(currentWorkflowSize)
+		currentWorkflow.ExecutionStats = &persistence.ExecutionStats{
+			HistorySize: currentWorkflowSize,
+		}
+	}
+
+	if err := c.conflictResolveEventReapply(
+		conflictResolveMode,
+		resetWorkflowEventsSeq,
+		newWorkflowEventsSeq,
+		// current workflow events will not participate in the events reapplication
+	); err != nil {
+		return err
+	}
+
 	if err := c.shard.ConflictResolveWorkflowExecution(&persistence.ConflictResolveWorkflowExecutionRequest{
-		// previous workflow information
-		PrevRunID:            prevRunID,
-		PrevLastWriteVersion: prevLastWriteVersion,
-		PrevState:            prevState,
+		// RangeID , this is set by shard context
+		Mode: conflictResolveMode,
 
 		ResetWorkflowSnapshot: *resetWorkflow,
+
+		NewWorkflowSnapshot: newWorkflow,
+
+		CurrentWorkflowMutation: currentWorkflow,
+
+		CurrentWorkflowCAS: workflowCAS,
+		// Encoding, this is set by shard context
 	}); err != nil {
-		return nil, err
+		return err
 	}
+
+	currentBranchToken, err := resetMutableState.GetCurrentBranchToken()
+	if err != nil {
+		return err
+	}
+
+	workflowState, workflowCloseState := resetMutableState.GetWorkflowStateCloseStatus()
+	// Current branch changed and notify the watchers
+	c.engine.NotifyNewHistoryEvent(newHistoryEventNotification(
+		c.domainID,
+		&c.workflowExecution,
+		resetMutableState.GetLastFirstEventID(),
+		resetMutableState.GetNextEventID(),
+		resetMutableState.GetPreviousStartedEventID(),
+		currentBranchToken,
+		workflowState,
+		workflowCloseState,
+	))
 
 	c.notifyTasks(
 		resetWorkflow.TransferTasks,
 		resetWorkflow.ReplicationTasks,
 		resetWorkflow.TimerTasks,
 	)
+	if newWorkflow != nil {
+		c.notifyTasks(
+			newWorkflow.TransferTasks,
+			newWorkflow.ReplicationTasks,
+			newWorkflow.TimerTasks,
+		)
+	}
+	if currentWorkflow != nil {
+		c.notifyTasks(
+			currentWorkflow.TransferTasks,
+			currentWorkflow.ReplicationTasks,
+			currentWorkflow.TimerTasks,
+		)
+	}
 
-	c.clear()
-	return c.loadWorkflowExecution()
+	c.clear() // TODO when 2DC is deprecated remove this line
+	return nil
 }
 
 func (c *workflowExecutionContextImpl) updateWorkflowExecutionAsActive(
@@ -377,6 +504,7 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionAsActive(
 
 	return c.updateWorkflowExecutionWithNew(
 		now,
+		persistence.UpdateWorkflowModeUpdateCurrent,
 		nil,
 		nil,
 		transactionPolicyActive,
@@ -392,6 +520,7 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithNewAsActive(
 
 	return c.updateWorkflowExecutionWithNew(
 		now,
+		persistence.UpdateWorkflowModeUpdateCurrent,
 		newContext,
 		newMutableState,
 		transactionPolicyActive,
@@ -405,6 +534,7 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionAsPassive(
 
 	return c.updateWorkflowExecutionWithNew(
 		now,
+		persistence.UpdateWorkflowModeUpdateCurrent,
 		nil,
 		nil,
 		transactionPolicyPassive,
@@ -420,6 +550,7 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithNewAsPassive(
 
 	return c.updateWorkflowExecutionWithNew(
 		now,
+		persistence.UpdateWorkflowModeUpdateCurrent,
 		newContext,
 		newMutableState,
 		transactionPolicyPassive,
@@ -429,6 +560,7 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithNewAsPassive(
 
 func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithNew(
 	now time.Time,
+	updateMode persistence.UpdateWorkflowMode,
 	newContext workflowExecutionContext,
 	newMutableState mutableState,
 	currentWorkflowTransactionPolicy transactionPolicy,
@@ -441,12 +573,16 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithNew(
 		}
 	}()
 
-	currentWorkflow, workflowEventsSeq, err := c.msBuilder.CloseTransactionAsMutation(now, currentWorkflowTransactionPolicy)
+	currentWorkflow, currentWorkflowEventsSeq, err := c.mutableState.CloseTransactionAsMutation(
+		now,
+		currentWorkflowTransactionPolicy,
+	)
 	if err != nil {
 		return err
 	}
+
 	currentWorkflowSize := c.getHistorySize()
-	for _, workflowEvents := range workflowEventsSeq {
+	for _, workflowEvents := range currentWorkflowEventsSeq {
 		eventsSize, err := c.persistNonFirstWorkflowEvents(workflowEvents)
 		if err != nil {
 			return err
@@ -459,6 +595,7 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithNew(
 	}
 
 	var newWorkflow *persistence.WorkflowSnapshot
+	var newWorkflowEventsSeq []*persistence.WorkflowEvents
 	if newContext != nil && newMutableState != nil && newWorkflowTransactionPolicy != nil {
 
 		defer func() {
@@ -467,12 +604,16 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithNew(
 			}
 		}()
 
-		newWorkflow, workflowEventsSeq, err = newMutableState.CloseTransactionAsSnapshot(now, *newWorkflowTransactionPolicy)
+		newWorkflow, newWorkflowEventsSeq, err = newMutableState.CloseTransactionAsSnapshot(
+			now,
+			*newWorkflowTransactionPolicy,
+		)
 		if err != nil {
 			return err
 		}
 		newWorkflowSizeSize := newContext.getHistorySize()
-		eventsSize, err := c.persistFirstWorkflowEvents(workflowEventsSeq[0])
+		startEvents := newWorkflowEventsSeq[0]
+		eventsSize, err := c.persistFirstWorkflowEvents(startEvents)
 		if err != nil {
 			return err
 		}
@@ -484,14 +625,24 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithNew(
 	}
 
 	if err := c.mergeContinueAsNewReplicationTasks(
+		updateMode,
 		currentWorkflow,
 		newWorkflow,
 	); err != nil {
 		return err
 	}
 
+	if err := c.updateWorkflowExecutionEventReapply(
+		updateMode,
+		currentWorkflowEventsSeq,
+		newWorkflowEventsSeq,
+	); err != nil {
+		return err
+	}
+
 	resp, err := c.updateWorkflowExecutionWithRetry(&persistence.UpdateWorkflowExecutionRequest{
 		// RangeID , this is set by shard context
+		Mode:                   updateMode,
 		UpdateWorkflowMutation: *currentWorkflow,
 		NewWorkflowSnapshot:    newWorkflow,
 		// Encoding, this is set by shard context
@@ -504,14 +655,20 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithNew(
 	c.updateCondition = currentWorkflow.ExecutionInfo.NextEventID
 
 	// for any change in the workflow, send a event
+	currentBranchToken, err := c.mutableState.GetCurrentBranchToken()
+	if err != nil {
+		return err
+	}
+	workflowState, workflowCloseState := c.mutableState.GetWorkflowStateCloseStatus()
 	c.engine.NotifyNewHistoryEvent(newHistoryEventNotification(
 		c.domainID,
 		&c.workflowExecution,
-		c.msBuilder.GetLastFirstEventID(),
-		c.msBuilder.GetNextEventID(),
-		c.msBuilder.GetPreviousStartedEventID(),
-		c.msBuilder.IsWorkflowExecutionRunning(),
-		c.msBuilder.GetExecutionInfo().CloseStatus,
+		c.mutableState.GetLastFirstEventID(),
+		c.mutableState.GetNextEventID(),
+		c.mutableState.GetPreviousStartedEventID(),
+		currentBranchToken,
+		workflowState,
+		workflowCloseState,
 	))
 
 	// notify current workflow tasks
@@ -536,7 +693,7 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithNew(
 		c.metricsClient,
 		domainName,
 		int(c.stats.HistorySize),
-		int(c.msBuilder.GetNextEventID()-1),
+		int(c.mutableState.GetNextEventID()-1),
 	)
 	emitSessionUpdateStats(
 		c.metricsClient,
@@ -545,8 +702,9 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithNew(
 	)
 	// emit workflow completion stats if any
 	if currentWorkflow.ExecutionInfo.State == persistence.WorkflowStateCompleted {
-		if event, ok := c.msBuilder.GetCompletionEvent(); ok {
-			emitWorkflowCompletionStats(c.metricsClient, domainName, event)
+		if event, err := c.mutableState.GetCompletionEvent(); err == nil {
+			taskList := currentWorkflow.ExecutionInfo.TaskList
+			emitWorkflowCompletionStats(c.metricsClient, domainName, taskList, event)
 		}
 	}
 
@@ -564,10 +722,16 @@ func (c *workflowExecutionContextImpl) notifyTasks(
 }
 
 func (c *workflowExecutionContextImpl) mergeContinueAsNewReplicationTasks(
+	updateMode persistence.UpdateWorkflowMode,
 	currentWorkflowMutation *persistence.WorkflowMutation,
 	newWorkflowSnapshot *persistence.WorkflowSnapshot,
 ) error {
+
 	if currentWorkflowMutation.ExecutionInfo.CloseStatus != persistence.WorkflowCloseStatusContinuedAsNew {
+		return nil
+	} else if updateMode == persistence.UpdateWorkflowModeBypassCurrent && newWorkflowSnapshot == nil {
+		// update current workflow as zombie & continue as new without new zombie workflow
+		// this case can be valid if new workflow is already created by resend
 		return nil
 	}
 
@@ -590,13 +754,11 @@ func (c *workflowExecutionContextImpl) mergeContinueAsNewReplicationTasks(
 	newWorkflowSnapshot.ReplicationTasks = nil
 
 	newRunBranchToken := newRunTask.BranchToken
-	newRunEventStoreVersion := newRunTask.EventStoreVersion
 	taskUpdated := false
 	for _, replicationTask := range currentWorkflowMutation.ReplicationTasks {
 		if task, ok := replicationTask.(*persistence.HistoryReplicationTask); ok {
 			taskUpdated = true
 			task.NewRunBranchToken = newRunBranchToken
-			task.NewRunEventStoreVersion = newRunEventStoreVersion
 		}
 	}
 	if !taskUpdated {
@@ -626,19 +788,6 @@ func (c *workflowExecutionContextImpl) persistFirstWorkflowEvents(
 	}
 	branchToken := workflowEvents.BranchToken
 	events := workflowEvents.Events
-	firstEvent := events[0]
-
-	if len(branchToken) == 0 {
-		size, err := c.appendHistoryEventsWithRetry(&persistence.AppendHistoryEventsRequest{
-			DomainID:          domainID,
-			Execution:         execution,
-			FirstEventID:      firstEvent.GetEventId(),
-			EventBatchVersion: firstEvent.GetVersion(),
-			Events:            events,
-			// TransactionID is set by shard context
-		})
-		return int64(size), err
-	}
 
 	size, err := c.appendHistoryV2EventsWithRetry(
 		domainID,
@@ -669,19 +818,6 @@ func (c *workflowExecutionContextImpl) persistNonFirstWorkflowEvents(
 	}
 	branchToken := workflowEvents.BranchToken
 	events := workflowEvents.Events
-	firstEvent := events[0]
-
-	if len(branchToken) == 0 {
-		size, err := c.appendHistoryEventsWithRetry(&persistence.AppendHistoryEventsRequest{
-			DomainID:          domainID,
-			Execution:         execution,
-			FirstEventID:      firstEvent.GetEventId(),
-			EventBatchVersion: firstEvent.GetVersion(),
-			Events:            events,
-			// TransactionID is set by shard context
-		})
-		return int64(size), err
-	}
 
 	size, err := c.appendHistoryV2EventsWithRetry(
 		domainID,
@@ -694,25 +830,6 @@ func (c *workflowExecutionContextImpl) persistNonFirstWorkflowEvents(
 		},
 	)
 	return int64(size), err
-}
-
-func (c *workflowExecutionContextImpl) appendHistoryEventsWithRetry(
-	request *persistence.AppendHistoryEventsRequest,
-) (int64, error) {
-
-	resp := 0
-	op := func() error {
-		var err error
-		resp, err = c.shard.AppendHistoryEvents(request)
-		return err
-	}
-
-	err := backoff.Retry(
-		op,
-		persistenceOperationRetryPolicy,
-		common.IsPersistenceTransientError,
-	)
-	return int64(resp), err
 }
 
 func (c *workflowExecutionContextImpl) appendHistoryV2EventsWithRetry(
@@ -762,6 +879,9 @@ func (c *workflowExecutionContextImpl) createWorkflowExecutionWithRetry(
 	default:
 		c.logger.Error(
 			"Persistent store operation failure",
+			tag.WorkflowID(c.workflowExecution.GetWorkflowId()),
+			tag.WorkflowRunID(c.workflowExecution.GetRunId()),
+			tag.WorkflowDomainID(c.domainID),
 			tag.StoreOperationCreateWorkflowExecution,
 			tag.Error(err),
 		)
@@ -795,6 +915,9 @@ func (c *workflowExecutionContextImpl) getWorkflowExecutionWithRetry(
 	default:
 		c.logger.Error(
 			"Persistent fetch operation failure",
+			tag.WorkflowID(c.workflowExecution.GetWorkflowId()),
+			tag.WorkflowRunID(c.workflowExecution.GetRunId()),
+			tag.WorkflowDomainID(c.domainID),
 			tag.StoreOperationGetWorkflowExecution,
 			tag.Error(err),
 		)
@@ -826,6 +949,9 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithRetry(
 	default:
 		c.logger.Error(
 			"Persistent store operation failure",
+			tag.WorkflowID(c.workflowExecution.GetWorkflowId()),
+			tag.WorkflowRunID(c.workflowExecution.GetRunId()),
+			tag.WorkflowDomainID(c.domainID),
 			tag.StoreOperationUpdateWorkflowExecution,
 			tag.Error(err),
 			tag.Number(c.updateCondition),
@@ -834,6 +960,7 @@ func (c *workflowExecutionContextImpl) updateWorkflowExecutionWithRetry(
 	}
 }
 
+// TODO deprecate this API in favor of create / update workflow execution
 // this reset is more complex than "resetMutableState", it involes currentMutableState and newMutableState:
 // 1. append history to new run
 // 2. append history to current run if current run is not closed
@@ -890,11 +1017,15 @@ func (c *workflowExecutionContextImpl) resetWorkflowExecution(
 		var size int64
 		// TODO workflow execution reset logic generates replication tasks in its own business logic
 		currentExecutionInfo := currMutableState.GetExecutionInfo()
+		currentBranchToken, err := currMutableState.GetCurrentBranchToken()
+		if err != nil {
+			return err
+		}
 		size, retError = c.persistNonFirstWorkflowEvents(&persistence.WorkflowEvents{
 			DomainID:    currentExecutionInfo.DomainID,
 			WorkflowID:  currentExecutionInfo.WorkflowID,
 			RunID:       currentExecutionInfo.RunID,
-			BranchToken: currMutableState.GetCurrentBranch(),
+			BranchToken: currentBranchToken,
 			Events:      hBuilder.GetHistory().GetEvents(),
 		})
 		if retError != nil {
@@ -960,10 +1091,11 @@ func (c *workflowExecutionContextImpl) resetWorkflowExecution(
 				HistorySize: c.stats.HistorySize,
 			},
 			ReplicationState: currMutableState.GetReplicationState(),
+			VersionHistories: currMutableState.GetVersionHistories(),
 
 			UpsertActivityInfos:       []*persistence.ActivityInfo{},
 			DeleteActivityInfos:       []int64{},
-			UpserTimerInfos:           []*persistence.TimerInfo{},
+			UpsertTimerInfos:          []*persistence.TimerInfo{},
 			DeleteTimerInfos:          []string{},
 			UpsertChildExecutionInfos: []*persistence.ChildExecutionInfo{},
 			DeleteChildExecutionInfo:  nil,
@@ -1007,6 +1139,124 @@ func (c *workflowExecutionContextImpl) resetWorkflowExecution(
 	return nil
 }
 
-func (c *workflowExecutionContextImpl) getQueryRegistry() QueryRegistry {
-	return c.queryRegistry
+func (c *workflowExecutionContextImpl) updateWorkflowExecutionEventReapply(
+	updateMode persistence.UpdateWorkflowMode,
+	eventBatch1 []*persistence.WorkflowEvents,
+	eventBatch2 []*persistence.WorkflowEvents,
+) error {
+
+	if updateMode != persistence.UpdateWorkflowModeBypassCurrent {
+		return nil
+	}
+
+	var eventBatches []*persistence.WorkflowEvents
+	eventBatches = append(eventBatches, eventBatch1...)
+	eventBatches = append(eventBatches, eventBatch2...)
+	return c.reapplyEvents(eventBatches)
+}
+
+func (c *workflowExecutionContextImpl) conflictResolveEventReapply(
+	conflictResolveMode persistence.ConflictResolveWorkflowMode,
+	eventBatch1 []*persistence.WorkflowEvents,
+	eventBatch2 []*persistence.WorkflowEvents,
+) error {
+
+	if conflictResolveMode != persistence.ConflictResolveWorkflowModeBypassCurrent {
+		return nil
+	}
+
+	var eventBatches []*persistence.WorkflowEvents
+	eventBatches = append(eventBatches, eventBatch1...)
+	eventBatches = append(eventBatches, eventBatch2...)
+	return c.reapplyEvents(eventBatches)
+}
+
+func (c *workflowExecutionContextImpl) reapplyEvents(
+	eventBatches []*persistence.WorkflowEvents,
+) error {
+
+	// NOTE: this function should only be used to workflow which is
+	// not the caller, or otherwise deadlock will appear
+
+	if len(eventBatches) == 0 {
+		return nil
+	}
+
+	domainID := eventBatches[0].DomainID
+	workflowID := eventBatches[0].WorkflowID
+	runID := eventBatches[0].RunID
+	var reapplyEvents []*workflow.HistoryEvent
+	for _, events := range eventBatches {
+		if events.DomainID != domainID ||
+			events.WorkflowID != workflowID {
+			return &workflow.InternalServiceError{
+				Message: "workflowExecutionContext encounter mismatch domainID / workflowID in events reapplication.",
+			}
+		}
+
+		for _, event := range events.Events {
+			switch event.GetEventType() {
+			case workflow.EventTypeWorkflowExecutionSignaled:
+				reapplyEvents = append(reapplyEvents, event)
+			}
+		}
+	}
+	if len(reapplyEvents) == 0 {
+		return nil
+	}
+
+	// Reapply events only reapply to the current run.
+	// The run id is only used for reapply event de-duplication
+	execution := &workflow.WorkflowExecution{
+		WorkflowId: common.StringPtr(workflowID),
+		RunId:      common.StringPtr(runID),
+	}
+	domainCache := c.shard.GetDomainCache()
+	clientBean := c.shard.GetService().GetClientBean()
+	serializer := c.shard.GetService().GetPayloadSerializer()
+	domainEntry, err := domainCache.GetDomainByID(domainID)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultRemoteCallTimeout)
+	defer cancel()
+
+	activeCluster := domainEntry.GetReplicationConfig().ActiveClusterName
+	if activeCluster == c.shard.GetClusterMetadata().GetCurrentClusterName() {
+		return c.shard.GetEngine().ReapplyEvents(
+			ctx,
+			domainID,
+			workflowID,
+			runID,
+			reapplyEvents,
+		)
+	}
+
+	// The active cluster of the domain is the same as current cluster.
+	// Use the history from the same cluster to reapply events
+	reapplyEventsDataBlob, err := serializer.SerializeBatchEvents(
+		reapplyEvents,
+		common.EncodingTypeThriftRW,
+	)
+	if err != nil {
+		return err
+	}
+	// The active cluster of the domain is differ from the current cluster
+	// Use frontend client to route this request to the active cluster
+	// Reapplication only happens in active cluster
+	sourceCluster := clientBean.GetRemoteAdminClient(activeCluster)
+	if sourceCluster == nil {
+		return &workflow.InternalServiceError{
+			Message: fmt.Sprintf("cannot find cluster config %v to do reapply", activeCluster),
+		}
+	}
+	return sourceCluster.ReapplyEvents(
+		ctx,
+		&workflow.ReapplyEventsRequest{
+			DomainName:        common.StringPtr(domainEntry.GetInfo().Name),
+			WorkflowExecution: execution,
+			Events:            reapplyEventsDataBlob.ToThrift(),
+		},
+	)
 }

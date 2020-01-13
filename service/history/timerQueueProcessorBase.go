@@ -21,14 +21,13 @@
 package history
 
 import (
-	"context"
+	ctx "context"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
-	carchiver "github.com/uber/cadence/common/archiver"
 	"github.com/uber/cadence/common/backoff"
 	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/clock"
@@ -260,14 +259,13 @@ func (t *timerQueueProcessorBase) notifyNewTimer(
 }
 
 func (t *timerQueueProcessorBase) internalProcessor() error {
-	jitter := backoff.NewJitter()
-	pollTimer := time.NewTimer(jitter.JitDuration(
+	pollTimer := time.NewTimer(backoff.JitDuration(
 		t.config.TimerProcessorMaxPollInterval(),
 		t.config.TimerProcessorMaxPollIntervalJitterCoefficient(),
 	))
 	defer pollTimer.Stop()
 
-	updateAckTimer := time.NewTimer(jitter.JitDuration(
+	updateAckTimer := time.NewTimer(backoff.JitDuration(
 		t.config.TimerProcessorUpdateAckInterval(),
 		t.config.TimerProcessorUpdateAckIntervalJitterCoefficient(),
 	))
@@ -299,7 +297,7 @@ func (t *timerQueueProcessorBase) internalProcessor() error {
 				t.timerGate.Update(lookAheadTimer.VisibilityTimestamp)
 			}
 		case <-pollTimer.C:
-			pollTimer.Reset(jitter.JitDuration(
+			pollTimer.Reset(backoff.JitDuration(
 				t.config.TimerProcessorMaxPollInterval(),
 				t.config.TimerProcessorMaxPollIntervalJitterCoefficient(),
 			))
@@ -313,7 +311,7 @@ func (t *timerQueueProcessorBase) internalProcessor() error {
 				}
 			}
 		case <-updateAckTimer.C:
-			updateAckTimer.Reset(jitter.JitDuration(
+			updateAckTimer.Reset(backoff.JitDuration(
 				t.config.TimerProcessorUpdateAckInterval(),
 				t.config.TimerProcessorUpdateAckIntervalJitterCoefficient(),
 			))
@@ -331,7 +329,7 @@ func (t *timerQueueProcessorBase) internalProcessor() error {
 }
 
 func (t *timerQueueProcessorBase) readAndFanoutTimerTasks() (*persistence.TimerTaskInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), loadTimerTaskThrottleRetryDelay)
+	ctx, cancel := ctx.WithTimeout(ctx.Background(), loadTimerTaskThrottleRetryDelay)
 	if err := t.rateLimiter.Wait(ctx); err != nil {
 		cancel()
 		t.notifyNewTimer(time.Time{}) // re-enqueue the event
@@ -348,10 +346,11 @@ func (t *timerQueueProcessorBase) readAndFanoutTimerTasks() (*persistence.TimerT
 
 	for _, task := range timerTasks {
 		if shutdown := t.taskProcessor.addTask(
-			&taskInfo{
-				processor: t.timerProcessor,
-				task:      task,
-			},
+			newTaskInfo(
+				t.timerProcessor,
+				task,
+				initializeLoggerForTask(t.shard.GetShardID(), task, t.logger),
+			),
 		); shutdown {
 			return nil, nil
 		}
@@ -374,7 +373,10 @@ func (t *timerQueueProcessorBase) retryTasks() {
 	t.taskProcessor.retryTasks()
 }
 
-func (t *timerQueueProcessorBase) complete(timerTask *persistence.TimerTaskInfo) {
+func (t *timerQueueProcessorBase) complete(
+	timerTask *persistence.TimerTaskInfo,
+) {
+
 	t.timerQueueAckMgr.completeTimerTask(timerTask)
 	atomic.AddUint64(&t.timerFiredCount, 1)
 }
@@ -403,43 +405,39 @@ func (t *timerQueueProcessorBase) processDeleteHistoryEvent(
 	}
 	defer func() { release(retError) }()
 
-	msBuilder, err := loadMutableStateForTimerTask(context, task, t.metricsClient, t.logger)
-	if err != nil {
-		return err
-	} else if msBuilder == nil || msBuilder.IsWorkflowExecutionRunning() {
-		return nil
-	}
-	ok, err := verifyTaskVersion(t.shard, t.logger, task.DomainID, msBuilder.GetLastWriteVersion(), task.Version, task)
+	mutableState, err := loadMutableStateForTimerTask(context, task, t.metricsClient, t.logger)
 	if err != nil {
 		return err
 	}
-	if !ok {
+	if mutableState == nil || mutableState.IsWorkflowExecutionRunning() {
 		return nil
+	}
+
+	lastWriteVersion, err := mutableState.GetLastWriteVersion()
+	if err != nil {
+		return err
+	}
+	ok, err := verifyTaskVersion(t.shard, t.logger, task.DomainID, lastWriteVersion, task.Version, task)
+	if err != nil || !ok {
+		return err
 	}
 
 	domainCacheEntry, err := t.historyService.shard.GetDomainCache().GetDomainByID(task.DomainID)
 	if err != nil {
 		return err
 	}
-	clusterArchivalStatus := t.shard.GetService().GetArchivalMetadata().GetHistoryConfig().GetClusterStatus()
-	domainArchivalStatus := domainCacheEntry.GetConfig().HistoryArchivalStatus
-	switch clusterArchivalStatus {
-	case carchiver.ArchivalDisabled:
-		t.metricsClient.IncCounter(metrics.HistoryProcessDeleteHistoryEventScope, metrics.WorkflowCleanupDeleteCount)
-		return t.deleteWorkflow(task, context, msBuilder)
-	case carchiver.ArchivalPaused:
-		// TODO: @ycyang once archival backfill is in place cluster:paused && domain:enabled should be a nop rather than a delete
-		t.metricsClient.IncCounter(metrics.HistoryProcessDeleteHistoryEventScope, metrics.WorkflowCleanupDeleteCount)
-		return t.deleteWorkflow(task, context, msBuilder)
-	case carchiver.ArchivalEnabled:
-		if domainArchivalStatus == workflow.ArchivalStatusDisabled {
-			t.metricsClient.IncCounter(metrics.HistoryProcessDeleteHistoryEventScope, metrics.WorkflowCleanupDeleteCount)
-			return t.deleteWorkflow(task, context, msBuilder)
-		}
+	clusterConfiguredForHistoryArchival := t.shard.GetService().GetArchivalMetadata().GetHistoryConfig().ClusterConfiguredForArchival()
+	domainConfiguredForHistoryArchival := domainCacheEntry.GetConfig().HistoryArchivalStatus == workflow.ArchivalStatusEnabled
+	archiveHistory := clusterConfiguredForHistoryArchival && domainConfiguredForHistoryArchival
+
+	// TODO: @ycyang once archival backfill is in place cluster:paused && domain:enabled should be a nop rather than a delete
+	if archiveHistory {
 		t.metricsClient.IncCounter(metrics.HistoryProcessDeleteHistoryEventScope, metrics.WorkflowCleanupArchiveCount)
-		return t.archiveWorkflow(task, context, msBuilder, domainCacheEntry)
+		return t.archiveWorkflow(task, context, mutableState, domainCacheEntry)
 	}
-	return nil
+
+	t.metricsClient.IncCounter(metrics.HistoryProcessDeleteHistoryEventScope, metrics.WorkflowCleanupDeleteCount)
+	return t.deleteWorkflow(task, context, mutableState)
 }
 
 func (t *timerQueueProcessorBase) deleteWorkflow(
@@ -475,29 +473,38 @@ func (t *timerQueueProcessorBase) archiveWorkflow(
 	msBuilder mutableState,
 	domainCacheEntry *cache.DomainCacheEntry,
 ) error {
-	executionStats, err := workflowContext.loadExecutionStats()
+	branchToken, err := msBuilder.GetCurrentBranchToken()
 	if err != nil {
 		return err
 	}
-	attemptArchiveInline := executionStats.HistorySize < int64(t.config.TimerProcessorHistoryArchivalSizeLimit())
-	ctx, cancel := context.WithTimeout(context.Background(), t.config.TimerProcessorHistoryArchivalTimeLimit())
-	defer cancel()
+	closeFailoverVersion, err := msBuilder.GetLastWriteVersion()
+	if err != nil {
+		return err
+	}
+
 	req := &archiver.ClientRequest{
 		ArchiveRequest: &archiver.ArchiveRequest{
-			ShardID:              t.shard.GetShardID(),
 			DomainID:             task.DomainID,
-			DomainName:           domainCacheEntry.GetInfo().Name,
 			WorkflowID:           task.WorkflowID,
 			RunID:                task.RunID,
-			EventStoreVersion:    msBuilder.GetEventStoreVersion(),
-			BranchToken:          msBuilder.GetCurrentBranch(),
-			NextEventID:          msBuilder.GetNextEventID(),
-			CloseFailoverVersion: msBuilder.GetLastWriteVersion(),
+			DomainName:           domainCacheEntry.GetInfo().Name,
+			ShardID:              t.shard.GetShardID(),
+			Targets:              []archiver.ArchivalTarget{archiver.ArchiveTargetHistory},
 			URI:                  domainCacheEntry.GetConfig().HistoryArchivalURI,
+			NextEventID:          msBuilder.GetNextEventID(),
+			BranchToken:          branchToken,
+			CloseFailoverVersion: closeFailoverVersion,
 		},
 		CallerService:        common.HistoryServiceName,
-		AttemptArchiveInline: attemptArchiveInline,
+		AttemptArchiveInline: false, // archive in workflow by default
 	}
+	executionStats, err := workflowContext.loadExecutionStats()
+	if err == nil && executionStats.HistorySize < int64(t.config.TimerProcessorHistoryArchivalSizeLimit()) {
+		req.AttemptArchiveInline = true
+	}
+
+	ctx, cancel := ctx.WithTimeout(ctx.Background(), t.config.TimerProcessorArchivalTimeLimit())
+	defer cancel()
 	resp, err := t.historyService.archivalClient.Archive(ctx, req)
 	if err != nil {
 		return err
@@ -509,12 +516,15 @@ func (t *timerQueueProcessorBase) archiveWorkflow(
 	if err := t.deleteWorkflowExecution(task); err != nil {
 		return err
 	}
-	if resp.ArchivedInline {
+	// delete workflow history if history archival is not needed or history as been archived inline
+	if resp.HistoryArchivedInline {
 		t.metricsClient.IncCounter(metrics.HistoryProcessDeleteHistoryEventScope, metrics.WorkflowCleanupDeleteHistoryInlineCount)
 		if err := t.deleteWorkflowHistory(task, msBuilder); err != nil {
 			return err
 		}
 	}
+	// delete visibility record here regardless if it's been archived inline or not
+	// since the entire record is included as part of the archive request.
 	if err := t.deleteWorkflowVisibility(task); err != nil {
 		return err
 	}
@@ -557,23 +567,16 @@ func (t *timerQueueProcessorBase) deleteWorkflowHistory(
 	msBuilder mutableState,
 ) error {
 
-	domainID, workflowExecution := t.getDomainIDAndWorkflowExecution(task)
 	op := func() error {
-		if msBuilder.GetEventStoreVersion() == persistence.EventStoreVersionV2 {
-			logger := t.logger.WithTags(tag.WorkflowID(task.WorkflowID),
-				tag.WorkflowRunID(task.RunID),
-				tag.WorkflowDomainID(task.DomainID),
-				tag.ShardID(t.shard.GetShardID()),
-				tag.TaskID(task.GetTaskID()),
-				tag.FailoverVersion(task.GetVersion()),
-				tag.TaskType(task.GetTaskType()))
-			return persistence.DeleteWorkflowExecutionHistoryV2(t.historyService.historyV2Mgr, msBuilder.GetCurrentBranch(), common.IntPtr(t.shard.GetShardID()), logger)
+		branchToken, err := msBuilder.GetCurrentBranchToken()
+		if err != nil {
+			return err
 		}
-		return t.historyService.historyMgr.DeleteWorkflowExecutionHistory(
-			&persistence.DeleteWorkflowExecutionHistoryRequest{
-				DomainID:  domainID,
-				Execution: workflowExecution,
-			})
+		return t.historyService.historyV2Mgr.DeleteHistoryBranch(&persistence.DeleteHistoryBranchRequest{
+			BranchToken: branchToken,
+			ShardID:     common.IntPtr(t.shard.GetShardID()),
+		})
+
 	}
 	return backoff.Retry(op, persistenceOperationRetryPolicy, common.IsPersistenceTransientError)
 }
@@ -588,6 +591,7 @@ func (t *timerQueueProcessorBase) deleteWorkflowVisibility(
 	return backoff.Retry(op, persistenceOperationRetryPolicy, common.IsPersistenceTransientError)
 }
 
+//nolint:unused
 func (t *timerQueueProcessorBase) getTimerTaskType(
 	taskType int,
 ) string {

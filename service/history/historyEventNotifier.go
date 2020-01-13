@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/pborman/uuid"
+
 	gen "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/clock"
@@ -38,6 +39,17 @@ const (
 )
 
 type (
+	historyEventNotification struct {
+		id                     definition.WorkflowIdentifier
+		lastFirstEventID       int64
+		nextEventID            int64
+		previousStartedEventID int64
+		timestamp              time.Time
+		currentBranchToken     []byte
+		workflowState          int
+		workflowCloseState     int
+	}
+
 	historyEventNotifierImpl struct {
 		timeSource clock.TimeSource
 		metrics    metrics.Client
@@ -66,9 +78,11 @@ func newHistoryEventNotification(
 	lastFirstEventID int64,
 	nextEventID int64,
 	previousStartedEventID int64,
-	isWorkflowRunning bool,
-	closeStatus int,
+	currentBranchToken []byte,
+	workflowState int,
+	workflowCloseState int,
 ) *historyEventNotification {
+
 	return &historyEventNotification{
 		id: definition.NewWorkflowIdentifier(
 			domainID,
@@ -78,12 +92,18 @@ func newHistoryEventNotification(
 		lastFirstEventID:       lastFirstEventID,
 		nextEventID:            nextEventID,
 		previousStartedEventID: previousStartedEventID,
-		isWorkflowRunning:      isWorkflowRunning,
-		closeStatus:            closeStatus,
+		currentBranchToken:     currentBranchToken,
+		workflowState:          workflowState,
+		workflowCloseState:     workflowCloseState,
 	}
 }
 
-func newHistoryEventNotifier(timeSource clock.TimeSource, metrics metrics.Client, workflowIDToShardID func(string) int) *historyEventNotifierImpl {
+func newHistoryEventNotifier(
+	timeSource clock.TimeSource,
+	metrics metrics.Client,
+	workflowIDToShardID func(string) int,
+) *historyEventNotifierImpl {
+
 	hashFn := func(key interface{}) uint32 {
 		notification, ok := key.(historyEventNotification)
 		if !ok {
@@ -165,7 +185,7 @@ func (notifier *historyEventNotifierImpl) dispatchHistoryEventNotification(event
 
 	timer := notifier.metrics.StartTimer(metrics.HistoryEventNotificationScope, metrics.HistoryEventNotificationFanoutLatency)
 	defer timer.Stop()
-	notifier.eventsPubsubs.GetAndDo(identifier, func(key interface{}, value interface{}) error {
+	notifier.eventsPubsubs.GetAndDo(identifier, func(key interface{}, value interface{}) error { //nolint:errcheck
 		subscribers := value.(map[string]chan *historyEventNotification)
 
 		for _, channel := range subscribers {

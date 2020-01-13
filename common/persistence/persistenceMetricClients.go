@@ -46,15 +46,9 @@ type (
 		logger       log.Logger
 	}
 
-	historyPersistenceClient struct {
-		metricClient metrics.Client
-		persistence  HistoryManager
-		logger       log.Logger
-	}
-
 	historyV2PersistenceClient struct {
 		metricClient metrics.Client
-		persistence  HistoryV2Manager
+		persistence  HistoryManager
 		logger       log.Logger
 	}
 
@@ -69,15 +63,21 @@ type (
 		persistence  VisibilityManager
 		logger       log.Logger
 	}
+
+	queuePersistenceClient struct {
+		metricClient metrics.Client
+		persistence  Queue
+		logger       log.Logger
+	}
 )
 
 var _ ShardManager = (*shardPersistenceClient)(nil)
 var _ ExecutionManager = (*workflowExecutionPersistenceClient)(nil)
 var _ TaskManager = (*taskPersistenceClient)(nil)
-var _ HistoryManager = (*historyPersistenceClient)(nil)
-var _ HistoryV2Manager = (*historyV2PersistenceClient)(nil)
+var _ HistoryManager = (*historyV2PersistenceClient)(nil)
 var _ MetadataManager = (*metadataPersistenceClient)(nil)
 var _ VisibilityManager = (*visibilityPersistenceClient)(nil)
+var _ Queue = (*queuePersistenceClient)(nil)
 
 // NewShardPersistenceMetricsClient creates a client to manage shards
 func NewShardPersistenceMetricsClient(persistence ShardManager, metricClient metrics.Client, logger log.Logger) ShardManager {
@@ -106,17 +106,8 @@ func NewTaskPersistenceMetricsClient(persistence TaskManager, metricClient metri
 	}
 }
 
-// NewHistoryPersistenceMetricsClient creates a HistoryManager client to manage workflow execution history
-func NewHistoryPersistenceMetricsClient(persistence HistoryManager, metricClient metrics.Client, logger log.Logger) HistoryManager {
-	return &historyPersistenceClient{
-		persistence:  persistence,
-		metricClient: metricClient,
-		logger:       logger,
-	}
-}
-
 // NewHistoryV2PersistenceMetricsClient creates a HistoryManager client to manage workflow execution history
-func NewHistoryV2PersistenceMetricsClient(persistence HistoryV2Manager, metricClient metrics.Client, logger log.Logger) HistoryV2Manager {
+func NewHistoryV2PersistenceMetricsClient(persistence HistoryManager, metricClient metrics.Client, logger log.Logger) HistoryManager {
 	return &historyV2PersistenceClient{
 		persistence:  persistence,
 		metricClient: metricClient,
@@ -136,6 +127,15 @@ func NewMetadataPersistenceMetricsClient(persistence MetadataManager, metricClie
 // NewVisibilityPersistenceMetricsClient creates a client to manage visibility
 func NewVisibilityPersistenceMetricsClient(persistence VisibilityManager, metricClient metrics.Client, logger log.Logger) VisibilityManager {
 	return &visibilityPersistenceClient{
+		persistence:  persistence,
+		metricClient: metricClient,
+		logger:       logger,
+	}
+}
+
+// NewQueuePersistenceMetricsClient creates a client to manage queue
+func NewQueuePersistenceMetricsClient(persistence Queue, metricClient metrics.Client, logger log.Logger) Queue {
+	return &queuePersistenceClient{
 		persistence:  persistence,
 		metricClient: metricClient,
 		logger:       logger,
@@ -400,18 +400,64 @@ func (p *workflowExecutionPersistenceClient) CompleteReplicationTask(request *Co
 	return err
 }
 
+func (p *workflowExecutionPersistenceClient) RangeCompleteReplicationTask(request *RangeCompleteReplicationTaskRequest) error {
+	p.metricClient.IncCounter(metrics.PersistenceRangeCompleteReplicationTaskScope, metrics.PersistenceRequests)
+
+	sw := p.metricClient.StartTimer(metrics.PersistenceRangeCompleteReplicationTaskScope, metrics.PersistenceLatency)
+	err := p.persistence.RangeCompleteReplicationTask(request)
+	sw.Stop()
+
+	if err != nil {
+		p.updateErrorMetric(metrics.PersistenceRangeCompleteReplicationTaskScope, err)
+	}
+
+	return err
+}
+
+func (p *workflowExecutionPersistenceClient) PutReplicationTaskToDLQ(
+	request *PutReplicationTaskToDLQRequest,
+) error {
+	p.metricClient.IncCounter(metrics.PersistencePutReplicationTaskToDLQScope, metrics.PersistenceRequests)
+
+	sw := p.metricClient.StartTimer(metrics.PersistencePutReplicationTaskToDLQScope, metrics.PersistenceLatency)
+	err := p.persistence.PutReplicationTaskToDLQ(request)
+	sw.Stop()
+
+	if err != nil {
+		p.updateErrorMetric(metrics.PersistencePutReplicationTaskToDLQScope, err)
+	}
+
+	return err
+}
+
+func (p *workflowExecutionPersistenceClient) GetReplicationTasksFromDLQ(
+	request *GetReplicationTasksFromDLQRequest,
+) (*GetReplicationTasksFromDLQResponse, error) {
+	p.metricClient.IncCounter(metrics.PersistenceGetReplicationTasksFromDLQScope, metrics.PersistenceRequests)
+
+	sw := p.metricClient.StartTimer(metrics.PersistenceGetReplicationTasksFromDLQScope, metrics.PersistenceLatency)
+	response, err := p.persistence.GetReplicationTasksFromDLQ(request)
+	sw.Stop()
+
+	if err != nil {
+		p.updateErrorMetric(metrics.PersistenceGetReplicationTasksFromDLQScope, err)
+	}
+
+	return response, err
+}
+
 func (p *workflowExecutionPersistenceClient) GetTimerIndexTasks(request *GetTimerIndexTasksRequest) (*GetTimerIndexTasksResponse, error) {
 	p.metricClient.IncCounter(metrics.PersistenceGetTimerIndexTasksScope, metrics.PersistenceRequests)
 
 	sw := p.metricClient.StartTimer(metrics.PersistenceGetTimerIndexTasksScope, metrics.PersistenceLatency)
-	resonse, err := p.persistence.GetTimerIndexTasks(request)
+	response, err := p.persistence.GetTimerIndexTasks(request)
 	sw.Stop()
 
 	if err != nil {
 		p.updateErrorMetric(metrics.PersistenceGetTimerIndexTasksScope, err)
 	}
 
-	return resonse, err
+	return response, err
 }
 
 func (p *workflowExecutionPersistenceClient) CompleteTimerTask(request *CompleteTimerTaskRequest) error {
@@ -609,92 +655,6 @@ func (p *taskPersistenceClient) updateErrorMetric(scope int, err error) {
 }
 
 func (p *taskPersistenceClient) Close() {
-	p.persistence.Close()
-}
-
-func (p *historyPersistenceClient) GetName() string {
-	return p.persistence.GetName()
-}
-
-func (p *historyPersistenceClient) AppendHistoryEvents(request *AppendHistoryEventsRequest) (*AppendHistoryEventsResponse, error) {
-	p.metricClient.IncCounter(metrics.PersistenceAppendHistoryEventsScope, metrics.PersistenceRequests)
-
-	sw := p.metricClient.StartTimer(metrics.PersistenceAppendHistoryEventsScope, metrics.PersistenceLatency)
-	resp, err := p.persistence.AppendHistoryEvents(request)
-	sw.Stop()
-
-	if err != nil {
-		p.updateErrorMetric(metrics.PersistenceAppendHistoryEventsScope, err)
-	}
-
-	return resp, err
-}
-
-func (p *historyPersistenceClient) GetWorkflowExecutionHistory(
-	request *GetWorkflowExecutionHistoryRequest) (*GetWorkflowExecutionHistoryResponse, error) {
-	p.metricClient.IncCounter(metrics.PersistenceGetWorkflowExecutionHistoryScope, metrics.PersistenceRequests)
-
-	sw := p.metricClient.StartTimer(metrics.PersistenceGetWorkflowExecutionHistoryScope, metrics.PersistenceLatency)
-	response, err := p.persistence.GetWorkflowExecutionHistory(request)
-	sw.Stop()
-
-	if err != nil {
-		p.updateErrorMetric(metrics.PersistenceGetWorkflowExecutionHistoryScope, err)
-	}
-
-	return response, err
-}
-
-func (p *historyPersistenceClient) GetWorkflowExecutionHistoryByBatch(
-	request *GetWorkflowExecutionHistoryRequest) (*GetWorkflowExecutionHistoryByBatchResponse, error) {
-	p.metricClient.IncCounter(metrics.PersistenceGetWorkflowExecutionHistoryScope, metrics.PersistenceRequests)
-
-	sw := p.metricClient.StartTimer(metrics.PersistenceGetWorkflowExecutionHistoryScope, metrics.PersistenceLatency)
-	response, err := p.persistence.GetWorkflowExecutionHistoryByBatch(request)
-	sw.Stop()
-
-	if err != nil {
-		p.updateErrorMetric(metrics.PersistenceGetWorkflowExecutionHistoryScope, err)
-	}
-
-	return response, err
-}
-
-func (p *historyPersistenceClient) DeleteWorkflowExecutionHistory(
-	request *DeleteWorkflowExecutionHistoryRequest) error {
-	p.metricClient.IncCounter(metrics.PersistenceDeleteWorkflowExecutionHistoryScope, metrics.PersistenceRequests)
-
-	sw := p.metricClient.StartTimer(metrics.PersistenceDeleteWorkflowExecutionHistoryScope, metrics.PersistenceLatency)
-	err := p.persistence.DeleteWorkflowExecutionHistory(request)
-	sw.Stop()
-
-	if err != nil {
-		p.updateErrorMetric(metrics.PersistenceDeleteWorkflowExecutionHistoryScope, err)
-	}
-
-	return err
-}
-
-func (p *historyPersistenceClient) updateErrorMetric(scope int, err error) {
-	switch err.(type) {
-	case *workflow.EntityNotExistsError:
-		p.metricClient.IncCounter(scope, metrics.PersistenceErrEntityNotExistsCounter)
-	case *ConditionFailedError:
-		p.metricClient.IncCounter(scope, metrics.PersistenceErrConditionFailedCounter)
-	case *TimeoutError:
-		p.metricClient.IncCounter(scope, metrics.PersistenceErrTimeoutCounter)
-		p.metricClient.IncCounter(scope, metrics.PersistenceFailures)
-	case *workflow.ServiceBusyError:
-		p.metricClient.IncCounter(scope, metrics.PersistenceErrBusyCounter)
-		p.metricClient.IncCounter(scope, metrics.PersistenceFailures)
-	default:
-		p.logger.Error("Operation failed with internal error.",
-			tag.Error(err), tag.MetricScope(scope))
-		p.metricClient.IncCounter(scope, metrics.PersistenceFailures)
-	}
-}
-
-func (p *historyPersistenceClient) Close() {
 	p.persistence.Close()
 }
 
@@ -1139,18 +1099,6 @@ func (p *historyV2PersistenceClient) DeleteHistoryBranch(request *DeleteHistoryB
 	return err
 }
 
-// CompleteForkBranch complete forking process
-func (p *historyV2PersistenceClient) CompleteForkBranch(request *CompleteForkBranchRequest) error {
-	p.metricClient.IncCounter(metrics.PersistenceCompleteForkBranchScope, metrics.PersistenceRequests)
-	sw := p.metricClient.StartTimer(metrics.PersistenceCompleteForkBranchScope, metrics.PersistenceLatency)
-	err := p.persistence.CompleteForkBranch(request)
-	sw.Stop()
-	if err != nil {
-		p.updateErrorMetric(metrics.PersistenceCompleteForkBranchScope, err)
-	}
-	return err
-}
-
 func (p *historyV2PersistenceClient) GetAllHistoryTreeBranches(request *GetAllHistoryTreeBranchesRequest) (*GetAllHistoryTreeBranchesResponse, error) {
 	p.metricClient.IncCounter(metrics.PersistenceGetAllHistoryTreeBranchesScope, metrics.PersistenceRequests)
 	sw := p.metricClient.StartTimer(metrics.PersistenceGetAllHistoryTreeBranchesScope, metrics.PersistenceLatency)
@@ -1191,4 +1139,78 @@ func (p *historyV2PersistenceClient) updateErrorMetric(scope int, err error) {
 			tag.Error(err), tag.MetricScope(scope))
 		p.metricClient.IncCounter(scope, metrics.PersistenceFailures)
 	}
+}
+
+func (p *queuePersistenceClient) EnqueueMessage(message []byte) error {
+	p.metricClient.IncCounter(metrics.PersistenceEnqueueMessageScope, metrics.PersistenceRequests)
+
+	sw := p.metricClient.StartTimer(metrics.PersistenceEnqueueMessageScope, metrics.PersistenceLatency)
+	err := p.persistence.EnqueueMessage(message)
+	sw.Stop()
+
+	if err != nil {
+		p.metricClient.IncCounter(metrics.PersistenceEnqueueMessageScope, metrics.PersistenceFailures)
+	}
+
+	return err
+}
+
+func (p *queuePersistenceClient) ReadMessages(lastMessageID int, maxCount int) ([]*QueueMessage, error) {
+	p.metricClient.IncCounter(metrics.PersistenceReadQueueMessagesScope, metrics.PersistenceRequests)
+
+	sw := p.metricClient.StartTimer(metrics.PersistenceReadQueueMessagesScope, metrics.PersistenceLatency)
+	result, err := p.persistence.ReadMessages(lastMessageID, maxCount)
+	sw.Stop()
+
+	if err != nil {
+		p.metricClient.IncCounter(metrics.PersistenceReadQueueMessagesScope, metrics.PersistenceFailures)
+	}
+
+	return result, err
+}
+
+func (p *queuePersistenceClient) UpdateAckLevel(messageID int, clusterName string) error {
+	p.metricClient.IncCounter(metrics.PersistenceUpdateAckLevelScope, metrics.PersistenceRequests)
+
+	sw := p.metricClient.StartTimer(metrics.PersistenceUpdateAckLevelScope, metrics.PersistenceLatency)
+	err := p.persistence.UpdateAckLevel(messageID, clusterName)
+	sw.Stop()
+
+	if err != nil {
+		p.metricClient.IncCounter(metrics.PersistenceUpdateAckLevelScope, metrics.PersistenceFailures)
+	}
+
+	return err
+}
+
+func (p *queuePersistenceClient) GetAckLevels() (map[string]int, error) {
+	p.metricClient.IncCounter(metrics.PersistenceGetAckLevelScope, metrics.PersistenceRequests)
+
+	sw := p.metricClient.StartTimer(metrics.PersistenceGetAckLevelScope, metrics.PersistenceLatency)
+	result, err := p.persistence.GetAckLevels()
+	sw.Stop()
+
+	if err != nil {
+		p.metricClient.IncCounter(metrics.PersistenceGetAckLevelScope, metrics.PersistenceFailures)
+	}
+
+	return result, err
+}
+
+func (p *queuePersistenceClient) DeleteMessagesBefore(messageID int) error {
+	p.metricClient.IncCounter(metrics.PersistenceDeleteQueueMessagesScope, metrics.PersistenceRequests)
+
+	sw := p.metricClient.StartTimer(metrics.PersistenceDeleteQueueMessagesScope, metrics.PersistenceLatency)
+	err := p.persistence.DeleteMessagesBefore(messageID)
+	sw.Stop()
+
+	if err != nil {
+		p.metricClient.IncCounter(metrics.PersistenceDeleteQueueMessagesScope, metrics.PersistenceFailures)
+	}
+
+	return err
+}
+
+func (p *queuePersistenceClient) Close() {
+	p.persistence.Close()
 }

@@ -21,15 +21,16 @@
 package elasticsearch
 
 import (
-	"github.com/uber/cadence/common"
 	"net/url"
+
+	"github.com/uber/cadence/common"
 )
 
 // Config for connecting to ElasticSearch
 type (
 	Config struct {
-		URL     url.URL           `yaml:url`
-		Indices map[string]string `yaml:indices`
+		URL     url.URL           `yaml:url`     //nolint:govet
+		Indices map[string]string `yaml:indices` //nolint:govet
 	}
 )
 

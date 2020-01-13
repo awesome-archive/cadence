@@ -26,6 +26,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/suite"
+
 	"github.com/uber/cadence/environment"
 	"github.com/uber/cadence/tools/common/schema/test"
 )
@@ -56,7 +57,7 @@ func (s *SetupSchemaTestSuite) TearDownSuite() {
 }
 
 func (s *SetupSchemaTestSuite) TestCreateKeyspace() {
-	RunTool([]string{"./tool", "create", "-k", "foobar123", "--rf", "1"})
+	s.Nil(RunTool([]string{"./tool", "create", "-k", "foobar123", "--rf", "1"}))
 	err := s.client.dropKeyspace("foobar123")
 	s.Nil(err)
 }

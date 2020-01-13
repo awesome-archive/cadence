@@ -23,7 +23,10 @@ package history
 import (
 	"testing"
 
+	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
@@ -37,11 +40,12 @@ import (
 type (
 	decisionAttrValidatorSuite struct {
 		suite.Suite
+		*require.Assertions
 
-		mockDomainCache *cache.DomainCacheMock
+		controller      *gomock.Controller
+		mockDomainCache *cache.MockDomainCache
 
-		maxIDLengthLimit int
-		validator        *decisionAttrValidator
+		validator *decisionAttrValidator
 
 		testDomainID       string
 		testTargetDomainID string
@@ -62,7 +66,10 @@ func (s *decisionAttrValidatorSuite) TearDownSuite() {
 }
 
 func (s *decisionAttrValidatorSuite) SetupTest() {
-	s.mockDomainCache = &cache.DomainCacheMock{}
+	s.Assertions = require.New(s.T())
+
+	s.controller = gomock.NewController(s.T())
+	s.mockDomainCache = cache.NewMockDomainCache(s.controller)
 	config := &Config{
 		MaxIDLengthLimit:                  dynamicconfig.GetIntPropertyFn(1000),
 		ValidSearchAttributes:             dynamicconfig.GetMapPropertyFn(definition.GetDefaultIndexedKeys()),
@@ -78,7 +85,7 @@ func (s *decisionAttrValidatorSuite) SetupTest() {
 }
 
 func (s *decisionAttrValidatorSuite) TearDownTest() {
-	s.mockDomainCache.AssertExpectations(s.T())
+	s.controller.Finish()
 }
 
 func (s *decisionAttrValidatorSuite) TestValidateSignalExternalWorkflowExecutionAttributes() {
@@ -95,8 +102,8 @@ func (s *decisionAttrValidatorSuite) TestValidateSignalExternalWorkflowExecution
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil)
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).AnyTimes()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).AnyTimes()
 
 	var attributes *workflow.SignalExternalWorkflowExecutionDecisionAttributes
 
@@ -115,7 +122,7 @@ func (s *decisionAttrValidatorSuite) TestValidateSignalExternalWorkflowExecution
 	attributes.Execution.RunId = common.StringPtr("run-id")
 	err = s.validator.validateSignalExternalWorkflowExecutionAttributes(s.testDomainID, s.testTargetDomainID, attributes)
 	s.EqualError(err, "BadRequestError{Message: Invalid RunId set on decision.}")
-	attributes.Execution.RunId = common.StringPtr(validRunID)
+	attributes.Execution.RunId = common.StringPtr(testRunID)
 
 	attributes.SignalName = common.StringPtr("my signal name")
 	err = s.validator.validateSignalExternalWorkflowExecutionAttributes(s.testDomainID, s.testTargetDomainID, attributes)
@@ -160,8 +167,8 @@ func (s *decisionAttrValidatorSuite) TestValidateCrossDomainCall_LocalToLocal() 
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil).Once()
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil).Once()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).Times(1)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).Times(1)
 
 	err := s.validator.validateCrossDomainCall(s.testDomainID, s.testTargetDomainID)
 	s.Nil(err)
@@ -185,8 +192,8 @@ func (s *decisionAttrValidatorSuite) TestValidateCrossDomainCall_LocalToEffectiv
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil).Once()
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil).Once()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).Times(1)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).Times(1)
 
 	err := s.validator.validateCrossDomainCall(s.testDomainID, s.testTargetDomainID)
 	s.Nil(err)
@@ -210,8 +217,8 @@ func (s *decisionAttrValidatorSuite) TestValidateCrossDomainCall_LocalToEffectiv
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil).Once()
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil).Once()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).Times(1)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).Times(1)
 
 	err := s.validator.validateCrossDomainCall(s.testDomainID, s.testTargetDomainID)
 	s.IsType(&workflow.BadRequestError{}, err)
@@ -238,8 +245,8 @@ func (s *decisionAttrValidatorSuite) TestValidateCrossDomainCall_LocalToGlobal()
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil).Once()
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil).Once()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).Times(1)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).Times(1)
 
 	err := s.validator.validateCrossDomainCall(s.testDomainID, s.testTargetDomainID)
 	s.IsType(&workflow.BadRequestError{}, err)
@@ -263,8 +270,8 @@ func (s *decisionAttrValidatorSuite) TestValidateCrossDomainCall_EffectiveLocalT
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil).Once()
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil).Once()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).Times(1)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).Times(1)
 
 	err := s.validator.validateCrossDomainCall(s.testDomainID, s.testTargetDomainID)
 	s.Nil(err)
@@ -288,8 +295,8 @@ func (s *decisionAttrValidatorSuite) TestValidateCrossDomainCall_EffectiveLocalT
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil).Once()
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil).Once()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).Times(1)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).Times(1)
 
 	err := s.validator.validateCrossDomainCall(s.testDomainID, s.testTargetDomainID)
 	s.IsType(&workflow.BadRequestError{}, err)
@@ -317,8 +324,8 @@ func (s *decisionAttrValidatorSuite) TestValidateCrossDomainCall_EffectiveLocalT
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil).Once()
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil).Once()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).Times(1)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).Times(1)
 
 	err := s.validator.validateCrossDomainCall(s.testDomainID, s.testTargetDomainID)
 	s.Nil(err)
@@ -346,8 +353,8 @@ func (s *decisionAttrValidatorSuite) TestValidateCrossDomainCall_EffectiveLocalT
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil).Once()
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil).Once()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).Times(1)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).Times(1)
 
 	err := s.validator.validateCrossDomainCall(s.testDomainID, s.testTargetDomainID)
 	s.IsType(&workflow.BadRequestError{}, err)
@@ -380,8 +387,8 @@ func (s *decisionAttrValidatorSuite) TestValidateCrossDomainCall_EffectiveLocalT
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil).Once()
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil).Once()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).Times(1)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).Times(1)
 
 	err := s.validator.validateCrossDomainCall(s.testDomainID, s.testTargetDomainID)
 	s.IsType(&workflow.BadRequestError{}, err)
@@ -408,8 +415,8 @@ func (s *decisionAttrValidatorSuite) TestValidateCrossDomainCall_GlobalToLocal()
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil).Once()
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil).Once()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).Times(1)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).Times(1)
 
 	err := s.validator.validateCrossDomainCall(s.testDomainID, s.testTargetDomainID)
 	s.IsType(&workflow.BadRequestError{}, err)
@@ -442,8 +449,8 @@ func (s *decisionAttrValidatorSuite) TestValidateCrossDomainCall_GlobalToEffecti
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil).Once()
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil).Once()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).Times(1)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).Times(1)
 
 	err := s.validator.validateCrossDomainCall(s.testDomainID, s.testTargetDomainID)
 	s.IsType(&workflow.BadRequestError{}, err)
@@ -477,8 +484,8 @@ func (s *decisionAttrValidatorSuite) TestValidateCrossDomainCall_GlobalToGlobal_
 		nil,
 	)
 
-	s.mockDomainCache.On("GetDomainByID", s.testDomainID).Return(domainEntry, nil).Once()
-	s.mockDomainCache.On("GetDomainByID", s.testTargetDomainID).Return(targetDomainEntry, nil).Once()
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testDomainID).Return(domainEntry, nil).Times(1)
+	s.mockDomainCache.EXPECT().GetDomainByID(s.testTargetDomainID).Return(targetDomainEntry, nil).Times(1)
 
 	err := s.validator.validateCrossDomainCall(s.testDomainID, s.testTargetDomainID)
 	s.IsType(&workflow.BadRequestError{}, err)

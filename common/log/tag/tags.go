@@ -141,6 +141,11 @@ func WorkflowDecisionTimeoutSeconds(s int32) Tag {
 	return newInt32("wf-decision-timeout", s)
 }
 
+// QueryID returns tag for QueryID
+func QueryID(queryID string) Tag {
+	return newStringTag("query-id", queryID)
+}
+
 // domain related
 
 // WorkflowDomainID returns tag for WorkflowDomainID
@@ -542,10 +547,6 @@ func ESDocID(id string) Tag {
 // LoggingCallAtKey is reserved tag
 const LoggingCallAtKey = "logging-call-at"
 
-func loggingCallAt(position string) Tag {
-	return newStringTag(LoggingCallAtKey, position)
-}
-
 // SysStackTrace returns tag for SysStackTrace
 func SysStackTrace(stackTrace string) Tag {
 	return newStringTag("sys-stack-trace", stackTrace)
@@ -678,11 +679,6 @@ func ArchivalRequestRunID(requestRunID string) Tag {
 	return newStringTag("archival-request-run-id", requestRunID)
 }
 
-// ArchivalRequestEventStoreVersion returns tag for RequestEventStoreVersion
-func ArchivalRequestEventStoreVersion(requestEventStoreVersion int32) Tag {
-	return newInt32("archival-request-event-store-version", requestEventStoreVersion)
-}
-
 // ArchivalRequestBranchToken returns tag for RequestBranchToken
 func ArchivalRequestBranchToken(requestBranchToken []byte) Tag {
 	return newObjectTag("archival-request-branch-token", requestBranchToken)
@@ -723,6 +719,11 @@ func ArchivalDeleteHistoryFailReason(deleteHistoryFailReason string) Tag {
 	return newStringTag("archival-delete-history-fail-reason", deleteHistoryFailReason)
 }
 
+// ArchivalVisibilityQuery returns tag for the query for getting archived visibility record
+func ArchivalVisibilityQuery(query string) Tag {
+	return newStringTag("archival-visibility-query", query)
+}
+
 // The following logger tags are only used by internal archiver implemention.
 // TODO: move them to internal repo once cadence plugin model is in place.
 
@@ -744,4 +745,9 @@ func ArchivalNonDeterministicBlobKey(nondeterministicBlobKey string) Tag {
 // ArchivalBlobIntegrityCheckFailReason returns tag for ArchivalBlobIntegrityCheckFailReason
 func ArchivalBlobIntegrityCheckFailReason(blobIntegrityCheckFailReason string) Tag {
 	return newStringTag("archival-blob-integrity-check-fail-reason", blobIntegrityCheckFailReason)
+}
+
+// ArchivalBlobstoreContextTimeout returns tag for ArchivalBlobstoreContextTimeout
+func ArchivalBlobstoreContextTimeout(blobstoreContextTimeout time.Duration) Tag {
+	return newDurationTag("archival-blobstore-context-timeout", blobstoreContextTimeout)
 }

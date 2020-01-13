@@ -18,12 +18,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -copyright_file ../../LICENSE -package $GOPACKAGE -source $GOFILE -destination conflictResolver_mock.go -self_package github.com/uber/cadence/service/history
+
 package history
 
 import (
 	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
@@ -47,20 +48,18 @@ type (
 		shard           ShardContext
 		clusterMetadata cluster.Metadata
 		context         workflowExecutionContext
-		historyMgr      persistence.HistoryManager
-		historyV2Mgr    persistence.HistoryV2Manager
+		historyV2Mgr    persistence.HistoryManager
 		logger          log.Logger
 	}
 )
 
-func newConflictResolver(shard ShardContext, context workflowExecutionContext, historyMgr persistence.HistoryManager, historyV2Mgr persistence.HistoryV2Manager,
+func newConflictResolver(shard ShardContext, context workflowExecutionContext, historyV2Mgr persistence.HistoryManager,
 	logger log.Logger) *conflictResolverImpl {
 
 	return &conflictResolverImpl{
 		shard:           shard,
 		clusterMetadata: shard.GetService().GetClusterMetadata(),
 		context:         context,
-		historyMgr:      historyMgr,
 		historyV2Mgr:    historyV2Mgr,
 		logger:          logger,
 	}
@@ -79,21 +78,24 @@ func (r *conflictResolverImpl) reset(
 	domainID := r.context.getDomainID()
 	execution := *r.context.getExecution()
 	startTime := info.StartTimestamp
-	eventStoreVersion := info.EventStoreVersion
-	branchToken := info.GetCurrentBranch()
+	branchToken := info.BranchToken // in 2DC world branch token is stored in execution info
 	replayNextEventID := replayEventID + 1
+
+	domainEntry, err := r.shard.GetDomainCache().GetDomainByID(domainID)
+	if err != nil {
+		return nil, err
+	}
 
 	var nextPageToken []byte
 	var resetMutableStateBuilder *mutableStateBuilder
 	var sBuilder stateBuilder
 	var history []*shared.HistoryEvent
 	var totalSize int64
-	var err error
 
 	eventsToApply := replayNextEventID - common.FirstEventID
 	for hasMore := true; hasMore; hasMore = len(nextPageToken) > 0 {
 		var size int
-		history, size, _, nextPageToken, err = r.getHistory(domainID, execution, common.FirstEventID, replayNextEventID, nextPageToken, eventStoreVersion, branchToken)
+		history, size, _, nextPageToken, err = r.getHistory(domainID, execution, common.FirstEventID, replayNextEventID, nextPageToken, branchToken)
 		if err != nil {
 			r.logError("Conflict resolution err getting history.", err)
 			return nil, err
@@ -118,19 +120,20 @@ func (r *conflictResolverImpl) reset(
 				r.shard,
 				r.shard.GetEventsCache(),
 				r.logger,
-				firstEvent.GetVersion(),
-				// if can see replication task, meaning that domain is
-				// global domain with > 1 target clusters
-				cache.ReplicationPolicyMultiCluster,
-				r.context.getDomainName(),
+				domainEntry,
 			)
 
-			resetMutableStateBuilder.executionInfo.EventStoreVersion = eventStoreVersion
-			sBuilder = newStateBuilder(r.shard, resetMutableStateBuilder, r.logger)
+			sBuilder = newStateBuilder(
+				r.shard,
+				r.logger,
+				resetMutableStateBuilder,
+				func(mutableState mutableState) mutableStateTaskGenerator {
+					return newMutableStateTaskGenerator(r.shard.GetDomainCache(), r.logger, mutableState)
+				},
+			)
 		}
 
-		// NOTE: passing 0 as newRunEventStoreVersion is safe here, since we don't need the newMutableState of the new run
-		_, _, _, err = sBuilder.applyEvents(domainID, requestID, execution, history, nil, resetMutableStateBuilder.GetEventStoreVersion(), 0)
+		_, err = sBuilder.applyEvents(domainID, requestID, execution, history, nil, false)
 		if err != nil {
 			r.logError("Conflict resolution err applying events.", err)
 			return nil, err
@@ -145,7 +148,7 @@ func (r *conflictResolverImpl) reset(
 	}
 
 	// reset branchToken to the original one(it has been set to a wrong branchToken in applyEvents for startEvent)
-	resetMutableStateBuilder.executionInfo.BranchToken = branchToken
+	resetMutableStateBuilder.executionInfo.BranchToken = branchToken // in 2DC world branch token is stored in execution info
 
 	resetMutableStateBuilder.executionInfo.StartTimestamp = startTime
 	// the last updated time is not important here, since this should be updated with event time afterwards
@@ -168,50 +171,42 @@ func (r *conflictResolverImpl) reset(
 	}
 
 	r.logger.Info("All events applied for execution.", tag.WorkflowResetNextEventID(resetMutableStateBuilder.GetNextEventID()))
-	msBuilder, err := r.context.conflictResolveWorkflowExecution(
+	r.context.setHistorySize(totalSize)
+	if err := r.context.conflictResolveWorkflowExecution(
 		startTime,
-		prevRunID,
-		prevLastWriteVersion,
-		prevState,
+		persistence.ConflictResolveWorkflowModeUpdateCurrent,
 		resetMutableStateBuilder,
-		totalSize,
-	)
-	if err != nil {
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		&persistence.CurrentWorkflowCAS{
+			PrevRunID:            prevRunID,
+			PrevLastWriteVersion: prevLastWriteVersion,
+			PrevState:            prevState,
+		},
+	); err != nil {
 		r.logError("Conflict resolution err reset workflow.", err)
 	}
-	return msBuilder, err
+	return r.context.loadWorkflowExecution()
 }
 
 func (r *conflictResolverImpl) getHistory(domainID string, execution shared.WorkflowExecution, firstEventID,
-	nextEventID int64, nextPageToken []byte, eventStoreVersion int32, branchToken []byte) ([]*shared.HistoryEvent, int, int64, []byte, error) {
+	nextEventID int64, nextPageToken []byte, branchToken []byte) ([]*shared.HistoryEvent, int, int64, []byte, error) {
 
-	if eventStoreVersion == persistence.EventStoreVersionV2 {
-		response, err := r.historyV2Mgr.ReadHistoryBranch(&persistence.ReadHistoryBranchRequest{
-			BranchToken:   branchToken,
-			MinEventID:    firstEventID,
-			MaxEventID:    nextEventID,
-			PageSize:      defaultHistoryPageSize,
-			NextPageToken: nextPageToken,
-			ShardID:       common.IntPtr(r.shard.GetShardID()),
-		})
-		if err != nil {
-			return nil, 0, 0, nil, err
-		}
-		return response.HistoryEvents, response.Size, response.LastFirstEventID, response.NextPageToken, nil
-	}
-	response, err := r.historyMgr.GetWorkflowExecutionHistory(&persistence.GetWorkflowExecutionHistoryRequest{
-		DomainID:      domainID,
-		Execution:     execution,
-		FirstEventID:  firstEventID,
-		NextEventID:   nextEventID,
+	response, err := r.historyV2Mgr.ReadHistoryBranch(&persistence.ReadHistoryBranchRequest{
+		BranchToken:   branchToken,
+		MinEventID:    firstEventID,
+		MaxEventID:    nextEventID,
 		PageSize:      defaultHistoryPageSize,
 		NextPageToken: nextPageToken,
+		ShardID:       common.IntPtr(r.shard.GetShardID()),
 	})
-
 	if err != nil {
 		return nil, 0, 0, nil, err
 	}
-	return response.History.Events, response.Size, response.LastFirstEventID, response.NextPageToken, nil
+	return response.HistoryEvents, response.Size, response.LastFirstEventID, response.NextPageToken, nil
 }
 
 func (r *conflictResolverImpl) logError(msg string, err error) {

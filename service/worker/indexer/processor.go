@@ -23,7 +23,12 @@ package indexer
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/olivere/elastic"
+
 	"github.com/uber/cadence/.gen/go/indexer"
 	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
@@ -34,9 +39,6 @@ import (
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/messaging"
 	"github.com/uber/cadence/common/metrics"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 type indexProcessor struct {
@@ -141,15 +143,13 @@ func (p *indexProcessor) processorPump() {
 	var workerWG sync.WaitGroup
 	for workerID := 0; workerID < p.config.IndexerConcurrency(); workerID++ {
 		workerWG.Add(1)
-		go p.messageProcessLoop(&workerWG, workerID)
+		go p.messageProcessLoop(&workerWG)
 	}
 
-	select {
-	case <-p.shutdownCh:
-		// Processor is shutting down, close the underlying consumer and esProcessor
-		p.consumer.Stop()
-		p.esProcessor.Stop()
-	}
+	<-p.shutdownCh
+	// Processor is shutting down, close the underlying consumer and esProcessor
+	p.consumer.Stop()
+	p.esProcessor.Stop()
 
 	p.logger.Info("Index processor pump shutting down.")
 	if success := common.AwaitWaitGroup(&workerWG, 10*time.Second); !success {
@@ -157,22 +157,15 @@ func (p *indexProcessor) processorPump() {
 	}
 }
 
-func (p *indexProcessor) messageProcessLoop(workerWG *sync.WaitGroup, workerID int) {
+func (p *indexProcessor) messageProcessLoop(workerWG *sync.WaitGroup) {
 	defer workerWG.Done()
 
-	for {
-		select {
-		case msg, ok := <-p.consumer.Messages():
-			if !ok {
-				p.logger.Info("Worker for index processor shutting down.")
-				return // channel closed
-			}
-			sw := p.metricsClient.StartTimer(metrics.IndexProcessorScope, metrics.IndexProcessorProcessMsgLatency)
-			err := p.process(msg)
-			sw.Stop()
-			if err != nil {
-				msg.Nack()
-			}
+	for msg := range p.consumer.Messages() {
+		sw := p.metricsClient.StartTimer(metrics.IndexProcessorScope, metrics.IndexProcessorProcessMsgLatency)
+		err := p.process(msg)
+		sw.Stop()
+		if err != nil {
+			msg.Nack() //nolint:errcheck
 		}
 	}
 }

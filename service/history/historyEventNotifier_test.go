@@ -25,8 +25,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
+
 	gen "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/clock"
@@ -38,6 +40,8 @@ import (
 type (
 	historyEventNotifierSuite struct {
 		suite.Suite
+		*require.Assertions
+
 		historyEventNotifier *historyEventNotifierImpl
 	}
 )
@@ -56,6 +60,8 @@ func (s *historyEventNotifierSuite) TearDownSuite() {
 }
 
 func (s *historyEventNotifierSuite) SetupTest() {
+	s.Assertions = require.New(s.T())
+
 	s.historyEventNotifier = newHistoryEventNotifier(
 		clock.NewRealTimeSource(),
 		metrics.NewClient(tally.NoopScope, metrics.History),
@@ -76,12 +82,13 @@ func (s *historyEventNotifierSuite) TestSingleSubscriberWatchingEvents() {
 		WorkflowId: common.StringPtr("workflow ID"),
 		RunId:      common.StringPtr("run ID"),
 	}
-	var lastFirstEventID int64 = 3
-	var previousStartedEventID int64 = 5
-	var nextEventID int64 = 18
-	isRunning := true
-	closeStatus := persistence.WorkflowCloseStatusNone
-	historyEvent := newHistoryEventNotification(domainID, execution, lastFirstEventID, nextEventID, previousStartedEventID, isRunning, closeStatus)
+	lastFirstEventID := int64(3)
+	previousStartedEventID := int64(5)
+	nextEventID := int64(18)
+	workflowState := persistence.WorkflowStateCreated
+	workflowCloseState := persistence.WorkflowCloseStatusNone
+	branchToken := make([]byte, 0)
+	historyEvent := newHistoryEventNotification(domainID, execution, lastFirstEventID, nextEventID, previousStartedEventID, branchToken, workflowState, workflowCloseState)
 	timerChan := time.NewTimer(time.Second * 2).C
 
 	subscriberID, channel, err := s.historyEventNotifier.WatchHistoryEvent(definition.NewWorkflowIdentifier(domainID, execution.GetWorkflowId(), execution.GetRunId()))
@@ -108,12 +115,13 @@ func (s *historyEventNotifierSuite) TestMultipleSubscriberWatchingEvents() {
 		RunId:      common.StringPtr("run ID"),
 	}
 
-	var lastFirstEventID int64 = 3
-	var previousStartedEventID int64 = 5
-	var nextEventID int64 = 18
-	isRunning := true
-	closeStatus := persistence.WorkflowCloseStatusNone
-	historyEvent := newHistoryEventNotification(domainID, execution, lastFirstEventID, nextEventID, previousStartedEventID, isRunning, closeStatus)
+	lastFirstEventID := int64(3)
+	previousStartedEventID := int64(5)
+	nextEventID := int64(18)
+	workflowState := persistence.WorkflowStateCreated
+	workflowCloseState := persistence.WorkflowCloseStatusNone
+	branchToken := make([]byte, 0)
+	historyEvent := newHistoryEventNotification(domainID, execution, lastFirstEventID, nextEventID, previousStartedEventID, branchToken, workflowState, workflowCloseState)
 	timerChan := time.NewTimer(time.Second * 5).C
 
 	subscriberCount := 100

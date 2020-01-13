@@ -23,11 +23,12 @@ package history
 import (
 	"context"
 
+	"go.uber.org/yarpc"
+
 	h "github.com/uber/cadence/.gen/go/history"
 	"github.com/uber/cadence/.gen/go/replicator"
 	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/metrics"
-	"go.uber.org/yarpc"
 )
 
 var _ Client = (*metricClient)(nil)
@@ -110,6 +111,23 @@ func (c *metricClient) GetMutableState(
 
 	if err != nil {
 		c.metricsClient.IncCounter(metrics.HistoryClientGetMutableStateScope, metrics.CadenceClientFailures)
+	}
+
+	return resp, err
+}
+
+func (c *metricClient) PollMutableState(
+	context context.Context,
+	request *h.PollMutableStateRequest,
+	opts ...yarpc.CallOption) (*h.PollMutableStateResponse, error) {
+	c.metricsClient.IncCounter(metrics.HistoryClientPollMutableStateScope, metrics.CadenceClientRequests)
+
+	sw := c.metricsClient.StartTimer(metrics.HistoryClientPollMutableStateScope, metrics.CadenceClientLatency)
+	resp, err := c.client.PollMutableState(context, request, opts...)
+	sw.Stop()
+
+	if err != nil {
+		c.metricsClient.IncCounter(metrics.HistoryClientPollMutableStateScope, metrics.CadenceClientFailures)
 	}
 
 	return resp, err
@@ -455,6 +473,23 @@ func (c *metricClient) ReplicateRawEvents(
 	return err
 }
 
+func (c *metricClient) ReplicateEventsV2(
+	context context.Context,
+	request *h.ReplicateEventsV2Request,
+	opts ...yarpc.CallOption) error {
+	c.metricsClient.IncCounter(metrics.HistoryClientReplicateEventsV2Scope, metrics.CadenceClientRequests)
+
+	sw := c.metricsClient.StartTimer(metrics.HistoryClientReplicateEventsV2Scope, metrics.CadenceClientLatency)
+	err := c.client.ReplicateEventsV2(context, request, opts...)
+	sw.Stop()
+
+	if err != nil {
+		c.metricsClient.IncCounter(metrics.HistoryClientReplicateEventsV2Scope, metrics.CadenceClientFailures)
+	}
+
+	return err
+}
+
 func (c *metricClient) SyncShardStatus(
 	context context.Context,
 	request *h.SyncShardStatusRequest,
@@ -507,6 +542,24 @@ func (c *metricClient) GetReplicationMessages(
 	return resp, err
 }
 
+func (c *metricClient) GetDLQReplicationMessages(
+	ctx context.Context,
+	request *replicator.GetDLQReplicationMessagesRequest,
+	opts ...yarpc.CallOption,
+) (*replicator.GetDLQReplicationMessagesResponse, error) {
+	c.metricsClient.IncCounter(metrics.HistoryClientGetDLQReplicationTasksScope, metrics.CadenceClientRequests)
+
+	sw := c.metricsClient.StartTimer(metrics.HistoryClientGetDLQReplicationTasksScope, metrics.CadenceClientLatency)
+	resp, err := c.client.GetDLQReplicationMessages(ctx, request, opts...)
+	sw.Stop()
+
+	if err != nil {
+		c.metricsClient.IncCounter(metrics.HistoryClientGetDLQReplicationTasksScope, metrics.CadenceClientFailures)
+	}
+
+	return resp, err
+}
+
 func (c *metricClient) QueryWorkflow(
 	ctx context.Context,
 	request *h.QueryWorkflowRequest,
@@ -523,4 +576,21 @@ func (c *metricClient) QueryWorkflow(
 	}
 
 	return resp, err
+}
+
+func (c *metricClient) ReapplyEvents(
+	ctx context.Context,
+	request *h.ReapplyEventsRequest,
+	opts ...yarpc.CallOption,
+) error {
+
+	c.metricsClient.IncCounter(metrics.HistoryClientReapplyEventsScope, metrics.CadenceClientRequests)
+	sw := c.metricsClient.StartTimer(metrics.HistoryClientReapplyEventsScope, metrics.CadenceClientLatency)
+	err := c.client.ReapplyEvents(ctx, request, opts...)
+	sw.Stop()
+
+	if err != nil {
+		c.metricsClient.IncCounter(metrics.HistoryClientReapplyEventsScope, metrics.CadenceClientFailures)
+	}
+	return err
 }

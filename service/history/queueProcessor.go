@@ -75,8 +75,7 @@ type (
 var (
 	errUnexpectedQueueTask = errors.New("unexpected queue task")
 
-	loadDomainEntryForQueueTaskRetryDelay = 100 * time.Millisecond
-	loadQueueTaskThrottleRetryDelay       = 5 * time.Second
+	loadQueueTaskThrottleRetryDelay = 5 * time.Second
 )
 
 func newQueueProcessorBase(
@@ -160,14 +159,13 @@ func (p *queueProcessorBase) notifyNewTask() {
 func (p *queueProcessorBase) processorPump() {
 	defer p.shutdownWG.Done()
 
-	jitter := backoff.NewJitter()
-	pollTimer := time.NewTimer(jitter.JitDuration(
+	pollTimer := time.NewTimer(backoff.JitDuration(
 		p.options.MaxPollInterval(),
 		p.options.MaxPollIntervalJitterCoefficient(),
 	))
 	defer pollTimer.Stop()
 
-	updateAckTimer := time.NewTimer(jitter.JitDuration(
+	updateAckTimer := time.NewTimer(backoff.JitDuration(
 		p.options.UpdateAckInterval(),
 		p.options.UpdateAckIntervalJitterCoefficient(),
 	))
@@ -184,7 +182,7 @@ processorPumpLoop:
 		case <-p.notifyCh:
 			p.processBatch()
 		case <-pollTimer.C:
-			pollTimer.Reset(jitter.JitDuration(
+			pollTimer.Reset(backoff.JitDuration(
 				p.options.MaxPollInterval(),
 				p.options.MaxPollIntervalJitterCoefficient(),
 			))
@@ -192,7 +190,7 @@ processorPumpLoop:
 				p.processBatch()
 			}
 		case <-updateAckTimer.C:
-			updateAckTimer.Reset(jitter.JitDuration(
+			updateAckTimer.Reset(backoff.JitDuration(
 				p.options.UpdateAckInterval(),
 				p.options.UpdateAckIntervalJitterCoefficient(),
 			))
@@ -228,10 +226,11 @@ func (p *queueProcessorBase) processBatch() {
 
 	for _, task := range tasks {
 		if shutdown := p.taskProcessor.addTask(
-			&taskInfo{
-				processor: p.processor,
-				task:      task,
-			},
+			newTaskInfo(
+				p.processor,
+				task,
+				initializeLoggerForTask(p.shard.GetShardID(), task, p.logger),
+			),
 		); shutdown {
 			return
 		}

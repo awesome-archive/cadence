@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+
 	workflow "github.com/uber/cadence/.gen/go/shared"
 )
 
@@ -99,9 +100,7 @@ func (s *thriftRWEncoderSuite) TestDecode_MissingVersion() {
 
 func (s *thriftRWEncoderSuite) TestDecode_InvalidVersion() {
 	binary := []byte{}
-	for _, value := range thriftEncodedBinary {
-		binary = append(binary, value)
-	}
+	binary = append(binary, thriftEncodedBinary...)
 	binary[0] = preambleVersion0 - 1
 
 	var val workflow.HistoryEvent

@@ -18,6 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -copyright_file ../../LICENSE -package $GOPACKAGE -source $GOFILE -destination transferQueueProcessor_mock.go
+
 package history
 
 import (
@@ -30,6 +32,7 @@ import (
 	h "github.com/uber/cadence/.gen/go/history"
 	"github.com/uber/cadence/client/history"
 	"github.com/uber/cadence/client/matching"
+	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
@@ -42,7 +45,15 @@ var (
 )
 
 type (
-	queueTaskFilter func(qTask queueTaskInfo) (bool, error)
+	transferQueueProcessor interface {
+		common.Daemon
+		FailoverDomain(domainIDs map[string]struct{})
+		NotifyNewTask(clusterName string, transferTasks []persistence.Task)
+		LockTaskProcessing()
+		UnlockTaskPrrocessing()
+	}
+
+	taskFilter func(task *taskInfo) (bool, error)
 
 	transferQueueProcessorImpl struct {
 		isGlobalDomainEnabled bool
@@ -95,6 +106,15 @@ func newTransferQueueProcessor(
 				historyRereplicationTimeout,
 				logger,
 			)
+			nDCHistoryResender := xdc.NewNDCHistoryResender(
+				shard.GetDomainCache(),
+				shard.GetService().GetClientBean().GetRemoteAdminClient(clusterName),
+				func(ctx context.Context, request *h.ReplicateEventsV2Request) error {
+					return historyService.ReplicateEventsV2(ctx, request)
+				},
+				shard.GetService().GetPayloadSerializer(),
+				logger,
+			)
 			standbyTaskProcessors[clusterName] = newTransferQueueStandbyProcessor(
 				clusterName,
 				shard,
@@ -103,6 +123,7 @@ func newTransferQueueProcessor(
 				matchingClient,
 				taskAllocator,
 				historyRereplicator,
+				nDCHistoryResender,
 				logger,
 			)
 		}
@@ -230,11 +251,14 @@ func (t *transferQueueProcessorImpl) FailoverDomain(
 
 	// NOTE: READ REF BEFORE MODIFICATION
 	// ref: historyEngine.go registerDomainFailoverCallback function
-	updateShardAckLevel(minLevel)
+	err := updateShardAckLevel(minLevel)
+	if err != nil {
+		t.logger.Error("Error update shard ack level", tag.Error(err))
+	}
 	failoverTaskProcessor.Start()
 }
 
-func (t *transferQueueProcessorImpl) LockTaskPrrocessing() {
+func (t *transferQueueProcessorImpl) LockTaskProcessing() {
 	t.taskAllocator.lock()
 }
 
@@ -250,7 +274,10 @@ func (t *transferQueueProcessorImpl) completeTransferLoop() {
 		select {
 		case <-t.shutdownChan:
 			// before shutdown, make sure the ack level is up to date
-			t.completeTransfer()
+			err := t.completeTransfer()
+			if err != nil {
+				t.logger.Error("Error complete transfer task", tag.Error(err))
+			}
 			return
 		case <-timer.C:
 		CompleteLoop:
@@ -307,6 +334,5 @@ func (t *transferQueueProcessorImpl) completeTransfer() error {
 
 	t.ackLevel = upperAckLevel
 
-	t.shard.UpdateTransferAckLevel(upperAckLevel)
-	return nil
+	return t.shard.UpdateTransferAckLevel(upperAckLevel)
 }

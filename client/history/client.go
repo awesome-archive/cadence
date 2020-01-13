@@ -25,6 +25,8 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/yarpc"
+
 	h "github.com/uber/cadence/.gen/go/history"
 	"github.com/uber/cadence/.gen/go/history/historyserviceclient"
 	"github.com/uber/cadence/.gen/go/replicator"
@@ -32,7 +34,6 @@ import (
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
-	"go.uber.org/yarpc"
 )
 
 var _ Client = (*clientImpl)(nil)
@@ -114,6 +115,30 @@ func (c *clientImpl) GetMutableState(
 	return response, nil
 }
 
+func (c *clientImpl) PollMutableState(
+	ctx context.Context,
+	request *h.PollMutableStateRequest,
+	opts ...yarpc.CallOption) (*h.PollMutableStateResponse, error) {
+	client, err := c.getClientForWorkflowID(*request.Execution.WorkflowId)
+	if err != nil {
+		return nil, err
+	}
+	opts = common.AggregateYarpcOptions(ctx, opts...)
+	var response *h.PollMutableStateResponse
+	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+		var err error
+		ctx, cancel := c.createContext(ctx)
+		defer cancel()
+		response, err = client.PollMutableState(ctx, request, opts...)
+		return err
+	}
+	err = c.executeWithRedirect(ctx, client, op)
+	if err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
 func (c *clientImpl) DescribeHistoryHost(
 	ctx context.Context,
 	request *workflow.DescribeHistoryHostRequest,
@@ -161,6 +186,9 @@ func (c *clientImpl) RemoveTask(
 	var client historyserviceclient.Interface
 	if request.ShardID != nil {
 		client, err = c.getClientForShardID(int(request.GetShardID()))
+		if err != nil {
+			return err
+		}
 	}
 	op := func(ctx context.Context, client historyserviceclient.Interface) error {
 		var err error
@@ -183,6 +211,9 @@ func (c *clientImpl) CloseShard(
 	var client historyserviceclient.Interface
 	if request.ShardID != nil {
 		client, err = c.getClientForShardID(int(request.GetShardID()))
+		if err != nil {
+			return err
+		}
 	}
 	op := func(ctx context.Context, client historyserviceclient.Interface) error {
 		var err error
@@ -651,6 +682,24 @@ func (c *clientImpl) ReplicateRawEvents(
 	return err
 }
 
+func (c *clientImpl) ReplicateEventsV2(
+	ctx context.Context,
+	request *h.ReplicateEventsV2Request,
+	opts ...yarpc.CallOption) error {
+	client, err := c.getClientForWorkflowID(request.WorkflowExecution.GetWorkflowId())
+	if err != nil {
+		return err
+	}
+	opts = common.AggregateYarpcOptions(ctx, opts...)
+	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+		ctx, cancel := c.createContext(ctx)
+		defer cancel()
+		return client.ReplicateEventsV2(ctx, request, opts...)
+	}
+	err = c.executeWithRedirect(ctx, client, op)
+	return err
+}
+
 func (c *clientImpl) SyncShardStatus(
 	ctx context.Context,
 	request *h.SyncShardStatusRequest,
@@ -696,7 +745,7 @@ func (c *clientImpl) QueryWorkflow(
 	request *h.QueryWorkflowRequest,
 	opts ...yarpc.CallOption,
 ) (*h.QueryWorkflowResponse, error) {
-	client, err := c.getClientForWorkflowID(request.Execution.GetWorkflowId())
+	client, err := c.getClientForWorkflowID(request.GetRequest().GetExecution().GetWorkflowId())
 	if err != nil {
 		return nil, err
 	}
@@ -730,7 +779,9 @@ func (c *clientImpl) GetReplicationMessages(
 		}
 
 		if _, ok := requestsByClient[client]; !ok {
-			requestsByClient[client] = &replicator.GetReplicationMessagesRequest{}
+			requestsByClient[client] = &replicator.GetReplicationMessagesRequest{
+				ClusterName: request.ClusterName,
+			}
 		}
 
 		req := requestsByClient[client]
@@ -766,6 +817,44 @@ func (c *clientImpl) GetReplicationMessages(
 	}
 
 	return response, nil
+}
+
+func (c *clientImpl) GetDLQReplicationMessages(
+	ctx context.Context,
+	request *replicator.GetDLQReplicationMessagesRequest,
+	opts ...yarpc.CallOption,
+) (*replicator.GetDLQReplicationMessagesResponse, error) {
+	// All workflow IDs are in the same shard per request
+	workflowID := request.GetTaskInfos()[0].GetWorkflowID()
+	client, err := c.getClientForWorkflowID(workflowID)
+	if err != nil {
+		return nil, err
+	}
+
+	return client.GetDLQReplicationMessages(
+		ctx,
+		request,
+		opts...,
+	)
+}
+
+func (c *clientImpl) ReapplyEvents(
+	ctx context.Context,
+	request *h.ReapplyEventsRequest,
+	opts ...yarpc.CallOption,
+) error {
+	client, err := c.getClientForWorkflowID(request.GetRequest().GetWorkflowExecution().GetWorkflowId())
+	if err != nil {
+		return err
+	}
+	opts = common.AggregateYarpcOptions(ctx, opts...)
+	op := func(ctx context.Context, client historyserviceclient.Interface) error {
+		ctx, cancel := c.createContext(ctx)
+		defer cancel()
+		return client.ReapplyEvents(ctx, request, opts...)
+	}
+	err = c.executeWithRedirect(ctx, client, op)
+	return err
 }
 
 func (c *clientImpl) createContext(parent context.Context) (context.Context, context.CancelFunc) {

@@ -24,7 +24,6 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -125,6 +124,8 @@ func (task *addLicenseHeaderTask) handleFile(path string, fileInfo os.FileInfo, 
 		return nil
 	}
 
+	// Used as part of the cli to write licence headers on files, does not use user supplied input so marked as nosec
+	// #nosec
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -152,6 +153,8 @@ func (task *addLicenseHeaderTask) handleFile(path string, fileInfo os.FileInfo, 
 		}
 	}
 
+	// Used as part of the cli to write licence headers on files, does not use user supplied input so marked as nosec
+	// #nosec
 	data, err := ioutil.ReadFile(path)
 	if err != nil {
 		return err
@@ -171,11 +174,6 @@ func mustProcessPath(path string) bool {
 		}
 	}
 	return true
-}
-
-// returns true if the error type is an EOF
-func isEOF(err error) bool {
-	return err == io.EOF || err == io.ErrUnexpectedEOF
 }
 
 func commentOutLines(str string) (string, error) {

@@ -29,6 +29,11 @@ import (
 
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/yarpc"
+	"go.uber.org/yarpc/transport/tchannel"
+	"go.uber.org/zap"
+	"gopkg.in/yaml.v2"
+
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
@@ -37,10 +42,6 @@ import (
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/persistence"
 	"github.com/uber/cadence/environment"
-	"go.uber.org/yarpc"
-	"go.uber.org/yarpc/transport/tchannel"
-	"go.uber.org/zap"
-	"gopkg.in/yaml.v2"
 )
 
 type (
@@ -123,6 +124,8 @@ func GetTestClusterConfig(configFile string) (*TestClusterConfig, error) {
 	if TestFlags.TestClusterConfigFile != "" {
 		configLocation = TestFlags.TestClusterConfigFile
 	}
+	// This is just reading a config so it's less of a security concern
+	// #nosec
 	confContent, err := ioutil.ReadFile(configLocation)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read test cluster config file %v: %v", configLocation, err)
@@ -133,7 +136,6 @@ func GetTestClusterConfig(configFile string) (*TestClusterConfig, error) {
 		return nil, fmt.Errorf("failed to decode test cluster config %v", tag.Error(err))
 	}
 
-	options.EnableEventsV2 = TestFlags.EnableEventsV2
 	options.FrontendAddress = TestFlags.FrontendAddr
 	if options.ESConfig != nil {
 		options.ESConfig.Indices[common.VisibilityAppName] += uuid.New()
@@ -168,15 +170,6 @@ func (s *IntegrationBase) registerDomain(
 		HistoryArchivalURI:                     &historyArchivalURI,
 		VisibilityArchivalStatus:               &visibilityArchivalStatus,
 		VisibilityArchivalURI:                  &visibilityArchivalURI,
-	})
-}
-
-func (s *IntegrationBase) describeDomain(domain string) (*workflow.DescribeDomainResponse, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	return s.engine.DescribeDomain(ctx, &workflow.DescribeDomainRequest{
-		Name: &domain,
 	})
 }
 
@@ -240,9 +233,9 @@ func (s *IntegrationBase) registerArchivalDomain() error {
 			},
 		},
 		IsGlobalDomain:  false,
-		FailoverVersion: 0,
+		FailoverVersion: common.EmptyVersion,
 	}
-	response, err := s.testCluster.testBase.MetadataProxy.CreateDomain(domainRequest)
+	response, err := s.testCluster.testBase.MetadataManager.CreateDomain(domainRequest)
 
 	s.Logger.Info("Register domain succeeded",
 		tag.WorkflowDomainName(s.archivalDomainName),

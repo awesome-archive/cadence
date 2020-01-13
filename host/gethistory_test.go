@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/pborman/uuid"
+
 	"github.com/uber/cadence/.gen/go/admin"
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
@@ -35,9 +36,9 @@ import (
 )
 
 func (s *integrationSuite) TestGetWorkflowExecutionHistory_All() {
-	workflowID := "interation-get-workflow-history-events-long-poll-test-all"
-	workflowTypeName := "interation-get-workflow-history-events-long-poll-test-all-type"
-	tasklistName := "interation-get-workflow-history-events-long-poll-test-all-tasklist"
+	workflowID := "integration-get-workflow-history-events-long-poll-test-all"
+	workflowTypeName := "integration-get-workflow-history-events-long-poll-test-all-type"
+	tasklistName := "integration-get-workflow-history-events-long-poll-test-all-tasklist"
 	identity := "worker1"
 	activityName := "activity_type1"
 
@@ -203,9 +204,9 @@ func (s *integrationSuite) TestGetWorkflowExecutionHistory_All() {
 }
 
 func (s *integrationSuite) TestGetWorkflowExecutionHistory_Close() {
-	workflowID := "interation-get-workflow-history-events-long-poll-test-close"
-	workflowTypeName := "interation-get-workflow-history-events-long-poll-test-close-type"
-	tasklistName := "interation-get-workflow-history-events-long-poll-test-close-tasklist"
+	workflowID := "integration-get-workflow-history-events-long-poll-test-close"
+	workflowTypeName := "integration-get-workflow-history-events-long-poll-test-close-type"
+	tasklistName := "integration-get-workflow-history-events-long-poll-test-close-tasklist"
 	identity := "worker1"
 	activityName := "activity_type1"
 
@@ -362,9 +363,9 @@ func (s *integrationSuite) TestGetWorkflowExecutionHistory_Close() {
 }
 
 func (s *integrationSuite) TestGetWorkflowExecutionRawHistory_All() {
-	workflowID := "interation-get-workflow-history-raw-events-all"
-	workflowTypeName := "interation-get-workflow-history-raw-events-all-type"
-	tasklistName := "interation-get-workflow-history-raw-events-all-tasklist"
+	workflowID := "integration-get-workflow-history-raw-events-all"
+	workflowTypeName := "integration-get-workflow-history-raw-events-all-type"
+	tasklistName := "integration-get-workflow-history-raw-events-all-tasklist"
 	identity := "worker1"
 	activityName := "activity_type1"
 
@@ -487,11 +488,6 @@ func (s *integrationSuite) TestGetWorkflowExecutionRawHistory_All() {
 	s.True(len(resp.HistoryBatches) == pageSize)
 	blobs = append(blobs, resp.HistoryBatches...)
 	token = resp.NextPageToken
-	if s.testClusterConfig.EnableEventsV2 {
-		s.Equal(int32(2), resp.GetEventStoreVersion())
-	} else {
-		s.Equal(int32(0), resp.GetEventStoreVersion())
-	}
 	if token != nil {
 		resp, err := getHistory(s.domainName, execution, common.FirstEventID, common.EndEventID, token)
 		s.Nil(err)
@@ -512,11 +508,6 @@ func (s *integrationSuite) TestGetWorkflowExecutionRawHistory_All() {
 		s.True(len(resp.HistoryBatches) <= pageSize)
 		blobs = append(blobs, resp.HistoryBatches...)
 		token = resp.NextPageToken
-		if s.testClusterConfig.EnableEventsV2 {
-			s.Equal(int32(2), resp.GetEventStoreVersion())
-		} else {
-			s.Equal(int32(0), resp.GetEventStoreVersion())
-		}
 	}
 	// now, there shall be 3 batches of events:
 	// 1. start event and decision task scheduled;
@@ -537,11 +528,6 @@ func (s *integrationSuite) TestGetWorkflowExecutionRawHistory_All() {
 		s.True(len(resp.HistoryBatches) <= pageSize)
 		blobs = append(blobs, resp.HistoryBatches...)
 		token = resp.NextPageToken
-		if s.testClusterConfig.EnableEventsV2 {
-			s.Equal(int32(2), resp.GetEventStoreVersion())
-		} else {
-			s.Equal(int32(0), resp.GetEventStoreVersion())
-		}
 	}
 	// now, there shall be 5 batches of events:
 	// 1. start event and decision task scheduled;
@@ -564,11 +550,6 @@ func (s *integrationSuite) TestGetWorkflowExecutionRawHistory_All() {
 		s.True(len(resp.HistoryBatches) <= pageSize)
 		blobs = append(blobs, resp.HistoryBatches...)
 		token = resp.NextPageToken
-		if s.testClusterConfig.EnableEventsV2 {
-			s.Equal(int32(2), resp.GetEventStoreVersion())
-		} else {
-			s.Equal(int32(0), resp.GetEventStoreVersion())
-		}
 	}
 	// now, there shall be 7 batches of events:
 	// 1. start event and decision task scheduled;
@@ -591,11 +572,6 @@ func (s *integrationSuite) TestGetWorkflowExecutionRawHistory_All() {
 		s.True(len(resp.HistoryBatches) <= pageSize)
 		blobs = append(blobs, resp.HistoryBatches...)
 		token = resp.NextPageToken
-		if s.testClusterConfig.EnableEventsV2 {
-			s.Equal(int32(2), resp.GetEventStoreVersion())
-		} else {
-			s.Equal(int32(0), resp.GetEventStoreVersion())
-		}
 	}
 	// should get the following events
 	// 1. decision task completed and activity task scheduled

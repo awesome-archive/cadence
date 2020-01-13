@@ -4,7 +4,7 @@ ARG TARGET=server
 ARG GOPROXY
 
 # Build tcheck binary
-FROM golang:1.12.7-alpine AS tcheck
+FROM golang:1.13.3-alpine AS tcheck
 
 RUN apk add --update --no-cache ca-certificates git curl
 
@@ -25,7 +25,7 @@ RUN go install
 
 
 # Build Cadence binaries
-FROM golang:1.12.7-alpine AS builder
+FROM golang:1.13.3-alpine AS builder
 
 RUN apk add --update --no-cache ca-certificates make git curl mercurial bzr
 
@@ -39,7 +39,8 @@ COPY go.* ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 make copyright cadence-cassandra-tool cadence-sql-tool cadence cadence-server
+# need to make clean first in case binaries to be built are stale
+RUN make clean && CGO_ENABLED=0 make copyright cadence-cassandra-tool cadence-sql-tool cadence cadence-server
 
 
 # Download dockerize

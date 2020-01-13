@@ -25,6 +25,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/uber/cadence/common/client"
+
+	"go.uber.org/yarpc"
+
 	h "github.com/uber/cadence/.gen/go/history"
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
@@ -34,7 +38,6 @@ import (
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
-	"go.uber.org/yarpc"
 )
 
 type (
@@ -65,6 +68,7 @@ type (
 		logger                log.Logger
 		throttledLogger       log.Logger
 		decisionAttrValidator *decisionAttrValidator
+		versionChecker        client.VersionChecker
 	}
 )
 
@@ -88,6 +92,7 @@ func newDecisionHandler(historyEngine *historyEngineImpl) *decisionHandlerImpl {
 			historyEngine.config,
 			historyEngine.logger,
 		),
+		versionChecker: client.NewVersionChecker(),
 	}
 }
 
@@ -108,22 +113,22 @@ func (handler *decisionHandlerImpl) handleDecisionTaskScheduled(
 	}
 
 	return handler.historyEngine.updateWorkflowExecutionWithAction(ctx, domainID, execution,
-		func(msBuilder mutableState, tBuilder *timerBuilder) (*updateWorkflowAction, error) {
-			if !msBuilder.IsWorkflowExecutionRunning() {
+		func(context workflowExecutionContext, mutableState mutableState) (*updateWorkflowAction, error) {
+			if !mutableState.IsWorkflowExecutionRunning() {
 				return nil, ErrWorkflowCompleted
 			}
 
-			if msBuilder.HasProcessedOrPendingDecision() {
+			if mutableState.HasProcessedOrPendingDecision() {
 				return &updateWorkflowAction{
 					noop: true,
 				}, nil
 			}
 
-			startEvent, found := msBuilder.GetStartEvent()
-			if !found {
-				return nil, &workflow.InternalServiceError{Message: "Failed to load start event."}
+			startEvent, err := mutableState.GetStartEvent()
+			if err != nil {
+				return nil, err
 			}
-			if err := msBuilder.AddFirstDecisionTaskScheduled(
+			if err := mutableState.AddFirstDecisionTaskScheduled(
 				startEvent,
 			); err != nil {
 				return nil, err
@@ -154,16 +159,16 @@ func (handler *decisionHandlerImpl) handleDecisionTaskStarted(
 
 	var resp *h.RecordDecisionTaskStartedResponse
 	err = handler.historyEngine.updateWorkflowExecutionWithAction(ctx, domainID, execution,
-		func(msBuilder mutableState, tBuilder *timerBuilder) (*updateWorkflowAction, error) {
-			if !msBuilder.IsWorkflowExecutionRunning() {
+		func(context workflowExecutionContext, mutableState mutableState) (*updateWorkflowAction, error) {
+			if !mutableState.IsWorkflowExecutionRunning() {
 				return nil, ErrWorkflowCompleted
 			}
 
-			decision, isRunning := msBuilder.GetDecisionInfo(scheduleID)
+			decision, isRunning := mutableState.GetDecisionInfo(scheduleID)
 
 			// First check to see if cache needs to be refreshed as we could potentially have stale workflow execution in
 			// some extreme cassandra failure cases.
-			if !isRunning && scheduleID >= msBuilder.GetNextEventID() {
+			if !isRunning && scheduleID >= mutableState.GetNextEventID() {
 				handler.metricsClient.IncCounter(metrics.HistoryRecordDecisionTaskStartedScope, metrics.StaleMutableStateCounter)
 				// Reload workflow execution history
 				// ErrStaleState will trigger updateWorkflowExecutionWithAction function to reload the mutable state
@@ -183,7 +188,10 @@ func (handler *decisionHandlerImpl) handleDecisionTaskStarted(
 			if decision.StartedID != common.EmptyEventID {
 				// If decision is started as part of the current request scope then return a positive response
 				if decision.RequestID == requestID {
-					resp = handler.createRecordDecisionTaskStartedResponse(domainID, msBuilder, decision, req.PollRequest.GetIdentity())
+					resp, err = handler.createRecordDecisionTaskStartedResponse(domainID, mutableState, decision, req.PollRequest.GetIdentity())
+					if err != nil {
+						return nil, err
+					}
 					updateAction.noop = true
 					return updateAction, nil
 				}
@@ -193,13 +201,16 @@ func (handler *decisionHandlerImpl) handleDecisionTaskStarted(
 				return nil, &h.EventAlreadyStartedError{Message: "Decision task already started."}
 			}
 
-			_, decision, err = msBuilder.AddDecisionTaskStartedEvent(scheduleID, requestID, req.PollRequest)
+			_, decision, err = mutableState.AddDecisionTaskStartedEvent(scheduleID, requestID, req.PollRequest)
 			if err != nil {
 				// Unable to add DecisionTaskStarted event to history
 				return nil, &workflow.InternalServiceError{Message: "Unable to add DecisionTaskStarted event to history."}
 			}
 
-			resp = handler.createRecordDecisionTaskStartedResponse(domainID, msBuilder, decision, req.PollRequest.GetIdentity())
+			resp, err = handler.createRecordDecisionTaskStartedResponse(domainID, mutableState, decision, req.PollRequest.GetIdentity())
+			if err != nil {
+				return nil, err
+			}
 			return updateAction, nil
 		})
 
@@ -232,19 +243,19 @@ func (handler *decisionHandlerImpl) handleDecisionTaskFailed(
 	}
 
 	return handler.historyEngine.updateWorkflowExecution(ctx, domainID, workflowExecution, true,
-		func(msBuilder mutableState, tBuilder *timerBuilder) error {
-			if !msBuilder.IsWorkflowExecutionRunning() {
+		func(context workflowExecutionContext, mutableState mutableState) error {
+			if !mutableState.IsWorkflowExecutionRunning() {
 				return ErrWorkflowCompleted
 			}
 
 			scheduleID := token.ScheduleID
-			decision, isRunning := msBuilder.GetDecisionInfo(scheduleID)
+			decision, isRunning := mutableState.GetDecisionInfo(scheduleID)
 			if !isRunning || decision.Attempt != token.ScheduleAttempt || decision.StartedID == common.EmptyEventID {
 				return &workflow.EntityNotExistsError{Message: "Decision task not found."}
 			}
 
-			_, err := msBuilder.AddDecisionTaskFailedEvent(decision.ScheduleID, decision.StartedID, request.GetCause(), request.Details,
-				request.GetIdentity(), "", "", "", 0)
+			_, err := mutableState.AddDecisionTaskFailedEvent(decision.ScheduleID, decision.StartedID, request.GetCause(), request.Details,
+				request.GetIdentity(), "", request.GetBinaryChecksum(), "", "", 0)
 			return err
 		})
 }
@@ -260,10 +271,6 @@ func (handler *decisionHandlerImpl) handleDecisionTaskCompleted(
 	}
 	domainID := domainEntry.GetInfo().ID
 
-	var eventStoreVersion int32
-	if handler.config.EnableEventsV2(domainEntry.GetInfo().Name) {
-		eventStoreVersion = persistence.EventStoreVersionV2
-	}
 	request := req.CompleteRequest
 	token, err0 := handler.tokenSerializer.Deserialize(request.TaskToken)
 	if err0 != nil {
@@ -301,9 +308,6 @@ Update_History_Loop:
 		}
 
 		executionInfo := msBuilder.GetExecutionInfo()
-		timerBuilderProvider := func() *timerBuilder {
-			return handler.historyEngine.getTimerBuilder(context.getExecution())
-		}
 
 		scheduleID := token.ScheduleID
 		currentDecision, isRunning := msBuilder.GetDecisionInfo(scheduleID)
@@ -405,13 +409,11 @@ Update_History_Loop:
 			decisionTaskHandler := newDecisionTaskHandler(
 				request.GetIdentity(),
 				completedEvent.GetEventId(),
-				eventStoreVersion,
 				domainEntry,
 				msBuilder,
 				handler.decisionAttrValidator,
 				workflowSizeChecker,
 				handler.logger,
-				timerBuilderProvider,
 				handler.domainCache,
 				handler.metricsClient,
 				handler.config,
@@ -455,9 +457,7 @@ Update_History_Loop:
 			continueAsNewBuilder = nil
 		}
 
-		// Schedule another decision task if new events came in during this decision or if request forced to
-		createNewDecisionTask := msBuilder.IsWorkflowExecutionRunning() &&
-			(hasUnhandledEvents || request.GetForceCreateNewDecisionTask() || activityNotStartedCancelled)
+		createNewDecisionTask := msBuilder.IsWorkflowExecutionRunning() && (hasUnhandledEvents || request.GetForceCreateNewDecisionTask() || activityNotStartedCancelled)
 		var newDecisionTaskScheduledID int64
 		if createNewDecisionTask {
 			var newDecision *decisionInfo
@@ -530,10 +530,13 @@ Update_History_Loop:
 					return nil, err
 				}
 
-				if _, err := msBuilder.AddWorkflowExecutionTerminatedEvent(
+				eventBatchFirstEventID := msBuilder.GetNextEventID()
+				if err := terminateWorkflow(
+					msBuilder,
+					eventBatchFirstEventID,
 					common.FailureReasonTransactionSizeExceedsLimit,
 					[]byte(updateErr.Error()),
-					"cadence-history-server",
+					identityHistoryService,
 				); err != nil {
 					return nil, err
 				}
@@ -547,6 +550,15 @@ Update_History_Loop:
 			return nil, updateErr
 		}
 
+		handler.handleBufferedQueries(
+			msBuilder,
+			clientImpl,
+			clientFeatureVersion,
+			req.GetCompleteRequest().GetQueryResults(),
+			createNewDecisionTask,
+			domainEntry,
+			decisionHeartbeating)
+
 		if decisionHeartbeatTimeout {
 			// at this point, update is successful, but we still return an error to client so that the worker will give up this workflow
 			return nil, &workflow.EntityNotExistsError{
@@ -557,7 +569,10 @@ Update_History_Loop:
 		resp = &h.RespondDecisionTaskCompletedResponse{}
 		if request.GetReturnNewDecisionTask() && createNewDecisionTask {
 			decision, _ := msBuilder.GetDecisionInfo(newDecisionTaskScheduledID)
-			resp.StartedResponse = handler.createRecordDecisionTaskStartedResponse(domainID, msBuilder, decision, request.GetIdentity())
+			resp.StartedResponse, err = handler.createRecordDecisionTaskStartedResponse(domainID, msBuilder, decision, request.GetIdentity())
+			if err != nil {
+				return nil, err
+			}
 			// sticky is always enabled when worker request for new decision task from RespondDecisionTaskCompleted
 			resp.StartedResponse.StickyExecutionEnabled = common.BoolPtr(true)
 		}
@@ -573,7 +588,7 @@ func (handler *decisionHandlerImpl) createRecordDecisionTaskStartedResponse(
 	msBuilder mutableState,
 	decision *decisionInfo,
 	identity string,
-) *h.RecordDecisionTaskStartedResponse {
+) (*h.RecordDecisionTaskStartedResponse, error) {
 
 	response := &h.RecordDecisionTaskStartedResponse{}
 	response.WorkflowType = msBuilder.GetWorkflowType()
@@ -604,8 +619,154 @@ func (handler *decisionHandlerImpl) createRecordDecisionTaskStartedResponse(
 		response.DecisionInfo.ScheduledEvent = scheduledEvent
 		response.DecisionInfo.StartedEvent = startedEvent
 	}
-	response.EventStoreVersion = common.Int32Ptr(msBuilder.GetEventStoreVersion())
-	response.BranchToken = msBuilder.GetCurrentBranch()
+	currentBranchToken, err := msBuilder.GetCurrentBranchToken()
+	if err != nil {
+		return nil, err
+	}
+	response.BranchToken = currentBranchToken
 
-	return response
+	qr := msBuilder.GetQueryRegistry()
+	buffered := qr.getBufferedIDs()
+	queries := make(map[string]*workflow.WorkflowQuery)
+	for _, id := range buffered {
+		input, err := qr.getQueryInput(id)
+		if err != nil {
+			continue
+		}
+		queries[id] = input
+	}
+	response.Queries = queries
+	return response, nil
+}
+
+func (handler *decisionHandlerImpl) handleBufferedQueries(
+	msBuilder mutableState,
+	clientImpl string,
+	clientFeatureVersion string,
+	queryResults map[string]*workflow.WorkflowQueryResult,
+	createNewDecisionTask bool,
+	domainEntry *cache.DomainCacheEntry,
+	decisionHeartbeating bool,
+) {
+	queryRegistry := msBuilder.GetQueryRegistry()
+	if !queryRegistry.hasBufferedQuery() {
+		return
+	}
+
+	domainID := domainEntry.GetInfo().ID
+	domain := domainEntry.GetInfo().Name
+	workflowID := msBuilder.GetExecutionInfo().WorkflowID
+	runID := msBuilder.GetExecutionInfo().RunID
+
+	scope := handler.metricsClient.Scope(metrics.HistoryRespondDecisionTaskCompletedScope)
+
+	// Consistent query requires both server and client worker support. If a consistent query was requested (meaning there are
+	// buffered queries) but worker does not support consistent query then all buffered queries should be failed.
+	if versionErr := handler.versionChecker.SupportsConsistentQuery(clientImpl, clientFeatureVersion); versionErr != nil {
+		scope.IncCounter(metrics.WorkerNotSupportsConsistentQueryCount)
+		failedTerminationState := &queryTerminationState{
+			queryTerminationType: queryTerminationTypeFailed,
+			failure:              &workflow.BadRequestError{Message: versionErr.Error()},
+		}
+		buffered := queryRegistry.getBufferedIDs()
+		handler.logger.Info(
+			"failing query because worker does not support consistent query",
+			tag.WorkflowDomainName(domain),
+			tag.WorkflowID(workflowID),
+			tag.WorkflowRunID(runID),
+			tag.Error(versionErr))
+		for _, id := range buffered {
+			if err := queryRegistry.setTerminationState(id, failedTerminationState); err != nil {
+				handler.logger.Error(
+					"failed to set query termination state to failed",
+					tag.WorkflowDomainName(domain),
+					tag.WorkflowID(workflowID),
+					tag.WorkflowRunID(runID),
+					tag.QueryID(id),
+					tag.Error(err))
+				scope.IncCounter(metrics.QueryRegistryInvalidStateCount)
+			}
+		}
+		return
+	}
+
+	// if its a heartbeat decision it means local activities may still be running on the worker
+	// which were started by an external event which happened before the query
+	if decisionHeartbeating {
+		return
+	}
+
+	sizeLimitError := handler.config.BlobSizeLimitError(domain)
+	sizeLimitWarn := handler.config.BlobSizeLimitWarn(domain)
+
+	// Complete or fail all queries we have results for
+	for id, result := range queryResults {
+		if err := common.CheckEventBlobSizeLimit(
+			len(result.GetAnswer()),
+			sizeLimitWarn,
+			sizeLimitError,
+			domainID,
+			workflowID,
+			runID,
+			scope,
+			handler.throttledLogger,
+		); err != nil {
+			handler.logger.Info("failing query because query result size is too large",
+				tag.WorkflowDomainName(domain),
+				tag.WorkflowID(workflowID),
+				tag.WorkflowRunID(runID),
+				tag.QueryID(id),
+				tag.Error(err))
+			failedTerminationState := &queryTerminationState{
+				queryTerminationType: queryTerminationTypeFailed,
+				failure:              err,
+			}
+			if err := queryRegistry.setTerminationState(id, failedTerminationState); err != nil {
+				handler.logger.Error(
+					"failed to set query termination state to failed",
+					tag.WorkflowDomainName(domain),
+					tag.WorkflowID(workflowID),
+					tag.WorkflowRunID(runID),
+					tag.QueryID(id),
+					tag.Error(err))
+				scope.IncCounter(metrics.QueryRegistryInvalidStateCount)
+			}
+		} else {
+			completedTerminationState := &queryTerminationState{
+				queryTerminationType: queryTerminationTypeCompleted,
+				queryResult:          result,
+			}
+			if err := queryRegistry.setTerminationState(id, completedTerminationState); err != nil {
+				handler.logger.Error(
+					"failed to set query termination state to completed",
+					tag.WorkflowDomainName(domain),
+					tag.WorkflowID(workflowID),
+					tag.WorkflowRunID(runID),
+					tag.QueryID(id),
+					tag.Error(err))
+				scope.IncCounter(metrics.QueryRegistryInvalidStateCount)
+			}
+		}
+	}
+
+	// If no decision task was created then it means no buffered events came in during this decision task's handling.
+	// This means all unanswered buffered queries can be dispatched directly through matching at this point.
+	if !createNewDecisionTask {
+		buffered := queryRegistry.getBufferedIDs()
+		for _, id := range buffered {
+			unblockTerminationState := &queryTerminationState{
+				queryTerminationType: queryTerminationTypeUnblocked,
+			}
+			if err := queryRegistry.setTerminationState(id, unblockTerminationState); err != nil {
+				handler.logger.Error(
+					"failed to set query termination state to unblocked",
+					tag.WorkflowDomainName(domain),
+					tag.WorkflowID(workflowID),
+					tag.WorkflowRunID(runID),
+					tag.QueryID(id),
+					tag.Error(err))
+				scope.IncCounter(metrics.QueryRegistryInvalidStateCount)
+			}
+		}
+	}
 }

@@ -28,6 +28,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/uber/cadence/common/auth"
+
 	"io"
 	"io/ioutil"
 	"os"
@@ -41,6 +43,11 @@ import (
 	"github.com/Shopify/sarama"
 	cluster "github.com/bsm/sarama-cluster"
 	"github.com/gocql/gocql"
+	"github.com/urfave/cli"
+	"go.uber.org/thriftrw/protocol"
+	"go.uber.org/thriftrw/wire"
+	yaml "gopkg.in/yaml.v2"
+
 	"github.com/uber/cadence/.gen/go/indexer"
 	"github.com/uber/cadence/.gen/go/replicator"
 	"github.com/uber/cadence/.gen/go/shared"
@@ -51,10 +58,6 @@ import (
 	"github.com/uber/cadence/common/persistence/cassandra"
 	"github.com/uber/cadence/common/service/dynamicconfig"
 	"github.com/uber/cadence/service/history"
-	"github.com/urfave/cli"
-	"go.uber.org/thriftrw/protocol"
-	"go.uber.org/thriftrw/wire"
-	yaml "gopkg.in/yaml.v2"
 )
 
 type filterFn func(*replicator.ReplicationTask) bool
@@ -68,7 +71,7 @@ const (
 )
 
 const (
-	bufferSize                 = 4096
+	bufferSize                 = 8192
 	preambleVersion0      byte = 0x59
 	malformedMessage           = "Input was malformed"
 	chanBufferSize             = 10000
@@ -76,7 +79,7 @@ const (
 )
 
 var (
-	r = regexp.MustCompile(`Partition: .*?, Offset: .*?, Key: .*?`)
+	r = regexp.MustCompile(`Partition: \d+, Offset: \d+, Key: [^\n]*\n`)
 )
 
 type writerChannel struct {
@@ -174,6 +177,8 @@ func getInputFile(inputFile string) *os.File {
 		}
 		return os.Stdin
 	}
+	// This code is executed from the CLI. All user input is from a CLI user.
+	// #nosec
 	f, err := os.Open(inputFile)
 	if err != nil {
 		ErrorAndExit(fmt.Sprintf("Failed to open input file for reading: %v", inputFile), err)
@@ -293,7 +298,10 @@ Loop:
 						*task.HistoryTaskAttributes.NextEventId,
 					)
 				}
-				outputFile.WriteString(fmt.Sprintf("%v\n", outStr))
+				_, err = outputFile.WriteString(fmt.Sprintf("%v\n", outStr))
+				if err != nil {
+					ErrorAndExit("Failed to write to file", fmt.Errorf("err: %v", err))
+				}
 			}
 		}
 	}
@@ -339,7 +347,10 @@ Loop:
 						msg.GetVersion(),
 					)
 				}
-				outputFile.WriteString(fmt.Sprintf("%v\n", outStr))
+				_, err = outputFile.WriteString(fmt.Sprintf("%v\n", outStr))
+				if err != nil {
+					ErrorAndExit("Failed to write to file", fmt.Errorf("err: %v", err))
+				}
 			}
 		}
 	}
@@ -459,7 +470,7 @@ func decodeVisibility(message []byte, val *indexer.Message) error {
 // ClustersConfig describes the kafka clusters
 type ClustersConfig struct {
 	Clusters map[string]messaging.ClusterConfig
-	TLS      messaging.TLS
+	TLS      auth.TLS
 }
 
 func doRereplicate(shardID int, domainID, wid, rid string, minID, maxID int64, targets []string, producer messaging.Producer, session *gocql.Session) {
@@ -469,9 +480,6 @@ func doRereplicate(shardID int, domainID, wid, rid string, minID, maxID int64, t
 	if maxID == 0 {
 		maxID = maxRereplicateEventID
 	}
-
-	histV1 := cassandra.NewHistoryPersistenceFromSession(session, loggerimpl.NewNopLogger())
-	historyMgr := persistence.NewHistoryManagerImpl(histV1, loggerimpl.NewNopLogger(), dynamicconfig.GetIntPropertyFn(common.DefaultTransactionSizeLimit))
 
 	histV2 := cassandra.NewHistoryV2PersistenceFromSession(session, loggerimpl.NewNopLogger())
 	historyV2Mgr := persistence.NewHistoryV2ManagerImpl(histV2, loggerimpl.NewNopLogger(), dynamicconfig.GetIntPropertyFn(common.DefaultTransactionSizeLimit))
@@ -507,12 +515,11 @@ func doRereplicate(shardID int, domainID, wid, rid string, minID, maxID int64, t
 			RunID:               rid,
 			Version:             currVersion,
 			LastReplicationInfo: repInfo,
-			EventStoreVersion:   exeInfo.EventStoreVersion,
-			BranchToken:         exeInfo.GetCurrentBranch(),
+			BranchToken:         exeInfo.BranchToken,
 		}
 
-		_, historyBatches, err := history.GetAllHistory(historyMgr, historyV2Mgr, nil, loggerimpl.NewNopLogger(), true,
-			domainID, wid, rid, minID, maxID, exeInfo.EventStoreVersion, exeInfo.GetCurrentBranch(), common.IntPtr(shardID))
+		_, historyBatches, err := history.GetAllHistory(historyV2Mgr, nil, true,
+			minID, maxID, exeInfo.BranchToken, common.IntPtr(shardID))
 
 		if err != nil {
 			ErrorAndExit("GetAllHistory error", err)
@@ -538,13 +545,12 @@ func doRereplicate(shardID int, domainID, wid, rid string, minID, maxID int64, t
 				if err != nil {
 					ErrorAndExit("GetWorkflowExecution error", err)
 				}
-				taskTemplate.NewRunEventStoreVersion = resp.State.ExecutionInfo.EventStoreVersion
-				taskTemplate.NewRunBranchToken = resp.State.ExecutionInfo.GetCurrentBranch()
+				taskTemplate.NewRunBranchToken = resp.State.ExecutionInfo.BranchToken
 			}
 			taskTemplate.Version = firstEvent.GetVersion()
 			taskTemplate.FirstEventID = firstEvent.GetEventId()
 			taskTemplate.NextEventID = lastEvent.GetEventId() + 1
-			task, err := history.GenerateReplicationTask(targets, taskTemplate, historyMgr, historyV2Mgr, nil, loggerimpl.NewNopLogger(), batch, common.IntPtr(shardID))
+			task, _, err := history.GenerateReplicationTask(targets, taskTemplate, historyV2Mgr, nil, batch, common.IntPtr(shardID))
 			if err != nil {
 				ErrorAndExit("GenerateReplicationTask error", err)
 			}
@@ -582,7 +588,9 @@ func AdminRereplicate(c *cli.Context) {
 
 	if c.IsSet(FlagInputFile) {
 		inFile := c.String(FlagInputFile)
+		// This code is executed from the CLI. All user input is from a CLI user.
 		// parse domainID,workflowID,runID,minEventID,maxEventID
+		// #nosec
 		file, err := os.Open(inFile)
 		if err != nil {
 			ErrorAndExit("Open failed", err)
@@ -695,6 +703,9 @@ func AdminPurgeTopic(c *cli.Context) {
 
 	consumer = createConsumerAndWaitForReady(brokers, tlsConfig, group, topic)
 	msg, ok := <-consumer.Messages()
+	if !ok {
+		fmt.Println("consumer channel is closed")
+	}
 	fmt.Printf("current offset sample: %v: %v \n", msg.Partition, msg.Offset)
 }
 
@@ -821,6 +832,8 @@ func createConsumerAndWaitForReady(brokers []string, tlsConfig *tls.Config, grou
 }
 
 func parseReplicationTask(in string) (tasks []*replicator.ReplicationTask, err error) {
+	// This code is executed from the CLI. All user input is from a CLI user.
+	// #nosec
 	file, err := os.Open(in)
 	if err != nil {
 		return nil, err
@@ -853,6 +866,8 @@ func parseReplicationTask(in string) (tasks []*replicator.ReplicationTask, err e
 }
 
 func loadBrokerConfig(hostFile string, cluster string) ([]string, *tls.Config, error) {
+	// This code is executed from the CLI and is only used to load config files
+	// #nosec
 	contents, err := ioutil.ReadFile(hostFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to load kafka cluster info from %v., error: %v", hostFile, err)

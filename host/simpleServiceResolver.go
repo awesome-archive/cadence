@@ -22,6 +22,7 @@ package host
 
 import (
 	"github.com/dgryski/go-farm"
+
 	"github.com/uber/cadence/common/membership"
 )
 
@@ -52,4 +53,12 @@ func (s *simpleResolver) AddListener(name string, notifyChannel chan<- *membersh
 
 func (s *simpleResolver) RemoveListener(name string) error {
 	return nil
+}
+
+func (s *simpleResolver) MemberCount() int {
+	return len(s.hosts)
+}
+
+func (s *simpleResolver) Members() []*membership.HostInfo {
+	return s.hosts
 }

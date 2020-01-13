@@ -21,9 +21,8 @@
 package history
 
 import (
-	"time"
-
 	"github.com/stretchr/testify/mock"
+
 	"github.com/uber/cadence/common/persistence"
 )
 
@@ -92,29 +91,29 @@ func (_m *MockTimerQueueAckMgr) completeTimerTask(timerTask *persistence.TimerTa
 	_m.Called(timerTask)
 }
 
-func (_m *MockTimerQueueAckMgr) getAckLevel() TimerSequenceID {
+func (_m *MockTimerQueueAckMgr) getAckLevel() timerKey {
 	ret := _m.Called()
 
-	var r0 TimerSequenceID
-	if rf, ok := ret.Get(0).(func() TimerSequenceID); ok {
+	var r0 timerKey
+	if rf, ok := ret.Get(0).(func() timerKey); ok {
 		r0 = rf()
 	} else {
 		if ret.Get(0) != nil {
-			r0 = ret.Get(0).(TimerSequenceID)
+			r0 = ret.Get(0).(timerKey)
 		}
 	}
 	return r0
 }
 
-func (_m *MockTimerQueueAckMgr) getReadLevel() TimerSequenceID {
+func (_m *MockTimerQueueAckMgr) getReadLevel() timerKey {
 	ret := _m.Called()
 
-	var r0 TimerSequenceID
-	if rf, ok := ret.Get(0).(func() TimerSequenceID); ok {
+	var r0 timerKey
+	if rf, ok := ret.Get(0).(func() timerKey); ok {
 		r0 = rf()
 	} else {
 		if ret.Get(0) != nil {
-			r0 = ret.Get(0).(TimerSequenceID)
+			r0 = ret.Get(0).(timerKey)
 		}
 	}
 	return r0
@@ -122,17 +121,4 @@ func (_m *MockTimerQueueAckMgr) getReadLevel() TimerSequenceID {
 
 func (_m *MockTimerQueueAckMgr) updateAckLevel() {
 	_m.Called()
-}
-
-func (_m *MockTimerQueueAckMgr) isProcessNow(expiryTime time.Time) bool {
-	ret := _m.Called(expiryTime)
-
-	var r0 bool
-	if rf, ok := ret.Get(0).(func(time.Time) bool); ok {
-		r0 = rf(expiryTime)
-	} else {
-		r0 = ret.Get(0).(bool)
-	}
-
-	return r0
 }

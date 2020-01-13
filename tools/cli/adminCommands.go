@@ -27,7 +27,13 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/uber/cadence/common/auth"
+
+	"github.com/uber/cadence/common/service/config"
+
 	"github.com/gocql/gocql"
+	"github.com/urfave/cli"
+
 	"github.com/uber/cadence/.gen/go/admin"
 	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
@@ -36,16 +42,12 @@ import (
 	"github.com/uber/cadence/common/persistence"
 	cassp "github.com/uber/cadence/common/persistence/cassandra"
 	"github.com/uber/cadence/tools/cassandra"
-	"github.com/urfave/cli"
 )
 
 const maxEventID = 9999
 
 // AdminShowWorkflow shows history
 func AdminShowWorkflow(c *cli.Context) {
-	domainID := c.String(FlagDomainID)
-	wid := c.String(FlagWorkflowID)
-	rid := c.String(FlagRunID)
 	tid := c.String(FlagTreeID)
 	bid := c.String(FlagBranchID)
 	sid := c.Int(FlagShardID)
@@ -54,25 +56,7 @@ func AdminShowWorkflow(c *cli.Context) {
 	session := connectToCassandra(c)
 	serializer := persistence.NewPayloadSerializer()
 	var history []*persistence.DataBlob
-	if len(wid) != 0 {
-		histV1 := cassp.NewHistoryPersistenceFromSession(session, loggerimpl.NewNopLogger())
-		resp, err := histV1.GetWorkflowExecutionHistory(&persistence.InternalGetWorkflowExecutionHistoryRequest{
-			LastEventBatchVersion: common.EmptyVersion,
-			DomainID:              domainID,
-			Execution: shared.WorkflowExecution{
-				WorkflowId: common.StringPtr(wid),
-				RunId:      common.StringPtr(rid),
-			},
-			FirstEventID: 1,
-			NextEventID:  maxEventID,
-			PageSize:     maxEventID,
-		})
-		if err != nil {
-			ErrorAndExit("GetWorkflowExecutionHistory err", err)
-		}
-
-		history = resp.History
-	} else if len(tid) != 0 {
+	if len(tid) != 0 {
 		histV2 := cassp.NewHistoryV2PersistenceFromSession(session, loggerimpl.NewNopLogger())
 		resp, err := histV2.ReadHistoryBranch(&persistence.InternalReadHistoryBranchRequest{
 			TreeID:    tid,
@@ -88,7 +72,7 @@ func AdminShowWorkflow(c *cli.Context) {
 
 		history = resp.History
 	} else {
-		ErrorAndExit("need to specify either WorkflowId/RunID for v1, or TreeID/BranchID/ShardID for v2", nil)
+		ErrorAndExit("need to specify TreeID/BranchID/ShardID", nil)
 	}
 
 	if len(history) == 0 {
@@ -129,7 +113,6 @@ func AdminShowWorkflow(c *cli.Context) {
 func AdminDescribeWorkflow(c *cli.Context) {
 
 	resp := describeMutableState(c)
-
 	prettyPrintJSONObject(resp)
 
 	if resp != nil {
@@ -139,21 +122,29 @@ func AdminDescribeWorkflow(c *cli.Context) {
 		if err != nil {
 			ErrorAndExit("json.Unmarshal err", err)
 		}
-		if ms.ExecutionInfo != nil && ms.ExecutionInfo.EventStoreVersion == persistence.EventStoreVersionV2 {
-			branchInfo := shared.HistoryBranch{}
-			thriftrwEncoder := codec.NewThriftRWEncoder()
-			err := thriftrwEncoder.Decode(ms.ExecutionInfo.BranchToken, &branchInfo)
+		currentBranchToken := ms.ExecutionInfo.BranchToken
+		if ms.VersionHistories != nil {
+			// if VersionHistories is set, then all branch infos are stored in VersionHistories
+			currentVersionHistory, err := ms.VersionHistories.GetCurrentVersionHistory()
 			if err != nil {
-				ErrorAndExit("thriftrwEncoder.Decode err", err)
+				ErrorAndExit("ms.VersionHistories.GetCurrentVersionHistory err", err)
 			}
-			prettyPrintJSONObject(branchInfo)
-			if ms.ExecutionInfo.AutoResetPoints != nil {
-				fmt.Println("auto-reset-points:")
-				for _, p := range ms.ExecutionInfo.AutoResetPoints.Points {
-					createT := time.Unix(0, p.GetCreatedTimeNano())
-					expireT := time.Unix(0, p.GetExpiringTimeNano())
-					fmt.Println(p.GetBinaryChecksum(), p.GetRunId(), p.GetFirstDecisionCompletedId(), p.GetResettable(), createT, expireT)
-				}
+			currentBranchToken = currentVersionHistory.GetBranchToken()
+		}
+
+		branchInfo := shared.HistoryBranch{}
+		thriftrwEncoder := codec.NewThriftRWEncoder()
+		err = thriftrwEncoder.Decode(currentBranchToken, &branchInfo)
+		if err != nil {
+			ErrorAndExit("thriftrwEncoder.Decode err", err)
+		}
+		prettyPrintJSONObject(branchInfo)
+		if ms.ExecutionInfo.AutoResetPoints != nil {
+			fmt.Println("auto-reset-points:")
+			for _, p := range ms.ExecutionInfo.AutoResetPoints.Points {
+				createT := time.Unix(0, p.GetCreatedTimeNano())
+				expireT := time.Unix(0, p.GetExpiringTimeNano())
+				fmt.Println(p.GetBinaryChecksum(), p.GetRunId(), p.GetFirstDecisionCompletedId(), p.GetResettable(), createT, expireT)
 			}
 		}
 	}
@@ -182,7 +173,7 @@ func describeMutableState(c *cli.Context) *admin.DescribeWorkflowExecutionRespon
 	return resp
 }
 
-// AdminDeleteWorkflow describe a new workflow execution for admin
+// AdminDeleteWorkflow delete a workflow execution for admin
 func AdminDeleteWorkflow(c *cli.Context) {
 	wid := getRequiredOption(c, FlagWorkflowID)
 	rid := c.String(FlagRunID)
@@ -202,10 +193,20 @@ func AdminDeleteWorkflow(c *cli.Context) {
 	if err != nil {
 		ErrorAndExit("strconv.Atoi(shardID) err", err)
 	}
-	if ms.ExecutionInfo.EventStoreVersion == persistence.EventStoreVersionV2 {
-		branchInfo := shared.HistoryBranch{}
-		thriftrwEncoder := codec.NewThriftRWEncoder()
-		err := thriftrwEncoder.Decode(ms.ExecutionInfo.BranchToken, &branchInfo)
+
+	branchInfo := shared.HistoryBranch{}
+	thriftrwEncoder := codec.NewThriftRWEncoder()
+	branchTokens := [][]byte{ms.ExecutionInfo.BranchToken}
+	if ms.VersionHistories != nil {
+		// if VersionHistories is set, then all branch infos are stored in VersionHistories
+		branchTokens = [][]byte{}
+		for _, versionHistory := range ms.VersionHistories.ToThrift().Histories {
+			branchTokens = append(branchTokens, versionHistory.BranchToken)
+		}
+	}
+
+	for _, branchToken := range branchTokens {
+		err = thriftrwEncoder.Decode(branchToken, &branchInfo)
 		if err != nil {
 			ErrorAndExit("thriftrwEncoder.Decode err", err)
 		}
@@ -221,22 +222,6 @@ func AdminDeleteWorkflow(c *cli.Context) {
 				fmt.Println("failed to delete history, ", err)
 			} else {
 				ErrorAndExit("DeleteHistoryBranch err", err)
-			}
-		}
-	} else {
-		histV1 := cassp.NewHistoryPersistenceFromSession(session, loggerimpl.NewNopLogger())
-		err = histV1.DeleteWorkflowExecutionHistory(&persistence.DeleteWorkflowExecutionHistoryRequest{
-			DomainID: domainID,
-			Execution: shared.WorkflowExecution{
-				WorkflowId: common.StringPtr(wid),
-				RunId:      common.StringPtr(rid),
-			},
-		})
-		if err != nil {
-			if skipError {
-				fmt.Println("failed to delete history, ", err)
-			} else {
-				ErrorAndExit("DeleteWorkflowExecutionHistory err", err)
 			}
 		}
 	}
@@ -282,16 +267,29 @@ func readOneRow(query *gocql.Query) (map[string]interface{}, error) {
 }
 
 func connectToCassandra(c *cli.Context) *gocql.Session {
-	host := getRequiredOption(c, FlagAddress)
-	if !c.IsSet(FlagPort) {
-		ErrorAndExit("port is required", nil)
+	host := getRequiredOption(c, FlagDBAddress)
+	if !c.IsSet(FlagDBPort) {
+		ErrorAndExit("cassandra port is required", nil)
 	}
-	port := c.Int(FlagPort)
-	user := c.String(FlagUsername)
-	pw := c.String(FlagPassword)
-	ksp := getRequiredOption(c, FlagKeyspace)
 
-	clusterCfg, err := cassandra.NewCassandraCluster(host, port, user, pw, ksp, 10)
+	cassandraConfig := &config.Cassandra{
+		Hosts:    host,
+		Port:     c.Int(FlagDBPort),
+		User:     c.String(FlagUsername),
+		Password: c.String(FlagPassword),
+		Keyspace: getRequiredOption(c, FlagKeyspace),
+	}
+	if c.Bool(FlagEnableTLS) {
+		cassandraConfig.TLS = &auth.TLS{
+			Enabled:                true,
+			CertFile:               c.String(FlagTLSCertPath),
+			KeyFile:                c.String(FlagTLSKeyPath),
+			CaFile:                 c.String(FlagTLSCaPath),
+			EnableHostVerification: c.Bool(FlagTLSEnableHostVerification),
+		}
+	}
+
+	clusterCfg, err := cassandra.NewCassandraCluster(cassandraConfig, 10)
 	clusterCfg.SerialConsistency = gocql.LocalSerial
 	clusterCfg.NumConns = 20
 	if err != nil {

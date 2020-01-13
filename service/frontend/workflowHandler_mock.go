@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 //
-// Copyright (c) 2017 Uber Technologies, Inc.
+// Copyright (c) 2019 Uber Technologies, Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -32,7 +32,7 @@ import (
 	reflect "reflect"
 
 	gomock "github.com/golang/mock/gomock"
-	replicator "github.com/uber/cadence/.gen/go/replicator"
+
 	shared "github.com/uber/cadence/.gen/go/shared"
 )
 
@@ -133,19 +133,19 @@ func (mr *MockWorkflowHandlerMockRecorder) DescribeWorkflowExecution(ctx, Descri
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DescribeWorkflowExecution", reflect.TypeOf((*MockWorkflowHandler)(nil).DescribeWorkflowExecution), ctx, DescribeRequest)
 }
 
-// GetReplicationMessages mocks base method
-func (m *MockWorkflowHandler) GetReplicationMessages(ctx context.Context, Request *replicator.GetReplicationMessagesRequest) (*replicator.GetReplicationMessagesResponse, error) {
+// GetClusterInfo mocks base method
+func (m *MockWorkflowHandler) GetClusterInfo(ctx context.Context) (*shared.ClusterInfo, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetReplicationMessages", ctx, Request)
-	ret0, _ := ret[0].(*replicator.GetReplicationMessagesResponse)
+	ret := m.ctrl.Call(m, "GetClusterInfo", ctx)
+	ret0, _ := ret[0].(*shared.ClusterInfo)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// GetReplicationMessages indicates an expected call of GetReplicationMessages
-func (mr *MockWorkflowHandlerMockRecorder) GetReplicationMessages(ctx, Request interface{}) *gomock.Call {
+// GetClusterInfo indicates an expected call of GetClusterInfo
+func (mr *MockWorkflowHandlerMockRecorder) GetClusterInfo(ctx interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetReplicationMessages", reflect.TypeOf((*MockWorkflowHandler)(nil).GetReplicationMessages), ctx, Request)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetClusterInfo", reflect.TypeOf((*MockWorkflowHandler)(nil).GetClusterInfo), ctx)
 }
 
 // GetSearchAttributes mocks base method
@@ -236,6 +236,21 @@ func (m *MockWorkflowHandler) ListOpenWorkflowExecutions(ctx context.Context, Li
 func (mr *MockWorkflowHandlerMockRecorder) ListOpenWorkflowExecutions(ctx, ListRequest interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListOpenWorkflowExecutions", reflect.TypeOf((*MockWorkflowHandler)(nil).ListOpenWorkflowExecutions), ctx, ListRequest)
+}
+
+// ListTaskListPartitions mocks base method
+func (m *MockWorkflowHandler) ListTaskListPartitions(ctx context.Context, Request *shared.ListTaskListPartitionsRequest) (*shared.ListTaskListPartitionsResponse, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListTaskListPartitions", ctx, Request)
+	ret0, _ := ret[0].(*shared.ListTaskListPartitionsResponse)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListTaskListPartitions indicates an expected call of ListTaskListPartitions
+func (mr *MockWorkflowHandlerMockRecorder) ListTaskListPartitions(ctx, Request interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListTaskListPartitions", reflect.TypeOf((*MockWorkflowHandler)(nil).ListTaskListPartitions), ctx, Request)
 }
 
 // ListWorkflowExecutions mocks base method

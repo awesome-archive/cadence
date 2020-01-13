@@ -38,6 +38,9 @@ import (
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/zap"
+	"gopkg.in/yaml.v2"
+
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/definition"
@@ -46,12 +49,10 @@ import (
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/environment"
 	"github.com/uber/cadence/host"
-	"go.uber.org/zap"
-	"gopkg.in/yaml.v2"
 )
 
 const (
-	numOfRetry        = 50
+	numOfRetry        = 100
 	waitTimeInMs      = 400
 	waitForESToSettle = 4 * time.Second // wait es shards for some time ensure data consistent
 )
@@ -64,7 +65,6 @@ type esCrossDCTestSuite struct {
 	cluster1       *host.TestCluster
 	cluster2       *host.TestCluster
 	logger         log.Logger
-	enableEventsV2 bool
 	clusterConfigs []*host.TestClusterConfig
 	esClient       *elastic.Client
 
@@ -203,7 +203,7 @@ func (s *esCrossDCTestSuite) TestSearchAttributes() {
 	query := fmt.Sprintf(`WorkflowID = "%s" and %s = "%s"`, id, s.testSearchAttributeKey, s.testSearchAttributeVal)
 	listRequest := &workflow.ListWorkflowExecutionsRequest{
 		Domain:   common.StringPtr(domainName),
-		PageSize: common.Int32Ptr(100),
+		PageSize: common.Int32Ptr(5),
 		Query:    common.StringPtr(query),
 	}
 
@@ -351,7 +351,7 @@ GetHistoryLoop:
 	var historyResponse *workflow.GetWorkflowExecutionHistoryResponse
 	eventsReplicated := false
 GetHistoryLoop2:
-	for i := 0; i < 15; i++ {
+	for i := 0; i < numOfRetry; i++ {
 		historyResponse, err = client2.GetWorkflowExecutionHistory(createContext(), getHistoryReq)
 		if err == nil {
 			history := historyResponse.History
@@ -365,7 +365,7 @@ GetHistoryLoop2:
 				break GetHistoryLoop2
 			}
 		}
-		time.Sleep(1 * time.Second)
+		time.Sleep(waitTimeInMs * time.Millisecond)
 	}
 	s.Nil(err)
 	s.True(eventsReplicated)

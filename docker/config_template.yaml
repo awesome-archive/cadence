@@ -17,29 +17,58 @@ persistence:
             cassandra:
                 hosts: {{ default .Env.CASSANDRA_SEEDS "" }}
                 keyspace: {{ default .Env.KEYSPACE "cadence" }}
-                consistency: {{ default .Env.CASSANDRA_CONSISTENCY "One" }}
         visibility:
             cassandra:
                 hosts: {{ default .Env.CASSANDRA_SEEDS "" }}
-                keyspace: {{ default .Env.VISIBILITY_KEYSPACE "cadence" }}
-                consistency: {{ default .Env.CASSANDRA_CONSISTENCY "One" }}
+                keyspace: {{ default .Env.VISIBILITY_KEYSPACE "cadence_visibility" }}
         {{- else if eq $db "mysql" }}
         default:
             sql:
-                driverName: "mysql"
+                pluginName: "mysql"
                 databaseName: {{ default .Env.DBNAME "cadence" }}
                 connectAddr: "{{ default .Env.MYSQL_SEEDS "" }}:{{ default .Env.DB_PORT "3306" }}"
                 connectProtocol: "tcp"
                 user: {{ default .Env.MYSQL_USER "" }}
                 password: {{ default .Env.MYSQL_PWD "" }}
+                {{- if .Env.MYSQL_TX_ISOLATION_COMPAT }}
+                connectAttributes:
+                    tx_isolation: 'READ-COMMITTED'
+                {{- end }}
         visibility:
             sql:
-                driverName: "mysql"
+                pluginName: "mysql"
                 databaseName: {{ default .Env.VISIBILITY_DBNAME "cadence_visibility" }}
                 connectAddr: "{{ default .Env.MYSQL_SEEDS "" }}:{{ default .Env.DB_PORT "3306" }}"
                 connectProtocol: "tcp"
                 user: {{ default .Env.MYSQL_USER "" }}
                 password: {{ default .Env.MYSQL_PWD "" }}
+                {{- if .Env.MYSQL_TX_ISOLATION_COMPAT }}
+                connectAttributes:
+                    tx_isolation: 'READ-COMMITTED'
+                {{- end }}
+        {{- else if eq $db "postgres" }}
+        default:
+            sql:
+                pluginName: "postgres"
+                databaseName: {{ default .Env.DBNAME "cadence" }}
+                connectAddr: "{{ default .Env.POSTGRES_SEEDS "" }}:{{ default .Env.DB_PORT "5432" }}"
+                connectProtocol: "tcp"
+                user: {{ default .Env.POSTGRES_USER "" }}
+                password: {{ default .Env.POSTGRES_PWD "" }}
+                maxConns: 20
+                maxIdleConns: 20
+                maxConnLifetime: "1h"
+        visibility:
+            sql:
+                pluginName: "postgres"
+                databaseName: {{ default .Env.VISIBILITY_DBNAME "cadence_visibility" }}
+                connectAddr: "{{ default .Env.POSTGRES_SEEDS "" }}:{{ default .Env.DB_PORT "5432" }}"
+                connectProtocol: "tcp"
+                user: {{ default .Env.POSTGRES_USER "" }}
+                password: {{ default .Env.POSTGRES_PWD "" }}
+                maxConns: 20
+                maxIdleConns: 20
+                maxConnLifetime: "1h"
         {{- end }}
         {{- if eq $es "true" }}
         es-visibility:
@@ -53,7 +82,7 @@ persistence:
 
 ringpop:
     name: cadence
-    bootstrapMode: hosts
+    bootstrapMode: {{ default .Env.RINGPOP_BOOTSTRAP_MODE "hosts" }}
     {{- if .Env.RINGPOP_SEEDS }}
     bootstrapHosts:
     {{- range $seed := (split .Env.RINGPOP_SEEDS ",") }}
@@ -78,6 +107,11 @@ services:
             statsd:
                 hostPort: {{ .Env.STATSD_ENDPOINT }}
                 prefix: "cadence-frontend"
+        {{- else if .Env.PROMETHEUS_ENDPOINT }}
+        metrics:
+            prometheus:
+                timerType: {{ default .Env.PROMETHEUS_TIMER_TYPE "histogram" }}
+                listenAddress: {{ .Env.PROMETHEUS_ENDPOINT }}
         {{- end }}
 
     matching:
@@ -89,6 +123,11 @@ services:
             statsd:
                 hostPort: {{ .Env.STATSD_ENDPOINT }}
                 prefix: "cadence-matching"
+        {{- else if .Env.PROMETHEUS_ENDPOINT }}
+        metrics:
+            prometheus:
+                timerType: {{ default .Env.PROMETHEUS_TIMER_TYPE "histogram" }}
+                listenAddress: {{ .Env.PROMETHEUS_ENDPOINT }}
         {{- end }}
 
     history:
@@ -100,6 +139,11 @@ services:
             statsd:
                 hostPort: {{ .Env.STATSD_ENDPOINT }}
                 prefix: "cadence-history"
+        {{- else if .Env.PROMETHEUS_ENDPOINT }}
+        metrics:
+            prometheus:
+                timerType: {{ default .Env.PROMETHEUS_TIMER_TYPE "histogram" }}
+                listenAddress: {{ .Env.PROMETHEUS_ENDPOINT }}
         {{- end }}
 
     worker:
@@ -111,6 +155,11 @@ services:
             statsd:
                 hostPort: {{ .Env.STATSD_ENDPOINT }}
                 prefix: "cadence-worker"
+        {{- else if .Env.PROMETHEUS_ENDPOINT }}
+        metrics:
+            prometheus:
+                timerType: {{ default .Env.PROMETHEUS_TIMER_TYPE "histogram" }}
+                listenAddress: {{ .Env.PROMETHEUS_ENDPOINT }}
         {{- end }}
 
 clusterMetadata:
@@ -130,15 +179,24 @@ dcRedirectionPolicy:
     toDC: ""
 
 archival:
+  history:
     status: "enabled"
-    enableReadFromArchival: true
-    defaultBucket: "cadence-development"
-    filestore:
-        storeDirectory: "/tmp/development/blobstore/"
-        defaultBucket: "cadence-development"
-        customBuckets:
-            - "custom-bucket-1"
-            - "custom-bucket-2"
+    enableRead: true
+    provider:
+      filestore:
+        fileMode: "0666"
+        dirMode: "0766"
+  visibility:
+    status: "disabled"
+    enableRead: false
+
+domainDefaults:
+  archival:
+    history:
+      status: "enabled"
+      URI: "file:///tmp/cadence_archival/development"
+    visibility:
+      status: "disabled"
 
 kafka:
     tls:

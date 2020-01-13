@@ -51,8 +51,7 @@ type (
 	// for the schema-tool to work
 	DB interface {
 		// Exec executes a cql statement
-		Exec(stmt string) error
-		//ListTables() ([]string, error)
+		Exec(stmt string, args ...interface{}) error
 		// DropAllTables drops all tables
 		DropAllTables() error
 		// CreateSchemaVersionTables sets up the schema version tables
@@ -83,8 +82,10 @@ const (
 	CLIOptKeyspace = "keyspace"
 	// CLIOptDatabase is the cli option for database
 	CLIOptDatabase = "database"
-	// CLIOptDriverName is the cli option for driver name
-	CLIOptDriverName = "driver"
+	// CLIOptPluginName is the cli option for plugin name
+	CLIOptPluginName = "plugin"
+	// CLIOptConnectAttributes is the cli option for connect attributes (key/values via a url query string)
+	CLIOptConnectAttributes = "connect-attributes"
 	// CLIOptVersion is the cli option for version
 	CLIOptVersion = "version"
 	// CLIOptSchemaFile is the cli option for schema file
@@ -118,8 +119,10 @@ const (
 	CLIFlagKeyspace = CLIOptKeyspace + ", k"
 	// CLIFlagDatabase is the cli flag for database
 	CLIFlagDatabase = CLIOptDatabase + ", db"
-	// CLIFlagDriverName is the cli flag for driver name
-	CLIFlagDriverName = CLIOptDriverName + ", dr"
+	// CLIFlagPluginName is the cli flag for plugin name
+	CLIFlagPluginName = CLIOptPluginName + ", pl"
+	// CLIFlagConnectAttributes allows arbitrary connect attributes
+	CLIFlagConnectAttributes = CLIOptConnectAttributes + ", ca"
 	// CLIFlagVersion is the cli flag for version
 	CLIFlagVersion = CLIOptVersion + ", v"
 	// CLIFlagSchemaFile is the cli flag for schema file
@@ -138,12 +141,23 @@ const (
 	CLIFlagReplicationFactor = CLIOptReplicationFactor + ", rf"
 	// CLIFlagQuiet is the cli flag for quiet mode
 	CLIFlagQuiet = CLIOptQuiet + ", q"
+
+	// CLIFlagEnableTLS enables cassandra client TLS
+	CLIFlagEnableTLS = "tls"
+	// CLIFlagTLSCertFile is the optional tls cert file (tls must be enabled)
+	CLIFlagTLSCertFile = "tls-cert-file"
+	// CLIFlagTLSKeyFile is the optional tls key file (tls must be enabled)
+	CLIFlagTLSKeyFile = "tls-key-file"
+	// CLIFlagTLSCaFile is the optional tls CA file (tls must be enabled)
+	CLIFlagTLSCaFile = "tls-ca-file"
+	// CLIFlagTLSEnableHostVerification enables tls host verification (tls must be enabled)
+	CLIFlagTLSEnableHostVerification = "tls-enable-host-verification"
 )
 
 // DryrunDBName is the db name used for dryrun
 const DryrunDBName = "_cadence_dryrun_"
 
-var rmspaceRegex = regexp.MustCompile("\\s+")
+var rmspaceRegex = regexp.MustCompile(`\s+`)
 
 // NewConfigError creates and returns an instance of ConfigError
 func NewConfigError(msg string) error {

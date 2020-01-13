@@ -24,12 +24,15 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/uber/cadence/common/auth"
+
 	"github.com/uber-go/tally/m3"
 	"github.com/uber-go/tally/prometheus"
+	"github.com/uber/ringpop-go/discovery"
+
 	"github.com/uber/cadence/common/elasticsearch"
 	"github.com/uber/cadence/common/messaging"
 	"github.com/uber/cadence/common/service/dynamicconfig"
-	"github.com/uber/ringpop-go/discovery"
 )
 
 const (
@@ -132,9 +135,9 @@ type (
 		// DataStores contains the configuration for all datastores
 		DataStores map[string]DataStore `yaml:"datastores"`
 		// VisibilityConfig is config for visibility sampling
-		VisibilityConfig *VisibilityConfig
+		VisibilityConfig *VisibilityConfig `yaml:"-" json:"-"`
 		// TransactionSizeLimit is the largest allowed transaction size
-		TransactionSizeLimit dynamicconfig.IntPropertyFn
+		TransactionSizeLimit dynamicconfig.IntPropertyFn `yaml:"-" json:"-"`
 	}
 
 	// DataStore is the configuration for a single datastore
@@ -150,21 +153,21 @@ type (
 	// VisibilityConfig is config for visibility sampling
 	VisibilityConfig struct {
 		// EnableSampling for visibility
-		EnableSampling dynamicconfig.BoolPropertyFn
+		EnableSampling dynamicconfig.BoolPropertyFn `yaml:"-" json:"-"`
 		// EnableReadFromClosedExecutionV2 read closed from v2 table
-		EnableReadFromClosedExecutionV2 dynamicconfig.BoolPropertyFn
+		EnableReadFromClosedExecutionV2 dynamicconfig.BoolPropertyFn `yaml:"-" json:"-"`
 		// VisibilityOpenMaxQPS max QPS for record open workflows
-		VisibilityOpenMaxQPS dynamicconfig.IntPropertyFnWithDomainFilter
+		VisibilityOpenMaxQPS dynamicconfig.IntPropertyFnWithDomainFilter `yaml:"-" json:"-"`
 		// VisibilityClosedMaxQPS max QPS for record closed workflows
-		VisibilityClosedMaxQPS dynamicconfig.IntPropertyFnWithDomainFilter
+		VisibilityClosedMaxQPS dynamicconfig.IntPropertyFnWithDomainFilter `yaml:"-" json:"-"`
 		// VisibilityListMaxQPS max QPS for list workflow
-		VisibilityListMaxQPS dynamicconfig.IntPropertyFnWithDomainFilter
+		VisibilityListMaxQPS dynamicconfig.IntPropertyFnWithDomainFilter `yaml:"-" json:"-"`
 		// ESIndexMaxResultWindow ElasticSearch index setting max_result_window
-		ESIndexMaxResultWindow dynamicconfig.IntPropertyFn
+		ESIndexMaxResultWindow dynamicconfig.IntPropertyFn `yaml:"-" json:"-"`
 		// MaxQPS is overall max QPS
-		MaxQPS dynamicconfig.IntPropertyFn
+		MaxQPS dynamicconfig.IntPropertyFn `yaml:"-" json:"-"`
 		// ValidSearchAttributes is legal indexed keys that can be used in list APIs
-		ValidSearchAttributes dynamicconfig.MapPropertyFn
+		ValidSearchAttributes dynamicconfig.MapPropertyFn `yaml:"-" json:"-"`
 	}
 
 	// Cassandra contains configuration to connect to Cassandra cluster
@@ -179,14 +182,14 @@ type (
 		Password string `yaml:"password"`
 		// keyspace is the cassandra keyspace
 		Keyspace string `yaml:"keyspace" validate:"nonzero"`
-		// Consistency is the default cassandra consistency level
-		Consistency string `yaml:"consistency"`
 		// Datacenter is the data center filter arg for cassandra
 		Datacenter string `yaml:"datacenter"`
 		// MaxQPS is the max request rate to this datastore
 		MaxQPS int `yaml:"maxQPS"`
 		// MaxConns is the max number of connections to this datastore for a single keyspace
 		MaxConns int `yaml:"maxConns"`
+		// TLS configuration
+		TLS *auth.TLS `yaml:"tls"`
 	}
 
 	// SQL is the configuration for connecting to a SQL backed datastore
@@ -195,8 +198,8 @@ type (
 		User string `yaml:"user"`
 		// Password is the password corresponding to the user name
 		Password string `yaml:"password"`
-		// DriverName is the name of SQL driver
-		DriverName string `yaml:"driverName" validate:"nonzero"`
+		// PluginName is the name of SQL plugin
+		PluginName string `yaml:"pluginName" validate:"nonzero"`
 		// DatabaseName is the name of SQL database to connect to
 		DatabaseName string `yaml:"databaseName" validate:"nonzero"`
 		// ConnectAddr is the remote addr of the database
@@ -216,6 +219,8 @@ type (
 		// NumShards is the number of storage shards to use for tables
 		// in a sharded sql database. The default value for this param is 1
 		NumShards int `yaml:"nShards"`
+		// TLS is the configuration for TLS connections
+		TLS *auth.TLS `yaml:"tls"`
 	}
 
 	// Replicator describes the configuration of replicator
@@ -261,18 +266,6 @@ type (
 	ReplicationConsumerConfig struct {
 		// Type determines how we consume replication tasks. It can be either kafka(default) or rpc.
 		Type string `yaml:"type"`
-		// FetcherConfig is the config for replication task fetcher.
-		FetcherConfig *FetcherConfig `yaml:"fetcher"`
-		// ProcessorConfig is the config for replication task processor.
-		ProcessorConfig *ReplicationTaskProcessorConfig `yaml:"processor"`
-	}
-
-	// FetcherConfig is the config for replication task fetcher.
-	FetcherConfig struct {
-		RPCParallelism          int     `yaml:"rpcParallelism"`
-		AggregationIntervalSecs int     `yaml:"aggregationIntervalSecs"`
-		ErrorRetryWaitSecs      int     `yaml:"errorRetryWaitSecs"`
-		TimerJitterCoefficient  float64 `yaml:"timerJitterCoefficient"`
 	}
 
 	// ReplicationTaskProcessorConfig is the config for replication task processor.

@@ -29,6 +29,8 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
+	"go.uber.org/zap"
+
 	"github.com/uber/cadence/.gen/go/history"
 	"github.com/uber/cadence/.gen/go/history/historyservicetest"
 	"github.com/uber/cadence/.gen/go/shared"
@@ -38,7 +40,6 @@ import (
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/mocks"
 	p "github.com/uber/cadence/common/persistence"
-	"go.uber.org/zap"
 )
 
 type (
@@ -370,7 +371,7 @@ func (s *ScavengerTestSuite) TestMixesTwoPages() {
 		NextPageToken: []byte("page1"),
 		Branches: []p.HistoryBranchDetail{
 			{
-				//skip
+				// skip
 				TreeID:   "treeID1",
 				BranchID: "branchID1",
 				ForkTime: time.Now(),
@@ -391,7 +392,7 @@ func (s *ScavengerTestSuite) TestMixesTwoPages() {
 	}).Return(&p.GetAllHistoryTreeBranchesResponse{
 		Branches: []p.HistoryBranchDetail{
 			{
-				//delete succ
+				// delete succ
 				TreeID:   "treeID3",
 				BranchID: "branchID3",
 				ForkTime: time.Now().Add(-cleanUpThreshold * 2),
@@ -405,7 +406,7 @@ func (s *ScavengerTestSuite) TestMixesTwoPages() {
 				Info:     p.BuildHistoryGarbageCleanupInfo("domainID4", "workflowID4", "runID4"),
 			},
 			{
-				//not delete
+				// not delete
 				TreeID:   "treeID5",
 				BranchID: "branchID5",
 				ForkTime: time.Now().Add(-cleanUpThreshold * 2),

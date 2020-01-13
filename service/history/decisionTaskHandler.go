@@ -35,19 +35,15 @@ import (
 )
 
 type (
-	timerBuilderProvider func() *timerBuilder
-
 	decisionAttrValidationFn func() error
 
 	decisionTaskHandlerImpl struct {
 		identity                string
 		decisionTaskCompletedID int64
-		eventStoreVersion       int32
 		domainEntry             *cache.DomainCacheEntry
 
 		// internal state
 		hasUnhandledEventsBeforeDecisions bool
-		timerBuilder                      *timerBuilder
 		failDecision                      bool
 		failDecisionCause                 *workflow.DecisionTaskFailedCause
 		failMessage                       *string
@@ -60,24 +56,21 @@ type (
 		attrValidator    *decisionAttrValidator
 		sizeLimitChecker *workflowSizeChecker
 
-		logger               log.Logger
-		timerBuilderProvider timerBuilderProvider
-		domainCache          cache.DomainCache
-		metricsClient        metrics.Client
-		config               *Config
+		logger        log.Logger
+		domainCache   cache.DomainCache
+		metricsClient metrics.Client
+		config        *Config
 	}
 )
 
 func newDecisionTaskHandler(
 	identity string,
 	decisionTaskCompletedID int64,
-	eventStoreVersion int32,
 	domainEntry *cache.DomainCacheEntry,
 	mutableState mutableState,
 	attrValidator *decisionAttrValidator,
 	sizeLimitChecker *workflowSizeChecker,
 	logger log.Logger,
-	timerBuilderProvider timerBuilderProvider,
 	domainCache cache.DomainCache,
 	metricsClient metrics.Client,
 	config *Config,
@@ -86,7 +79,6 @@ func newDecisionTaskHandler(
 	return &decisionTaskHandlerImpl{
 		identity:                identity,
 		decisionTaskCompletedID: decisionTaskCompletedID,
-		eventStoreVersion:       eventStoreVersion,
 		domainEntry:             domainEntry,
 
 		// internal state
@@ -103,12 +95,10 @@ func newDecisionTaskHandler(
 		attrValidator:    attrValidator,
 		sizeLimitChecker: sizeLimitChecker,
 
-		logger:               logger,
-		timerBuilder:         timerBuilderProvider(),
-		timerBuilderProvider: timerBuilderProvider,
-		domainCache:          domainCache,
-		metricsClient:        metricsClient,
-		config:               config,
+		logger:        logger,
+		domainCache:   domainCache,
+		metricsClient: metricsClient,
+		config:        config,
 	}
 }
 
@@ -311,10 +301,9 @@ func (handler *decisionTaskHandlerImpl) handleDecisionStartTimer(
 		return err
 	}
 
-	_, ti, err := handler.mutableState.AddTimerStartedEvent(handler.decisionTaskCompletedID, attr)
+	_, _, err := handler.mutableState.AddTimerStartedEvent(handler.decisionTaskCompletedID, attr)
 	switch err.(type) {
 	case nil:
-		handler.timerBuilder.AddUserTimer(ti, handler.mutableState)
 		return nil
 	case *workflow.BadRequestError:
 		return handler.handlerFailDecision(
@@ -385,9 +374,9 @@ func (handler *decisionTaskHandlerImpl) handleDecisionCompleteWorkflow(
 	}
 
 	// this is a cron workflow
-	startEvent, found := handler.mutableState.GetStartEvent()
-	if !found {
-		return &workflow.InternalServiceError{Message: "Failed to load start event."}
+	startEvent, err := handler.mutableState.GetStartEvent()
+	if err != nil {
+		return err
 	}
 	startAttributes := startEvent.WorkflowExecutionStartedEventAttributes
 	return handler.retryCronContinueAsNew(
@@ -462,15 +451,15 @@ func (handler *decisionTaskHandlerImpl) handleDecisionFailWorkflow(
 	if backoffInterval == backoff.NoBackoff {
 		// no retry or cron
 		if _, err := handler.mutableState.AddFailWorkflowEvent(handler.decisionTaskCompletedID, attr); err != nil {
-			return &workflow.InternalServiceError{Message: "Unable to add fail workflow event."}
+			return err
 		}
 		return nil
 	}
 
 	// this is a cron / backoff workflow
-	startEvent, found := handler.mutableState.GetStartEvent()
-	if !found {
-		return &workflow.InternalServiceError{Message: "Failed to load start event."}
+	startEvent, err := handler.mutableState.GetStartEvent()
+	if err != nil {
+		return err
 	}
 	startAttributes := startEvent.WorkflowExecutionStartedEventAttributes
 	return handler.retryCronContinueAsNew(
@@ -507,11 +496,6 @@ func (handler *decisionTaskHandlerImpl) handleDecisionCancelTimer(
 		handler.identity)
 	switch err.(type) {
 	case nil:
-		// timer deletion is success. we need to rebuild the timer builder
-		// since timer builder has a local cached version of timers
-		handler.timerBuilder = handler.timerBuilderProvider()
-		handler.timerBuilder.loadUserTimers(handler.mutableState)
-
 		// timer deletion is a success, we may have deleted a fired timer in
 		// which case we should reset hasBufferedEvents
 		// TODO deletion of timer fired event refreshing hasUnhandledEventsBeforeDecisions
@@ -705,10 +689,8 @@ func (handler *decisionTaskHandlerImpl) handleDecisionContinueAsNewWorkflow(
 	_, newStateBuilder, err := handler.mutableState.AddContinueAsNewEvent(
 		handler.decisionTaskCompletedID,
 		handler.decisionTaskCompletedID,
-		handler.domainEntry,
 		parentDomainName,
 		attr,
-		handler.eventStoreVersion,
 	)
 	if err != nil {
 		return err
@@ -763,11 +745,17 @@ func (handler *decisionTaskHandlerImpl) handleDecisionStartChildWorkflow(
 		return err
 	}
 
+	enabled := handler.config.EnableParentClosePolicy(handler.domainEntry.GetInfo().Name)
 	if attr.ParentClosePolicy == nil {
-		useTerminate := handler.config.UseTerminateAsDefaultParentClosePolicy(handler.domainEntry.GetInfo().Name)
-		if useTerminate {
+		// for old clients, this field is empty. If they enable the feature, make default as terminate
+		if enabled {
 			attr.ParentClosePolicy = common.ParentClosePolicyPtr(workflow.ParentClosePolicyTerminate)
 		} else {
+			attr.ParentClosePolicy = common.ParentClosePolicyPtr(workflow.ParentClosePolicyAbandon)
+		}
+	} else {
+		// for domains that haven't enabled the feature yet, need to use Abandon for backward-compatibility
+		if !enabled {
 			attr.ParentClosePolicy = common.ParentClosePolicyPtr(workflow.ParentClosePolicyAbandon)
 		}
 	}
@@ -919,10 +907,8 @@ func (handler *decisionTaskHandlerImpl) retryCronContinueAsNew(
 	_, newStateBuilder, err := handler.mutableState.AddContinueAsNewEvent(
 		handler.decisionTaskCompletedID,
 		handler.decisionTaskCompletedID,
-		handler.domainEntry,
 		attr.GetParentWorkflowDomain(),
 		continueAsNewAttributes,
-		handler.eventStoreVersion,
 	)
 	if err != nil {
 		return err

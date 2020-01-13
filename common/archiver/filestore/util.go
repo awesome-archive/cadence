@@ -31,6 +31,7 @@ import (
 	"strings"
 
 	"github.com/dgryski/go-farm"
+
 	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/archiver"
 )
@@ -71,12 +72,17 @@ func mkdirAll(path string, dirMode os.FileMode) error {
 	return os.MkdirAll(path, dirMode)
 }
 
-func writeFile(filepath string, data []byte, fileMode os.FileMode) error {
+func writeFile(filepath string, data []byte, fileMode os.FileMode) (retErr error) {
 	if err := os.Remove(filepath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	f, err := os.Create(filepath)
-	defer f.Close()
+	defer func() {
+		err := f.Close()
+		if err != nil {
+			retErr = err
+		}
+	}()
 	if err != nil {
 		return err
 	}
@@ -89,7 +95,11 @@ func writeFile(filepath string, data []byte, fileMode os.FileMode) error {
 	return nil
 }
 
+// readFile reads the contents of a file specified by filepath
+// WARNING: callers of this method should be extremely careful not to use it in a context where filepath is supplied by
+// the user.
 func readFile(filepath string) ([]byte, error) {
+	// #nosec
 	return ioutil.ReadFile(filepath)
 }
 

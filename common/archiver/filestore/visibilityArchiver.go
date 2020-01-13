@@ -37,8 +37,7 @@ import (
 )
 
 const (
-	errEncodeVisibilityRecord    = "failed to encode visibility record"
-	errInvalidVisibilityFilename = "failed to parse visibility file name"
+	errEncodeVisibilityRecord = "failed to encode visibility record"
 )
 
 type (
@@ -149,6 +148,10 @@ func (v *visibilityArchiver) Query(
 	parsedQuery, err := v.queryParser.Parse(request.Query)
 	if err != nil {
 		return nil, &shared.BadRequestError{Message: err.Error()}
+	}
+
+	if parsedQuery.emptyResult {
+		return &archiver.QueryVisibilityResponse{}, nil
 	}
 
 	return v.query(ctx, URI, &queryVisibilityRequest{
@@ -334,7 +337,7 @@ func convertToExecutionInfo(record *visibilityRecord) *shared.WorkflowExecutionI
 		HistoryLength: common.Int64Ptr(record.HistoryLength),
 		Memo:          record.Memo,
 		SearchAttributes: &shared.SearchAttributes{
-			IndexedFields: record.SearchAttributes,
+			IndexedFields: archiver.ConvertSearchAttrToBytes(record.SearchAttributes),
 		},
 	}
 }

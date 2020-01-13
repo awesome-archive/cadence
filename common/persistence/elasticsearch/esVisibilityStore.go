@@ -35,6 +35,8 @@ import (
 
 	"github.com/cch123/elasticsql"
 	"github.com/olivere/elastic"
+	"github.com/valyala/fastjson"
+
 	"github.com/uber/cadence/.gen/go/indexer"
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
@@ -45,7 +47,6 @@ import (
 	"github.com/uber/cadence/common/messaging"
 	p "github.com/uber/cadence/common/persistence"
 	"github.com/uber/cadence/common/service/config"
-	"github.com/valyala/fastjson"
 )
 
 const (
@@ -421,7 +422,8 @@ func (v *esVisibilityStore) ScanWorkflowExecutions(
 	var searchResult *elastic.SearchResult
 	var scrollService es.ScrollService
 	if len(token.ScrollID) == 0 { // first call
-		queryDSL, err := getESQueryDSLForScan(request)
+		var queryDSL string
+		queryDSL, err = getESQueryDSLForScan(request)
 		if err != nil {
 			return nil, &workflow.BadRequestError{Message: fmt.Sprintf("Error when parse query: %v", err)}
 		}
@@ -433,7 +435,7 @@ func (v *esVisibilityStore) ScanWorkflowExecutions(
 	isLastPage := false
 	if err == io.EOF { // no more result
 		isLastPage = true
-		scrollService.Clear(context.Background())
+		scrollService.Clear(context.Background()) //nolint:errcheck
 	} else if err != nil {
 		return nil, &workflow.InternalServiceError{
 			Message: fmt.Sprintf("ScanWorkflowExecutions failed. Error: %v", err),
@@ -473,7 +475,6 @@ const (
 	dslFieldSearchAfter = "search_after"
 	dslFieldFrom        = "from"
 	dslFieldSize        = "size"
-	dslFieldMust        = "must"
 
 	defaultDateTimeFormat = time.RFC3339 // used for converting UnixNano to string like 2018-02-15T16:16:36-08:00
 )
@@ -575,8 +576,10 @@ func getCustomizedDSLFromSQL(sql string, domainID string) (*fastjson.Value, erro
 	if err != nil {
 		return nil, err
 	}
-	dsl := fastjson.MustParse(dslStr) // dsl.String() will be a compact json without spaces
-
+	dsl, err := fastjson.Parse(dslStr) // dsl.String() will be a compact json without spaces
+	if err != nil {
+		return nil, err
+	}
 	dslStr = dsl.String()
 	if strings.Contains(dslStr, jsonMissingCloseTime) { // isOpen
 		dsl = replaceQueryForOpen(dsl)

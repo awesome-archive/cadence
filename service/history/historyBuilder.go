@@ -25,7 +25,6 @@ import (
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/persistence"
 )
 
@@ -34,7 +33,6 @@ type (
 		transientHistory []*workflow.HistoryEvent
 		history          []*workflow.HistoryEvent
 		msBuilder        mutableState
-		logger           log.Logger
 	}
 )
 
@@ -43,14 +41,12 @@ func newHistoryBuilder(msBuilder mutableState, logger log.Logger) *historyBuilde
 		transientHistory: []*workflow.HistoryEvent{},
 		history:          []*workflow.HistoryEvent{},
 		msBuilder:        msBuilder,
-		logger:           logger.WithTags(tag.ComponentHistoryBuilder),
 	}
 }
 
 func newHistoryBuilderFromEvents(history []*workflow.HistoryEvent, logger log.Logger) *historyBuilder {
 	return &historyBuilder{
 		history: history,
-		logger:  logger.WithTags(tag.ComponentHistoryBuilder),
 	}
 }
 
@@ -155,9 +151,16 @@ func (b *historyBuilder) AddActivityTaskFailedEvent(scheduleEventID, startedEven
 	return b.addEventToHistory(event)
 }
 
-func (b *historyBuilder) AddActivityTaskTimedOutEvent(scheduleEventID, startedEventID int64,
-	timeoutType workflow.TimeoutType, lastHeartBeatDetails []byte) *workflow.HistoryEvent {
-	event := b.newActivityTaskTimedOutEvent(scheduleEventID, startedEventID, timeoutType, lastHeartBeatDetails)
+func (b *historyBuilder) AddActivityTaskTimedOutEvent(
+	scheduleEventID,
+	startedEventID int64,
+	timeoutType workflow.TimeoutType,
+	lastHeartBeatDetails []byte,
+	lastFailureReason string,
+	lastFailureDetail []byte,
+) *workflow.HistoryEvent {
+	event := b.newActivityTaskTimedOutEvent(scheduleEventID, startedEventID, timeoutType, lastHeartBeatDetails,
+		lastFailureReason, lastFailureDetail)
 
 	return b.addEventToHistory(event)
 }
@@ -614,14 +617,22 @@ func (b *historyBuilder) newActivityTaskCompletedEvent(scheduleEventID, startedE
 	return historyEvent
 }
 
-func (b *historyBuilder) newActivityTaskTimedOutEvent(scheduleEventID, startedEventID int64,
-	timeoutType workflow.TimeoutType, lastHeartBeatDetails []byte) *workflow.HistoryEvent {
+func (b *historyBuilder) newActivityTaskTimedOutEvent(
+	scheduleEventID, startedEventID int64,
+	timeoutType workflow.TimeoutType,
+	lastHeartBeatDetails []byte,
+	lastFailureReason string,
+	lastFailureDetail []byte,
+) *workflow.HistoryEvent {
 	historyEvent := b.msBuilder.CreateNewHistoryEvent(workflow.EventTypeActivityTaskTimedOut)
 	attributes := &workflow.ActivityTaskTimedOutEventAttributes{}
 	attributes.ScheduledEventId = common.Int64Ptr(scheduleEventID)
 	attributes.StartedEventId = common.Int64Ptr(startedEventID)
 	attributes.TimeoutType = common.TimeoutTypePtr(timeoutType)
 	attributes.Details = lastHeartBeatDetails
+	attributes.LastFailureReason = common.StringPtr(lastFailureReason)
+	attributes.LastFailureDetails = lastFailureDetail
+
 	historyEvent.ActivityTaskTimedOutEventAttributes = attributes
 
 	return historyEvent

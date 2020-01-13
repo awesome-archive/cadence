@@ -22,6 +22,7 @@ package indexer
 
 import (
 	"fmt"
+
 	"github.com/uber/cadence/common"
 	es "github.com/uber/cadence/common/elasticsearch"
 	"github.com/uber/cadence/common/log"
@@ -39,7 +40,6 @@ type (
 		esClient            es.Client
 		logger              log.Logger
 		metricsClient       metrics.Client
-		dynamicCollection   *dynamicconfig.Collection
 		visibilityProcessor *indexProcessor
 		visibilityIndexName string
 	}

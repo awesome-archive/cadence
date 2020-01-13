@@ -3,9 +3,9 @@ CREATE TABLE domains(
   id BINARY(16) NOT NULL,
   name VARCHAR(255) UNIQUE NOT NULL,
   --
-	data BLOB NOT NULL,
-	data_encoding VARCHAR(16) NOT NULL,
-	is_global TINYINT(1) NOT NULL,
+  data BLOB NOT NULL,
+  data_encoding VARCHAR(16) NOT NULL,
+  is_global TINYINT(1) NOT NULL,
   PRIMARY KEY(shard_id, id)
 );
 
@@ -106,6 +106,16 @@ CREATE TABLE replication_tasks (
   PRIMARY KEY (shard_id, task_id)
 );
 
+CREATE TABLE replication_tasks_dlq (
+  source_cluster_name VARCHAR(255) NOT NULL,
+  shard_id INT NOT NULL,
+  task_id BIGINT NOT NULL,
+  --
+  data BLOB NOT NULL,
+  data_encoding VARCHAR(16) NOT NULL,
+  PRIMARY KEY (source_cluster_name, shard_id, task_id)
+);
+
 CREATE TABLE timer_tasks (
   shard_id INT NOT NULL,
   visibility_timestamp DATETIME(6) NOT NULL,
@@ -114,21 +124,6 @@ CREATE TABLE timer_tasks (
   data BLOB NOT NULL,
   data_encoding VARCHAR(16) NOT NULL,
   PRIMARY KEY (shard_id, visibility_timestamp, task_id)
-);
-
--- Deprecated in favor of history eventsV2
-CREATE TABLE events (
-  domain_id      BINARY(16) NOT NULL,
-  workflow_id    VARCHAR(255) NOT NULL,
-  run_id         BINARY(16) NOT NULL,
-  first_event_id BIGINT NOT NULL,
-  --
-  batch_version  BIGINT,
-  range_id       BIGINT NOT NULL,
-  tx_id          BIGINT NOT NULL,
-  data MEDIUMBLOB NOT NULL,
-  data_encoding  VARCHAR(16) NOT NULL,
-	PRIMARY KEY (domain_id, workflow_id, run_id, first_event_id)
 );
 
 CREATE TABLE activity_info_maps (
@@ -241,8 +236,20 @@ CREATE TABLE history_tree (
   tree_id        BINARY(16) NOT NULL,
   branch_id      BINARY(16) NOT NULL,
   --
-  in_progress    BOOLEAN NOT NULL,
   data           BLOB NOT NULL,
   data_encoding  VARCHAR(16) NOT NULL,
   PRIMARY KEY (shard_id, tree_id, branch_id)
+);
+
+CREATE TABLE queue (
+  queue_type INT NOT NULL,
+  message_id BIGINT NOT NULL,
+  message_payload BLOB NOT NULL,
+  PRIMARY KEY(queue_type, message_id)
+);
+
+CREATE TABLE queue_metadata (
+  queue_type INT NOT NULL,
+  data BLOB NOT NULL,
+  PRIMARY KEY(queue_type)
 );

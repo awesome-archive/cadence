@@ -25,11 +25,11 @@ import (
 	"time"
 
 	"github.com/pborman/uuid"
+	"go.uber.org/yarpc"
+
 	"github.com/uber/cadence/.gen/go/cadence/workflowserviceclient"
-	"github.com/uber/cadence/.gen/go/replicator"
 	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
-	"go.uber.org/yarpc"
 )
 
 var _ Client = (*clientImpl)(nil)
@@ -151,7 +151,7 @@ func (c *clientImpl) ListArchivedWorkflowExecutions(
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := c.createContext(ctx)
+	ctx, cancel := c.createLongPollContext(ctx)
 	defer cancel()
 	return client.ListArchivedWorkflowExecutions(ctx, request, opts...)
 }
@@ -660,11 +660,11 @@ func (c *clientImpl) getRandomClient() (workflowserviceclient.Interface, error) 
 	return client.(workflowserviceclient.Interface), nil
 }
 
-func (c *clientImpl) GetReplicationMessages(
+func (c *clientImpl) GetClusterInfo(
 	ctx context.Context,
-	request *replicator.GetReplicationMessagesRequest,
 	opts ...yarpc.CallOption,
-) (*replicator.GetReplicationMessagesResponse, error) {
+) (*shared.ClusterInfo, error) {
+
 	opts = common.AggregateYarpcOptions(ctx, opts...)
 	client, err := c.getRandomClient()
 	if err != nil {
@@ -672,5 +672,22 @@ func (c *clientImpl) GetReplicationMessages(
 	}
 	ctx, cancel := c.createContext(ctx)
 	defer cancel()
-	return client.GetReplicationMessages(ctx, request, opts...)
+	return client.GetClusterInfo(ctx, opts...)
+}
+
+func (c *clientImpl) ListTaskListPartitions(
+	ctx context.Context,
+	request *shared.ListTaskListPartitionsRequest,
+	opts ...yarpc.CallOption,
+) (*shared.ListTaskListPartitionsResponse, error) {
+
+	opts = common.AggregateYarpcOptions(ctx, opts...)
+	client, err := c.getRandomClient()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := c.createContext(ctx)
+	defer cancel()
+
+	return client.ListTaskListPartitions(ctx, request, opts...)
 }

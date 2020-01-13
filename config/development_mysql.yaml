@@ -5,7 +5,7 @@ persistence:
   datastores:
     mysql-default:
       sql:
-        driverName: "mysql"
+        pluginName: "mysql"
         databaseName: "cadence"
         connectAddr: "127.0.0.1:3306"
         connectProtocol: "tcp"
@@ -16,7 +16,7 @@ persistence:
         maxConnLifetime: "1h"
     mysql-visibility:
       sql:
-        driverName: "mysql"
+        pluginName: "mysql"
         databaseName: "cadence_visibility"
         connectAddr: "127.0.0.1:3306"
         connectProtocol: "tcp"
@@ -77,15 +77,15 @@ services:
     pprof:
       port: 7940
 
-clustersInfo:
+clusterMetadata:
   enableGlobalDomain: false
   failoverVersionIncrement: 10
   masterClusterName: "active"
   currentClusterName: "active"
-  clusterInitialFailoverVersion:
-    active: 0
-  clusterAddress:
+  clusterInformation:
     active:
+      enabled: true
+      initialFailoverVersion: 0
       rpcName: "cadence-frontend"
       rpcAddress: "localhost:7933"
 

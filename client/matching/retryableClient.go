@@ -23,10 +23,11 @@ package matching
 import (
 	"context"
 
+	"go.uber.org/yarpc"
+
 	m "github.com/uber/cadence/.gen/go/matching"
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/backoff"
-	"go.uber.org/yarpc"
 )
 
 var _ Client = (*retryableClient)(nil)
@@ -150,6 +151,22 @@ func (c *retryableClient) DescribeTaskList(
 	op := func() error {
 		var err error
 		resp, err = c.client.DescribeTaskList(ctx, request, opts...)
+		return err
+	}
+
+	err := backoff.Retry(op, c.policy, c.isRetryable)
+	return resp, err
+}
+
+func (c *retryableClient) ListTaskListPartitions(
+	ctx context.Context,
+	request *m.ListTaskListPartitionsRequest,
+	opts ...yarpc.CallOption) (*workflow.ListTaskListPartitionsResponse, error) {
+
+	var resp *workflow.ListTaskListPartitionsResponse
+	op := func() error {
+		var err error
+		resp, err = c.client.ListTaskListPartitions(ctx, request, opts...)
 		return err
 	}
 

@@ -32,13 +32,13 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/zap"
+
 	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/archiver"
-	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/loggerimpl"
 	"github.com/uber/cadence/common/service/config"
-	"go.uber.org/zap"
 )
 
 const (
@@ -63,7 +63,6 @@ type historyArchiverSuite struct {
 	suite.Suite
 
 	container          *archiver.HistoryBootstrapContainer
-	logger             log.Logger
 	testArchivalURI    archiver.URI
 	testGetDirectory   string
 	historyBatchesV1   []*shared.History

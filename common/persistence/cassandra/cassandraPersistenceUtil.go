@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/gocql/gocql"
+
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	p "github.com/uber/cadence/common/persistence"
@@ -40,6 +41,7 @@ func applyWorkflowMutationBatch(
 
 	executionInfo := workflowMutation.ExecutionInfo
 	replicationState := workflowMutation.ReplicationState
+	versionHistories := workflowMutation.VersionHistories
 	domainID := executionInfo.DomainID
 	workflowID := executionInfo.WorkflowID
 	runID := executionInfo.RunID
@@ -50,6 +52,7 @@ func applyWorkflowMutationBatch(
 		shardID,
 		executionInfo,
 		replicationState,
+		versionHistories,
 		cqlNowTimestampMillis,
 		condition,
 	); err != nil {
@@ -70,7 +73,7 @@ func applyWorkflowMutationBatch(
 
 	updateTimerInfos(
 		batch,
-		workflowMutation.UpserTimerInfos,
+		workflowMutation.UpsertTimerInfos,
 		workflowMutation.DeleteTimerInfos,
 		shardID,
 		domainID,
@@ -153,6 +156,7 @@ func applyWorkflowSnapshotBatchAsReset(
 
 	executionInfo := workflowSnapshot.ExecutionInfo
 	replicationState := workflowSnapshot.ReplicationState
+	versionHistories := workflowSnapshot.VersionHistories
 	domainID := executionInfo.DomainID
 	workflowID := executionInfo.WorkflowID
 	runID := executionInfo.RunID
@@ -163,6 +167,7 @@ func applyWorkflowSnapshotBatchAsReset(
 		shardID,
 		executionInfo,
 		replicationState,
+		versionHistories,
 		cqlNowTimestampMillis,
 		condition,
 	); err != nil {
@@ -258,6 +263,7 @@ func applyWorkflowSnapshotBatchAsNew(
 
 	executionInfo := workflowSnapshot.ExecutionInfo
 	replicationState := workflowSnapshot.ReplicationState
+	versionHistories := workflowSnapshot.VersionHistories
 	domainID := executionInfo.DomainID
 	workflowID := executionInfo.WorkflowID
 	runID := executionInfo.RunID
@@ -267,6 +273,7 @@ func applyWorkflowSnapshotBatchAsNew(
 		shardID,
 		executionInfo,
 		replicationState,
+		versionHistories,
 		cqlNowTimestampMillis,
 	); err != nil {
 		return err
@@ -354,6 +361,7 @@ func createExecution(
 	shardID int,
 	executionInfo *p.InternalWorkflowExecutionInfo,
 	replicationState *p.ReplicationState,
+	versionHistories *p.DataBlob,
 	cqlNowTimestampMillis int64,
 ) error {
 
@@ -384,7 +392,7 @@ func createExecution(
 	executionInfo.LastUpdatedTimestamp = time.Unix(0, p.DBTimestampToUnixNano(cqlNowTimestampMillis))
 
 	completionData, completionEncoding := p.FromDataBlob(executionInfo.CompletionEvent)
-	if replicationState == nil {
+	if replicationState == nil && versionHistories == nil {
 		// Cross DC feature is currently disabled so we will be creating workflow executions without replication state
 		batch.Query(templateCreateWorkflowExecutionQuery,
 			shardID,
@@ -405,7 +413,7 @@ func createExecution(
 			executionInfo.TaskList,
 			executionInfo.WorkflowTypeName,
 			executionInfo.WorkflowTimeout,
-			executionInfo.DecisionTimeoutValue,
+			executionInfo.DecisionStartToCloseTimeout,
 			executionInfo.ExecutionContext,
 			executionInfo.State,
 			executionInfo.CloseStatus,
@@ -444,7 +452,7 @@ func createExecution(
 			executionInfo.ExpirationTime,
 			executionInfo.MaximumAttempts,
 			executionInfo.NonRetriableErrors,
-			executionInfo.EventStoreVersion,
+			p.EventStoreVersion,
 			executionInfo.BranchToken,
 			executionInfo.CronSchedule,
 			executionInfo.ExpirationSeconds,
@@ -453,7 +461,79 @@ func createExecution(
 			executionInfo.NextEventID,
 			defaultVisibilityTimestamp,
 			rowTypeExecutionTaskID)
-	} else {
+	} else if versionHistories != nil {
+		// TODO also need to set the start / current / last write version
+		versionHistoriesData, versionHistoriesEncoding := p.FromDataBlob(versionHistories)
+		batch.Query(templateCreateWorkflowExecutionWithVersionHistoriesQuery,
+			shardID,
+			domainID,
+			workflowID,
+			runID,
+			rowTypeExecution,
+			domainID,
+			workflowID,
+			runID,
+			parentDomainID,
+			parentWorkflowID,
+			parentRunID,
+			initiatedID,
+			executionInfo.CompletionEventBatchID,
+			completionData,
+			completionEncoding,
+			executionInfo.TaskList,
+			executionInfo.WorkflowTypeName,
+			executionInfo.WorkflowTimeout,
+			executionInfo.DecisionStartToCloseTimeout,
+			executionInfo.ExecutionContext,
+			executionInfo.State,
+			executionInfo.CloseStatus,
+			executionInfo.LastFirstEventID,
+			executionInfo.LastEventTaskID,
+			executionInfo.NextEventID,
+			executionInfo.LastProcessedEvent,
+			executionInfo.StartTimestamp,
+			executionInfo.LastUpdatedTimestamp,
+			executionInfo.CreateRequestID,
+			executionInfo.SignalCount,
+			executionInfo.HistorySize,
+			executionInfo.DecisionVersion,
+			executionInfo.DecisionScheduleID,
+			executionInfo.DecisionStartedID,
+			executionInfo.DecisionRequestID,
+			executionInfo.DecisionTimeout,
+			executionInfo.DecisionAttempt,
+			executionInfo.DecisionStartedTimestamp,
+			executionInfo.DecisionScheduledTimestamp,
+			executionInfo.DecisionOriginalScheduledTimestamp,
+			executionInfo.CancelRequested,
+			executionInfo.CancelRequestID,
+			executionInfo.StickyTaskList,
+			executionInfo.StickyScheduleToStartTimeout,
+			executionInfo.ClientLibraryVersion,
+			executionInfo.ClientFeatureVersion,
+			executionInfo.ClientImpl,
+			executionInfo.AutoResetPoints.Data,
+			executionInfo.AutoResetPoints.GetEncoding(),
+			executionInfo.Attempt,
+			executionInfo.HasRetryPolicy,
+			executionInfo.InitialInterval,
+			executionInfo.BackoffCoefficient,
+			executionInfo.MaximumInterval,
+			executionInfo.ExpirationTime,
+			executionInfo.MaximumAttempts,
+			executionInfo.NonRetriableErrors,
+			p.EventStoreVersion,
+			executionInfo.BranchToken,
+			executionInfo.CronSchedule,
+			executionInfo.ExpirationSeconds,
+			executionInfo.SearchAttributes,
+			executionInfo.Memo,
+			executionInfo.NextEventID,
+			defaultVisibilityTimestamp,
+			rowTypeExecutionTaskID,
+			versionHistoriesData,
+			versionHistoriesEncoding)
+	} else if replicationState != nil {
 		lastReplicationInfo := make(map[string]map[string]interface{})
 		for k, v := range replicationState.LastReplicationInfo {
 			lastReplicationInfo[k] = createReplicationInfoMap(v)
@@ -478,7 +558,7 @@ func createExecution(
 			executionInfo.TaskList,
 			executionInfo.WorkflowTypeName,
 			executionInfo.WorkflowTimeout,
-			executionInfo.DecisionTimeoutValue,
+			executionInfo.DecisionStartToCloseTimeout,
 			executionInfo.ExecutionContext,
 			executionInfo.State,
 			executionInfo.CloseStatus,
@@ -517,7 +597,7 @@ func createExecution(
 			executionInfo.ExpirationTime,
 			executionInfo.MaximumAttempts,
 			executionInfo.NonRetriableErrors,
-			executionInfo.EventStoreVersion,
+			p.EventStoreVersion,
 			executionInfo.BranchToken,
 			executionInfo.CronSchedule,
 			executionInfo.ExpirationSeconds,
@@ -531,6 +611,10 @@ func createExecution(
 			executionInfo.NextEventID,
 			defaultVisibilityTimestamp,
 			rowTypeExecutionTaskID)
+	} else {
+		return &workflow.InternalServiceError{
+			Message: fmt.Sprintf("Create workflow execution with both version histories and replication state."),
+		}
 	}
 	return nil
 }
@@ -540,6 +624,7 @@ func updateExecution(
 	shardID int,
 	executionInfo *p.InternalWorkflowExecutionInfo,
 	replicationState *p.ReplicationState,
+	versionHistories *p.DataBlob,
 	cqlNowTimestampMillis int64,
 	condition int64,
 ) error {
@@ -570,7 +655,7 @@ func updateExecution(
 	executionInfo.LastUpdatedTimestamp = time.Unix(0, p.DBTimestampToUnixNano(cqlNowTimestampMillis))
 
 	completionData, completionEncoding := p.FromDataBlob(executionInfo.CompletionEvent)
-	if replicationState == nil {
+	if replicationState == nil && versionHistories == nil {
 		// Updates will be called with null ReplicationState while the feature is disabled
 		batch.Query(templateUpdateWorkflowExecutionQuery,
 			domainID,
@@ -586,7 +671,7 @@ func updateExecution(
 			executionInfo.TaskList,
 			executionInfo.WorkflowTypeName,
 			executionInfo.WorkflowTimeout,
-			executionInfo.DecisionTimeoutValue,
+			executionInfo.DecisionStartToCloseTimeout,
 			executionInfo.ExecutionContext,
 			executionInfo.State,
 			executionInfo.CloseStatus,
@@ -625,7 +710,7 @@ func updateExecution(
 			executionInfo.ExpirationTime,
 			executionInfo.MaximumAttempts,
 			executionInfo.NonRetriableErrors,
-			executionInfo.EventStoreVersion,
+			p.EventStoreVersion,
 			executionInfo.BranchToken,
 			executionInfo.CronSchedule,
 			executionInfo.ExpirationSeconds,
@@ -640,7 +725,80 @@ func updateExecution(
 			defaultVisibilityTimestamp,
 			rowTypeExecutionTaskID,
 			condition)
-	} else {
+	} else if versionHistories != nil {
+		// TODO also need to set the start / current / last write version
+		versionHistoriesData, versionHistoriesEncoding := p.FromDataBlob(versionHistories)
+		batch.Query(templateUpdateWorkflowExecutionWithVersionHistoriesQuery,
+			domainID,
+			workflowID,
+			runID,
+			parentDomainID,
+			parentWorkflowID,
+			parentRunID,
+			initiatedID,
+			executionInfo.CompletionEventBatchID,
+			completionData,
+			completionEncoding,
+			executionInfo.TaskList,
+			executionInfo.WorkflowTypeName,
+			executionInfo.WorkflowTimeout,
+			executionInfo.DecisionStartToCloseTimeout,
+			executionInfo.ExecutionContext,
+			executionInfo.State,
+			executionInfo.CloseStatus,
+			executionInfo.LastFirstEventID,
+			executionInfo.LastEventTaskID,
+			executionInfo.NextEventID,
+			executionInfo.LastProcessedEvent,
+			executionInfo.StartTimestamp,
+			executionInfo.LastUpdatedTimestamp,
+			executionInfo.CreateRequestID,
+			executionInfo.SignalCount,
+			executionInfo.HistorySize,
+			executionInfo.DecisionVersion,
+			executionInfo.DecisionScheduleID,
+			executionInfo.DecisionStartedID,
+			executionInfo.DecisionRequestID,
+			executionInfo.DecisionTimeout,
+			executionInfo.DecisionAttempt,
+			executionInfo.DecisionStartedTimestamp,
+			executionInfo.DecisionScheduledTimestamp,
+			executionInfo.DecisionOriginalScheduledTimestamp,
+			executionInfo.CancelRequested,
+			executionInfo.CancelRequestID,
+			executionInfo.StickyTaskList,
+			executionInfo.StickyScheduleToStartTimeout,
+			executionInfo.ClientLibraryVersion,
+			executionInfo.ClientFeatureVersion,
+			executionInfo.ClientImpl,
+			executionInfo.AutoResetPoints.Data,
+			executionInfo.AutoResetPoints.GetEncoding(),
+			executionInfo.Attempt,
+			executionInfo.HasRetryPolicy,
+			executionInfo.InitialInterval,
+			executionInfo.BackoffCoefficient,
+			executionInfo.MaximumInterval,
+			executionInfo.ExpirationTime,
+			executionInfo.MaximumAttempts,
+			executionInfo.NonRetriableErrors,
+			p.EventStoreVersion,
+			executionInfo.BranchToken,
+			executionInfo.CronSchedule,
+			executionInfo.ExpirationSeconds,
+			executionInfo.SearchAttributes,
+			executionInfo.Memo,
+			executionInfo.NextEventID,
+			versionHistoriesData,
+			versionHistoriesEncoding,
+			shardID,
+			rowTypeExecution,
+			domainID,
+			workflowID,
+			runID,
+			defaultVisibilityTimestamp,
+			rowTypeExecutionTaskID,
+			condition)
+	} else if replicationState != nil {
 		lastReplicationInfo := make(map[string]map[string]interface{})
 		for k, v := range replicationState.LastReplicationInfo {
 			lastReplicationInfo[k] = createReplicationInfoMap(v)
@@ -660,7 +818,7 @@ func updateExecution(
 			executionInfo.TaskList,
 			executionInfo.WorkflowTypeName,
 			executionInfo.WorkflowTimeout,
-			executionInfo.DecisionTimeoutValue,
+			executionInfo.DecisionStartToCloseTimeout,
 			executionInfo.ExecutionContext,
 			executionInfo.State,
 			executionInfo.CloseStatus,
@@ -699,7 +857,7 @@ func updateExecution(
 			executionInfo.ExpirationTime,
 			executionInfo.MaximumAttempts,
 			executionInfo.NonRetriableErrors,
-			executionInfo.EventStoreVersion,
+			p.EventStoreVersion,
 			executionInfo.BranchToken,
 			executionInfo.CronSchedule,
 			executionInfo.ExpirationSeconds,
@@ -719,6 +877,10 @@ func updateExecution(
 			defaultVisibilityTimestamp,
 			rowTypeExecutionTaskID,
 			condition)
+	} else {
+		return &workflow.InternalServiceError{
+			Message: fmt.Sprintf("Update workflow execution with both version histories and replication state."),
+		}
 	}
 
 	return nil
@@ -874,18 +1036,15 @@ func createReplicationTasks(
 		// Replication task specific information
 		firstEventID := common.EmptyEventID
 		nextEventID := common.EmptyEventID
-		version := common.EmptyVersion
+		version := common.EmptyVersion //nolint:ineffassign
 		var lastReplicationInfo map[string]map[string]interface{}
 		activityScheduleID := common.EmptyEventID
-		var eventStoreVersion, newRunEventStoreVersion int32
 		var branchToken, newRunBranchToken []byte
 		resetWorkflow := false
 
 		switch task.GetType() {
 		case p.ReplicationTaskTypeHistory:
 			histTask := task.(*p.HistoryReplicationTask)
-			eventStoreVersion = histTask.EventStoreVersion
-			newRunEventStoreVersion = histTask.NewRunEventStoreVersion
 			branchToken = histTask.BranchToken
 			newRunBranchToken = histTask.NewRunBranchToken
 			firstEventID = histTask.FirstEventID
@@ -925,10 +1084,10 @@ func createReplicationTasks(
 			version,
 			lastReplicationInfo,
 			activityScheduleID,
-			eventStoreVersion,
+			p.EventStoreVersion,
 			branchToken,
 			resetWorkflow,
-			newRunEventStoreVersion,
+			p.EventStoreVersion,
 			newRunBranchToken,
 			defaultVisibilityTimestamp,
 			task.GetTaskID())
@@ -1014,7 +1173,7 @@ func createTimerTasks(
 
 func createOrUpdateCurrentExecution(
 	batch *gocql.Batch,
-	createMode int,
+	createMode p.CreateWorkflowMode,
 	shardID int,
 	domainID string,
 	workflowID string,
@@ -1022,25 +1181,11 @@ func createOrUpdateCurrentExecution(
 	state int,
 	closeStatus int,
 	createRequestID string,
-	replicationState *p.ReplicationState,
+	startVersion int64,
+	lastWriteVersion int64,
 	previousRunID string,
 	previousLastWriteVersion int64,
 ) error {
-
-	startVersion := common.EmptyVersion
-	lastWriteVersion := common.EmptyVersion
-	if replicationState != nil {
-		startVersion = replicationState.StartVersion
-		lastWriteVersion = replicationState.LastWriteVersion
-	} else {
-		// this is to deal with issue that gocql cannot return null value for value inside user defined type
-		// so we cannot know whether the last write version of current workflow record is null or not
-		// since non global domain (request.ReplicationState == null) will not have workflow reset problem
-		// so the CAS on last write version is not necessary
-		if createMode == p.CreateWorkflowModeWorkflowIDReuse {
-			createMode = p.CreateWorkflowModeContinueAsNew
-		}
-	}
 
 	switch createMode {
 	case p.CreateWorkflowModeContinueAsNew:
@@ -1105,7 +1250,9 @@ func createOrUpdateCurrentExecution(
 			state,
 		)
 	default:
-		return fmt.Errorf("Unknown CreateWorkflowMode: %v", createMode)
+		return &workflow.InternalServiceError{
+			Message: fmt.Sprintf("unknown mode: %v", createMode),
+		}
 	}
 
 	return nil
@@ -1248,7 +1395,7 @@ func updateTimerInfos(
 			a.TimerID,
 			a.StartedID,
 			a.ExpiryTime,
-			a.TaskID,
+			a.TaskStatus,
 			shardID,
 			rowTypeExecution,
 			domainID,
@@ -1694,7 +1841,7 @@ func createWorkflowExecutionInfo(
 		case "workflow_timeout":
 			info.WorkflowTimeout = int32(v.(int))
 		case "decision_task_timeout":
-			info.DecisionTimeoutValue = int32(v.(int))
+			info.DecisionStartToCloseTimeout = int32(v.(int))
 		case "execution_context":
 			info.ExecutionContext = v.([]byte)
 		case "state":
@@ -1767,8 +1914,6 @@ func createWorkflowExecutionInfo(
 			info.ExpirationTime = v.(time.Time)
 		case "non_retriable_errors":
 			info.NonRetriableErrors = v.([]string)
-		case "event_store_version":
-			info.EventStoreVersion = int32(v.(int))
 		case "branch_token":
 			info.BranchToken = v.([]byte)
 		case "cron_schedule":
@@ -1892,14 +2037,10 @@ func createReplicationTaskInfo(
 			}
 		case "scheduled_id":
 			info.ScheduledID = v.(int64)
-		case "event_store_version":
-			info.EventStoreVersion = int32(v.(int))
 		case "branch_token":
 			info.BranchToken = v.([]byte)
 		case "reset_workflow":
 			info.ResetWorkflow = v.(bool)
-		case "new_run_event_store_version":
-			info.NewRunEventStoreVersion = int32(v.(int))
 		case "new_run_branch_token":
 			info.NewRunBranchToken = v.([]byte)
 		}
@@ -2009,7 +2150,10 @@ func createTimerInfo(
 		case "expiry_time":
 			info.ExpiryTime = v.(time.Time)
 		case "task_id":
-			info.TaskID = v.(int64)
+			// task_id is a misleading variable, it actually serves
+			// the purpose of indicating whether a timer task is
+			// generated for this timer info
+			info.TaskStatus = v.(int64)
 		}
 	}
 	return info
@@ -2169,7 +2313,10 @@ func resetTimerInfoMap(
 		tInfo["timer_id"] = t.TimerID
 		tInfo["started_id"] = t.StartedID
 		tInfo["expiry_time"] = t.ExpiryTime
-		tInfo["task_id"] = t.TaskID
+		// task_id is a misleading variable, it actually serves
+		// the purpose of indicating whether a timer task is
+		// generated for this timer info
+		tInfo["task_id"] = t.TaskStatus
 
 		tMap[t.TimerID] = tInfo
 	}

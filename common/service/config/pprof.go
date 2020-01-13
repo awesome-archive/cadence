@@ -22,10 +22,12 @@ package config
 
 import (
 	"fmt"
-	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/log/tag"
 	"net/http"
 	"sync/atomic"
+
+	"github.com/uber/cadence/common/log"
+	"github.com/uber/cadence/common/log/tag"
+
 	// DO NOT REMOVE THE LINE BELOW
 	_ "net/http/pprof"
 )
@@ -66,7 +68,10 @@ func (initializer *PProfInitializerImpl) Start() error {
 	if atomic.CompareAndSwapInt32(&pprofStatus, pprofNotInitialized, pprofInitialized) {
 		go func() {
 			initializer.Logger.Info("PProf listen on ", tag.Port(port))
-			http.ListenAndServe(fmt.Sprintf("localhost:%d", port), nil)
+			err := http.ListenAndServe(fmt.Sprintf("localhost:%d", port), nil)
+			if err != nil {
+				initializer.Logger.Error("listen and serve err", tag.Error(err))
+			}
 		}()
 	}
 	return nil

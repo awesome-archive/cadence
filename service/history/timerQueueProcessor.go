@@ -18,6 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -copyright_file ../../LICENSE -package $GOPACKAGE -source $GOFILE -destination timerQueueProcessor_mock.go
+
 package history
 
 import (
@@ -29,6 +31,7 @@ import (
 
 	h "github.com/uber/cadence/.gen/go/history"
 	"github.com/uber/cadence/client/matching"
+	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
@@ -37,12 +40,20 @@ import (
 )
 
 var (
-	errUnknownTimerTask = errors.New("Unknown timer task")
+	errUnknownTimerTask = errors.New("unknown timer task")
 )
 
 type (
+	timerQueueProcessor interface {
+		common.Daemon
+		FailoverDomain(domainIDs map[string]struct{})
+		NotifyNewTimers(clusterName string, timerTask []persistence.Task)
+		LockTaskProcessing()
+		UnlockTaskProcessing()
+	}
+
 	timeNow                 func() time.Time
-	updateTimerAckLevel     func(TimerSequenceID) error
+	updateTimerAckLevel     func(timerKey) error
 	timerQueueShutdown      func() error
 	timerQueueProcessorImpl struct {
 		isGlobalDomainEnabled  bool
@@ -52,7 +63,7 @@ type (
 		config                 *Config
 		metricsClient          metrics.Client
 		historyService         *historyEngineImpl
-		ackLevel               TimerSequenceID
+		ackLevel               timerKey
 		logger                 log.Logger
 		matchingClient         matching.Client
 		isStarted              int32
@@ -88,8 +99,17 @@ func newTimerQueueProcessor(
 				func(ctx context.Context, request *h.ReplicateRawEventsRequest) error {
 					return historyService.ReplicateRawEvents(ctx, request)
 				},
-				persistence.NewPayloadSerializer(),
+				shard.GetService().GetPayloadSerializer(),
 				historyRereplicationTimeout,
+				logger,
+			)
+			nDCHistoryResender := xdc.NewNDCHistoryResender(
+				shard.GetDomainCache(),
+				shard.GetService().GetClientBean().GetRemoteAdminClient(clusterName),
+				func(ctx context.Context, request *h.ReplicateEventsV2Request) error {
+					return historyService.ReplicateEventsV2(ctx, request)
+				},
+				shard.GetService().GetPayloadSerializer(),
 				logger,
 			)
 			standbyTimerProcessors[clusterName] = newTimerQueueStandbyProcessor(
@@ -98,6 +118,7 @@ func newTimerQueueProcessor(
 				clusterName,
 				taskAllocator,
 				historyRereplicator,
+				nDCHistoryResender,
 				logger,
 			)
 		}
@@ -111,7 +132,7 @@ func newTimerQueueProcessor(
 		config:                 shard.GetConfig(),
 		metricsClient:          historyService.metricsClient,
 		historyService:         historyService,
-		ackLevel:               TimerSequenceID{VisibilityTimestamp: shard.GetTimerAckLevel()},
+		ackLevel:               timerKey{VisibilityTimestamp: shard.GetTimerAckLevel()},
 		logger:                 logger,
 		matchingClient:         matchingClient,
 		shutdownChan:           make(chan struct{}),
@@ -188,8 +209,8 @@ func (t *timerQueueProcessorImpl) FailoverDomain(
 	maxLevel := t.activeTimerProcessor.getReadLevel().VisibilityTimestamp.Add(1 * time.Millisecond)
 	t.logger.Info("Timer Failover Triggered",
 		tag.WorkflowDomainIDs(domainIDs),
-		tag.MinLevel(int64(minLevel.Nanosecond())),
-		tag.MaxLevel(int64(maxLevel.Nanosecond())))
+		tag.MinLevel(minLevel.UnixNano()),
+		tag.MaxLevel(maxLevel.UnixNano()))
 	// we should consider make the failover idempotent
 	updateShardAckLevel, failoverTimerProcessor := newTimerQueueFailoverProcessor(
 		t.shard,
@@ -209,31 +230,19 @@ func (t *timerQueueProcessorImpl) FailoverDomain(
 
 	// NOTE: READ REF BEFORE MODIFICATION
 	// ref: historyEngine.go registerDomainFailoverCallback function
-	updateShardAckLevel(TimerSequenceID{VisibilityTimestamp: minLevel})
+	err := updateShardAckLevel(timerKey{VisibilityTimestamp: minLevel})
+	if err != nil {
+		t.logger.Error("Error when update shard ack level", tag.Error(err))
+	}
 	failoverTimerProcessor.Start()
 }
 
-func (t *timerQueueProcessorImpl) LockTaskPrrocessing() {
+func (t *timerQueueProcessorImpl) LockTaskProcessing() {
 	t.taskAllocator.lock()
 }
 
-func (t *timerQueueProcessorImpl) UnlockTaskPrrocessing() {
+func (t *timerQueueProcessorImpl) UnlockTaskProcessing() {
 	t.taskAllocator.unlock()
-}
-
-func (t *timerQueueProcessorImpl) getTimerFiredCount(
-	clusterName string,
-) uint64 {
-
-	if clusterName == t.currentClusterName {
-		return t.activeTimerProcessor.getTimerFiredCount()
-	}
-
-	standbyTimerProcessor, ok := t.standbyTimerProcessors[clusterName]
-	if !ok {
-		panic(fmt.Sprintf("Cannot find timer processor for %s.", clusterName))
-	}
-	return standbyTimerProcessor.getTimerFiredCount()
 }
 
 func (t *timerQueueProcessorImpl) completeTimersLoop() {
@@ -243,7 +252,7 @@ func (t *timerQueueProcessorImpl) completeTimersLoop() {
 		select {
 		case <-t.shutdownChan:
 			// before shutdown, make sure the ack level is up to date
-			t.completeTimers()
+			t.completeTimers() //nolint:errcheck
 			return
 		case <-timer.C:
 		CompleteLoop:
@@ -276,7 +285,7 @@ func (t *timerQueueProcessorImpl) completeTimers() error {
 
 		for _, failoverInfo := range t.shard.GetAllTimerFailoverLevels() {
 			if !upperAckLevel.VisibilityTimestamp.Before(failoverInfo.MinLevel) {
-				upperAckLevel = TimerSequenceID{VisibilityTimestamp: failoverInfo.MinLevel}
+				upperAckLevel = timerKey{VisibilityTimestamp: failoverInfo.MinLevel}
 			}
 		}
 	}
@@ -300,6 +309,5 @@ func (t *timerQueueProcessorImpl) completeTimers() error {
 
 	t.ackLevel = upperAckLevel
 
-	t.shard.UpdateTimerAckLevel(t.ackLevel.VisibilityTimestamp)
-	return nil
+	return t.shard.UpdateTimerAckLevel(t.ackLevel.VisibilityTimestamp)
 }

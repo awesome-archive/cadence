@@ -27,6 +27,7 @@ import (
 
 	"github.com/dgryski/go-farm"
 	"github.com/stretchr/testify/suite"
+
 	"github.com/uber/cadence/common/definition"
 )
 
@@ -134,7 +135,6 @@ func (s *replicationSequentialTaskQueueSuite) TestAddRemoveIsEmptyLen() {
 	s.Equal(testTask3, testTask)
 
 	testTask4 := s.generateActivityTask(taskID)
-	taskID++
 
 	s.queue.Add(testTask4)
 	s.Equal(1, s.queue.Len())

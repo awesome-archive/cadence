@@ -21,12 +21,13 @@
 package config
 
 import (
-	"github.com/stretchr/testify/require"
-	"github.com/stretchr/testify/suite"
-	"go.uber.org/zap"
 	"io/ioutil"
 	"os"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+	"go.uber.org/zap"
 )
 
 type LogSuite struct {
@@ -35,7 +36,7 @@ type LogSuite struct {
 }
 
 func TestLogSuite(t *testing.T) {
-	suite.Run(t, new(LoaderSuite))
+	suite.Run(t, new(LogSuite))
 }
 
 func (s *LogSuite) SetupTest() {
@@ -58,7 +59,6 @@ func (s *LogSuite) TestNewLogger() {
 	defer os.RemoveAll(dir)
 
 	config := &Logger{
-		Stdout:     true,
 		Level:      "info",
 		OutputFile: dir + "/test.log",
 	}

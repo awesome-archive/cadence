@@ -28,8 +28,8 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
+
 	gen "github.com/uber/cadence/.gen/go/matching"
 	"github.com/uber/cadence/.gen/go/matching/matchingservicetest"
 	"github.com/uber/cadence/.gen/go/shared"
@@ -134,7 +134,8 @@ func (t *MatcherTestSuite) TestRemoteSyncMatch() {
 		},
 	).Return(nil)
 
-	t.matcher.Offer(ctx, task)
+	_, err0 := t.matcher.Offer(ctx, task)
+	t.NoError(err0)
 	cancel()
 	t.NotNil(req)
 	t.NoError(err)
@@ -228,7 +229,7 @@ func (t *MatcherTestSuite) TestQueryRemoteSyncMatch() {
 	t.NotNil(req)
 	t.NoError(err)
 	t.NotNil(result)
-	t.Equal("answer", string(result))
+	t.Equal("answer", string(result.QueryResult))
 	t.Equal(t.taskList.name, req.GetForwardedFrom())
 	t.Equal(t.taskList.Parent(20), req.GetTaskList().GetName())
 }
@@ -328,7 +329,7 @@ func (t *MatcherTestSuite) TestMustOfferRemoteMatch() {
 		},
 	).Return(nil)
 
-	t.matcher.MustOffer(ctx, task)
+	t.NoError(t.matcher.MustOffer(ctx, task))
 	cancel()
 	t.NotNil(req)
 	t.NoError(err)
@@ -391,8 +392,8 @@ func (t *MatcherTestSuite) newDomainCache() cache.DomainCache {
 		&persistence.DomainConfig{},
 		"",
 		nil)
-	dc := &cache.DomainCacheMock{}
-	dc.On("GetDomainByID", mock.Anything).Return(entry, nil)
+	dc := cache.NewMockDomainCache(t.controller)
+	dc.EXPECT().GetDomainByID(gomock.Any()).Return(entry, nil).AnyTimes()
 	return dc
 }
 

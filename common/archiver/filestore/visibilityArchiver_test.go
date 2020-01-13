@@ -33,13 +33,13 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/zap"
+
 	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/archiver"
-	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/loggerimpl"
 	"github.com/uber/cadence/common/service/config"
-	"go.uber.org/zap"
 )
 
 const (
@@ -51,7 +51,6 @@ type visibilityArchiverSuite struct {
 	suite.Suite
 
 	container          *archiver.VisibilityBootstrapContainer
-	logger             log.Logger
 	testArchivalURI    archiver.URI
 	testQueryDirectory string
 	visibilityRecords  []*visibilityRecord
@@ -121,6 +120,7 @@ func (s *visibilityArchiverSuite) TestArchive_Fail_InvalidURI() {
 	URI, err := archiver.NewURI("wrongscheme://")
 	s.NoError(err)
 	request := &archiver.ArchiveVisibilityRequest{
+		DomainName:         testDomainName,
 		DomainID:           testDomainID,
 		WorkflowID:         testWorkflowID,
 		RunID:              testRunID,
@@ -162,6 +162,7 @@ func (s *visibilityArchiverSuite) TestArchive_Success() {
 	closeTimestamp := time.Now()
 	request := &archiver.ArchiveVisibilityRequest{
 		DomainID:           testDomainID,
+		DomainName:         testDomainName,
 		WorkflowID:         testWorkflowID,
 		RunID:              testRunID,
 		WorkflowTypeName:   testWorkflowTypeName,
@@ -175,8 +176,8 @@ func (s *visibilityArchiverSuite) TestArchive_Success() {
 				"testFields": []byte{1, 2, 3},
 			},
 		},
-		SearchAttributes: map[string][]byte{
-			"testAttribute": []byte{4, 5, 6},
+		SearchAttributes: map[string]string{
+			"testAttribute": "456",
 		},
 	}
 	URI, err := archiver.NewURI("file://" + dir)
@@ -503,6 +504,7 @@ func (s *visibilityArchiverSuite) setupVisibilityDirectory() {
 	s.visibilityRecords = []*visibilityRecord{
 		{
 			DomainID:         testDomainID,
+			DomainName:       testDomainName,
 			WorkflowID:       testWorkflowID,
 			RunID:            testRunID,
 			WorkflowTypeName: testWorkflowTypeName,
@@ -513,6 +515,7 @@ func (s *visibilityArchiverSuite) setupVisibilityDirectory() {
 		},
 		{
 			DomainID:           testDomainID,
+			DomainName:         testDomainName,
 			WorkflowID:         "some random workflow ID",
 			RunID:              "some random run ID",
 			WorkflowTypeName:   testWorkflowTypeName,
@@ -524,6 +527,7 @@ func (s *visibilityArchiverSuite) setupVisibilityDirectory() {
 		},
 		{
 			DomainID:           testDomainID,
+			DomainName:         testDomainName,
 			WorkflowID:         "another workflow ID",
 			RunID:              "another run ID",
 			WorkflowTypeName:   testWorkflowTypeName,
@@ -535,6 +539,7 @@ func (s *visibilityArchiverSuite) setupVisibilityDirectory() {
 		},
 		{
 			DomainID:           testDomainID,
+			DomainName:         testDomainName,
 			WorkflowID:         "and another workflow ID",
 			RunID:              "and another run ID",
 			WorkflowTypeName:   testWorkflowTypeName,
@@ -546,6 +551,7 @@ func (s *visibilityArchiverSuite) setupVisibilityDirectory() {
 		},
 		{
 			DomainID:           "some random domain ID",
+			DomainName:         "some random domain name",
 			WorkflowID:         "another workflow ID",
 			RunID:              "another run ID",
 			WorkflowTypeName:   testWorkflowTypeName,

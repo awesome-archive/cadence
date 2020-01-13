@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 // 
-// Copyright (c) 2017 Uber Technologies, Inc.
+// Copyright (c) 2019 Uber Technologies, Inc.
 // 
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -57,6 +57,11 @@ type Interface interface {
 		DescribeRequest *history.DescribeWorkflowExecutionRequest,
 	) (*shared.DescribeWorkflowExecutionResponse, error)
 
+	GetDLQReplicationMessages(
+		ctx context.Context,
+		Request *replicator.GetDLQReplicationMessagesRequest,
+	) (*replicator.GetDLQReplicationMessagesResponse, error)
+
 	GetMutableState(
 		ctx context.Context,
 		GetRequest *history.GetMutableStateRequest,
@@ -67,10 +72,20 @@ type Interface interface {
 		Request *replicator.GetReplicationMessagesRequest,
 	) (*replicator.GetReplicationMessagesResponse, error)
 
+	PollMutableState(
+		ctx context.Context,
+		PollRequest *history.PollMutableStateRequest,
+	) (*history.PollMutableStateResponse, error)
+
 	QueryWorkflow(
 		ctx context.Context,
 		QueryRequest *history.QueryWorkflowRequest,
 	) (*history.QueryWorkflowResponse, error)
+
+	ReapplyEvents(
+		ctx context.Context,
+		ReapplyEventsRequest *history.ReapplyEventsRequest,
+	) error
 
 	RecordActivityTaskHeartbeat(
 		ctx context.Context,
@@ -105,6 +120,11 @@ type Interface interface {
 	ReplicateEvents(
 		ctx context.Context,
 		ReplicateRequest *history.ReplicateEventsRequest,
+	) error
+
+	ReplicateEventsV2(
+		ctx context.Context,
+		ReplicateV2Request *history.ReplicateEventsV2Request,
 	) error
 
 	ReplicateRawEvents(
@@ -244,6 +264,17 @@ func New(impl Interface, opts ...thrift.RegisterOption) []transport.Procedure {
 			},
 
 			thrift.Method{
+				Name: "GetDLQReplicationMessages",
+				HandlerSpec: thrift.HandlerSpec{
+
+					Type:  transport.Unary,
+					Unary: thrift.UnaryHandler(h.GetDLQReplicationMessages),
+				},
+				Signature:    "GetDLQReplicationMessages(Request *replicator.GetDLQReplicationMessagesRequest) (*replicator.GetDLQReplicationMessagesResponse)",
+				ThriftModule: history.ThriftModule,
+			},
+
+			thrift.Method{
 				Name: "GetMutableState",
 				HandlerSpec: thrift.HandlerSpec{
 
@@ -266,6 +297,17 @@ func New(impl Interface, opts ...thrift.RegisterOption) []transport.Procedure {
 			},
 
 			thrift.Method{
+				Name: "PollMutableState",
+				HandlerSpec: thrift.HandlerSpec{
+
+					Type:  transport.Unary,
+					Unary: thrift.UnaryHandler(h.PollMutableState),
+				},
+				Signature:    "PollMutableState(PollRequest *history.PollMutableStateRequest) (*history.PollMutableStateResponse)",
+				ThriftModule: history.ThriftModule,
+			},
+
+			thrift.Method{
 				Name: "QueryWorkflow",
 				HandlerSpec: thrift.HandlerSpec{
 
@@ -273,6 +315,17 @@ func New(impl Interface, opts ...thrift.RegisterOption) []transport.Procedure {
 					Unary: thrift.UnaryHandler(h.QueryWorkflow),
 				},
 				Signature:    "QueryWorkflow(QueryRequest *history.QueryWorkflowRequest) (*history.QueryWorkflowResponse)",
+				ThriftModule: history.ThriftModule,
+			},
+
+			thrift.Method{
+				Name: "ReapplyEvents",
+				HandlerSpec: thrift.HandlerSpec{
+
+					Type:  transport.Unary,
+					Unary: thrift.UnaryHandler(h.ReapplyEvents),
+				},
+				Signature:    "ReapplyEvents(ReapplyEventsRequest *history.ReapplyEventsRequest)",
 				ThriftModule: history.ThriftModule,
 			},
 
@@ -350,6 +403,17 @@ func New(impl Interface, opts ...thrift.RegisterOption) []transport.Procedure {
 					Unary: thrift.UnaryHandler(h.ReplicateEvents),
 				},
 				Signature:    "ReplicateEvents(ReplicateRequest *history.ReplicateEventsRequest)",
+				ThriftModule: history.ThriftModule,
+			},
+
+			thrift.Method{
+				Name: "ReplicateEventsV2",
+				HandlerSpec: thrift.HandlerSpec{
+
+					Type:  transport.Unary,
+					Unary: thrift.UnaryHandler(h.ReplicateEventsV2),
+				},
+				Signature:    "ReplicateEventsV2(ReplicateV2Request *history.ReplicateEventsV2Request)",
 				ThriftModule: history.ThriftModule,
 			},
 
@@ -531,7 +595,7 @@ func New(impl Interface, opts ...thrift.RegisterOption) []transport.Procedure {
 		},
 	}
 
-	procedures := make([]transport.Procedure, 0, 30)
+	procedures := make([]transport.Procedure, 0, 34)
 	procedures = append(procedures, thrift.BuildProcedures(service, opts...)...)
 	return procedures
 }
@@ -614,6 +678,25 @@ func (h handler) DescribeWorkflowExecution(ctx context.Context, body wire.Value)
 	return response, err
 }
 
+func (h handler) GetDLQReplicationMessages(ctx context.Context, body wire.Value) (thrift.Response, error) {
+	var args history.HistoryService_GetDLQReplicationMessages_Args
+	if err := args.FromWire(body); err != nil {
+		return thrift.Response{}, err
+	}
+
+	success, err := h.impl.GetDLQReplicationMessages(ctx, args.Request)
+
+	hadError := err != nil
+	result, err := history.HistoryService_GetDLQReplicationMessages_Helper.WrapResponse(success, err)
+
+	var response thrift.Response
+	if err == nil {
+		response.IsApplicationError = hadError
+		response.Body = result
+	}
+	return response, err
+}
+
 func (h handler) GetMutableState(ctx context.Context, body wire.Value) (thrift.Response, error) {
 	var args history.HistoryService_GetMutableState_Args
 	if err := args.FromWire(body); err != nil {
@@ -652,6 +735,25 @@ func (h handler) GetReplicationMessages(ctx context.Context, body wire.Value) (t
 	return response, err
 }
 
+func (h handler) PollMutableState(ctx context.Context, body wire.Value) (thrift.Response, error) {
+	var args history.HistoryService_PollMutableState_Args
+	if err := args.FromWire(body); err != nil {
+		return thrift.Response{}, err
+	}
+
+	success, err := h.impl.PollMutableState(ctx, args.PollRequest)
+
+	hadError := err != nil
+	result, err := history.HistoryService_PollMutableState_Helper.WrapResponse(success, err)
+
+	var response thrift.Response
+	if err == nil {
+		response.IsApplicationError = hadError
+		response.Body = result
+	}
+	return response, err
+}
+
 func (h handler) QueryWorkflow(ctx context.Context, body wire.Value) (thrift.Response, error) {
 	var args history.HistoryService_QueryWorkflow_Args
 	if err := args.FromWire(body); err != nil {
@@ -662,6 +764,25 @@ func (h handler) QueryWorkflow(ctx context.Context, body wire.Value) (thrift.Res
 
 	hadError := err != nil
 	result, err := history.HistoryService_QueryWorkflow_Helper.WrapResponse(success, err)
+
+	var response thrift.Response
+	if err == nil {
+		response.IsApplicationError = hadError
+		response.Body = result
+	}
+	return response, err
+}
+
+func (h handler) ReapplyEvents(ctx context.Context, body wire.Value) (thrift.Response, error) {
+	var args history.HistoryService_ReapplyEvents_Args
+	if err := args.FromWire(body); err != nil {
+		return thrift.Response{}, err
+	}
+
+	err := h.impl.ReapplyEvents(ctx, args.ReapplyEventsRequest)
+
+	hadError := err != nil
+	result, err := history.HistoryService_ReapplyEvents_Helper.WrapResponse(err)
 
 	var response thrift.Response
 	if err == nil {
@@ -795,6 +916,25 @@ func (h handler) ReplicateEvents(ctx context.Context, body wire.Value) (thrift.R
 
 	hadError := err != nil
 	result, err := history.HistoryService_ReplicateEvents_Helper.WrapResponse(err)
+
+	var response thrift.Response
+	if err == nil {
+		response.IsApplicationError = hadError
+		response.Body = result
+	}
+	return response, err
+}
+
+func (h handler) ReplicateEventsV2(ctx context.Context, body wire.Value) (thrift.Response, error) {
+	var args history.HistoryService_ReplicateEventsV2_Args
+	if err := args.FromWire(body); err != nil {
+		return thrift.Response{}, err
+	}
+
+	err := h.impl.ReplicateEventsV2(ctx, args.ReplicateV2Request)
+
+	hadError := err != nil
+	result, err := history.HistoryService_ReplicateEventsV2_Helper.WrapResponse(err)
 
 	var response thrift.Response
 	if err == nil {

@@ -23,98 +23,194 @@
 package history
 
 import (
-	"errors"
 	"sync"
 
 	"github.com/uber/cadence/.gen/go/shared"
 )
 
 var (
-	errQueryNotFound       = errors.New("callback function could not be applied because query was not found")
-	errQueryAlreadyInState = errors.New("could not invoke callback because query is already in target state")
+	errQueryNotExists = &shared.InternalServiceError{Message: "query does not exist"}
 )
 
 type (
-	// QueryRegistry keeps track of all outstanding queries for a single workflow execution
-	QueryRegistry interface {
-		BufferQuery(*shared.WorkflowQuery) Query
-		GetBuffered() map[string]Query
-		GetStarted() map[string]Query
+	queryRegistry interface {
+		hasBufferedQuery() bool
+		getBufferedIDs() []string
+		hasCompletedQuery() bool
+		getCompletedIDs() []string
+		hasUnblockedQuery() bool
+		getUnblockedIDs() []string
+		hasFailedQuery() bool
+		getFailedIDs() []string
+
+		getQueryTermCh(string) (<-chan struct{}, error)
+		getQueryInput(string) (*shared.WorkflowQuery, error)
+		getTerminationState(string) (*queryTerminationState, error)
+
+		bufferQuery(queryInput *shared.WorkflowQuery) (string, <-chan struct{})
+		setTerminationState(string, *queryTerminationState) error
+		removeQuery(id string)
 	}
 
-	queryRegistry struct {
+	queryRegistryImpl struct {
 		sync.RWMutex
 
-		buffered map[string]Query
-		started  map[string]Query
+		buffered  map[string]query
+		completed map[string]query
+		unblocked map[string]query
+		failed    map[string]query
 	}
 )
 
-// NewQueryRegistry constructs a new QueryRegistry.
-// One QueryRegistry exists per workflowExecutionContext, and it should be accessed through the workflowExecutionContext.
-func NewQueryRegistry() QueryRegistry {
-	return &queryRegistry{
-		buffered: make(map[string]Query),
-		started:  make(map[string]Query),
+func newQueryRegistry() queryRegistry {
+	return &queryRegistryImpl{
+		buffered:  make(map[string]query),
+		completed: make(map[string]query),
+		unblocked: make(map[string]query),
+		failed:    make(map[string]query),
 	}
 }
 
-// BufferQuery is used to buffer a new query.
-func (r *queryRegistry) BufferQuery(queryInput *shared.WorkflowQuery) Query {
-	r.Lock()
-	defer r.Unlock()
-
-	query := newQuery(queryInput, r.bufferedToStartedCallback, r.startedToBufferedCallback, r.terminalStateCallback)
-	r.buffered[query.ID()] = query
-	return query
-}
-
-// GetBuffered returns all buffered queries.
-func (r *queryRegistry) GetBuffered() map[string]Query {
+func (r *queryRegistryImpl) hasBufferedQuery() bool {
 	r.RLock()
 	defer r.RUnlock()
-
-	return r.buffered
+	return len(r.buffered) > 0
 }
 
-// GetStarted returns all started queries.
-func (r *queryRegistry) GetStarted() map[string]Query {
+func (r *queryRegistryImpl) getBufferedIDs() []string {
 	r.RLock()
 	defer r.RUnlock()
-
-	return r.started
+	return r.getIDs(r.buffered)
 }
 
-func (r *queryRegistry) terminalStateCallback(id string) {
+func (r *queryRegistryImpl) hasCompletedQuery() bool {
+	r.RLock()
+	defer r.RUnlock()
+	return len(r.completed) > 0
+}
+
+func (r *queryRegistryImpl) getCompletedIDs() []string {
+	r.RLock()
+	defer r.RUnlock()
+	return r.getIDs(r.completed)
+}
+
+func (r *queryRegistryImpl) hasUnblockedQuery() bool {
+	r.RLock()
+	defer r.RUnlock()
+	return len(r.unblocked) > 0
+}
+
+func (r *queryRegistryImpl) getUnblockedIDs() []string {
+	r.RLock()
+	defer r.RUnlock()
+	return r.getIDs(r.unblocked)
+}
+
+func (r *queryRegistryImpl) hasFailedQuery() bool {
+	r.RLock()
+	defer r.RUnlock()
+	return len(r.failed) > 0
+}
+
+func (r *queryRegistryImpl) getFailedIDs() []string {
+	r.RLock()
+	defer r.RUnlock()
+	return r.getIDs(r.failed)
+}
+
+func (r *queryRegistryImpl) getQueryTermCh(id string) (<-chan struct{}, error) {
+	r.RLock()
+	defer r.RUnlock()
+	q, err := r.getQueryNoLock(id)
+	if err != nil {
+		return nil, err
+	}
+	return q.getQueryTermCh(), nil
+}
+
+func (r *queryRegistryImpl) getQueryInput(id string) (*shared.WorkflowQuery, error) {
+	r.RLock()
+	defer r.RUnlock()
+	q, err := r.getQueryNoLock(id)
+	if err != nil {
+		return nil, err
+	}
+	return q.getQueryInput(), nil
+}
+
+func (r *queryRegistryImpl) getTerminationState(id string) (*queryTerminationState, error) {
+	r.RLock()
+	defer r.RUnlock()
+	q, err := r.getQueryNoLock(id)
+	if err != nil {
+		return nil, err
+	}
+	return q.getTerminationState()
+}
+
+func (r *queryRegistryImpl) bufferQuery(queryInput *shared.WorkflowQuery) (string, <-chan struct{}) {
 	r.Lock()
 	defer r.Unlock()
+	q := newQuery(queryInput)
+	id := q.getQueryID()
+	r.buffered[id] = q
+	return id, q.getQueryTermCh()
+}
 
+func (r *queryRegistryImpl) setTerminationState(id string, terminationState *queryTerminationState) error {
+	r.Lock()
+	defer r.Unlock()
+	q, ok := r.buffered[id]
+	if !ok {
+		return errQueryNotExists
+	}
+	if err := q.setTerminationState(terminationState); err != nil {
+		return err
+	}
 	delete(r.buffered, id)
-	delete(r.started, id)
-}
-
-func (r *queryRegistry) bufferedToStartedCallback(id string) error {
-	r.Lock()
-	defer r.Unlock()
-
-	return move(r.buffered, r.started, id)
-}
-
-func (r *queryRegistry) startedToBufferedCallback(id string) error {
-	r.Lock()
-	defer r.Unlock()
-
-	return move(r.started, r.buffered, id)
-}
-
-func move(source map[string]Query, target map[string]Query, key string) error {
-	if _, ok := source[key]; !ok {
-		return errQueryNotFound
+	switch terminationState.queryTerminationType {
+	case queryTerminationTypeCompleted:
+		r.completed[id] = q
+	case queryTerminationTypeUnblocked:
+		r.unblocked[id] = q
+	case queryTerminationTypeFailed:
+		r.failed[id] = q
 	}
-	if _, ok := target[key]; ok {
-		return errQueryAlreadyInState
-	}
-	target[key] = source[key]
-	delete(source, key)
 	return nil
+}
+
+func (r *queryRegistryImpl) removeQuery(id string) {
+	r.Lock()
+	defer r.Unlock()
+	delete(r.buffered, id)
+	delete(r.completed, id)
+	delete(r.unblocked, id)
+	delete(r.failed, id)
+}
+
+func (r *queryRegistryImpl) getQueryNoLock(id string) (query, error) {
+	if q, ok := r.buffered[id]; ok {
+		return q, nil
+	}
+	if q, ok := r.completed[id]; ok {
+		return q, nil
+	}
+	if q, ok := r.unblocked[id]; ok {
+		return q, nil
+	}
+	if q, ok := r.failed[id]; ok {
+		return q, nil
+	}
+	return nil, errQueryNotExists
+}
+
+func (r *queryRegistryImpl) getIDs(m map[string]query) []string {
+	result := make([]string, len(m), len(m))
+	index := 0
+	for id := range m {
+		result[index] = id
+		index++
+	}
+	return result
 }

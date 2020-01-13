@@ -23,11 +23,14 @@ package cassandra
 import (
 	"fmt"
 	"log"
-	"path"
+
+	"github.com/uber/cadence/common/auth"
+
+	"github.com/urfave/cli"
 
 	"github.com/uber/cadence/common/service/config"
+	"github.com/uber/cadence/schema/cassandra"
 	"github.com/uber/cadence/tools/common/schema"
-	"github.com/urfave/cli"
 )
 
 const defaultNumReplicas = 1
@@ -43,38 +46,48 @@ type SetupSchemaConfig struct {
 // In most cases, the versions should match. However if after a schema upgrade there is a code
 // rollback, the code version (expected version) would fall lower than the actual version in
 // cassandra.
-func VerifyCompatibleVersion(cfg config.Persistence, rootPath string) error {
+func VerifyCompatibleVersion(
+	cfg config.Persistence,
+) error {
+
 	ds, ok := cfg.DataStores[cfg.DefaultStore]
 	if ok && ds.Cassandra != nil {
-		schemaPath := path.Join(rootPath, "schema/cassandra/cadence/versioned")
-		err := checkCompatibleVersion(*ds.Cassandra, ds.Cassandra.Keyspace, schemaPath)
+		err := checkCompatibleVersion(*ds.Cassandra, cassandra.Version)
 		if err != nil {
 			return err
 		}
 	}
 	ds, ok = cfg.DataStores[cfg.VisibilityStore]
 	if ok && ds.Cassandra != nil {
-		schemaPath := path.Join(rootPath, "schema/cassandra/visibility/versioned")
-		return checkCompatibleVersion(*ds.Cassandra, ds.Cassandra.Keyspace, schemaPath)
+		err := checkCompatibleVersion(*ds.Cassandra, cassandra.VisibilityVersion)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 // checkCompatibleVersion check the version compatibility
-func checkCompatibleVersion(cfg config.Cassandra, keyspace string, dirPath string) error {
+func checkCompatibleVersion(
+	cfg config.Cassandra,
+	expectedVersion string,
+) error {
+
 	client, err := newCQLClient(&CQLClientConfig{
 		Hosts:    cfg.Hosts,
 		Port:     cfg.Port,
 		User:     cfg.User,
 		Password: cfg.Password,
-		Keyspace: keyspace,
+		Keyspace: cfg.Keyspace,
 		Timeout:  defaultTimeout,
+		TLS:      cfg.TLS,
 	})
 	if err != nil {
 		return fmt.Errorf("unable to create CQL Client: %v", err.Error())
 	}
 	defer client.Close()
-	return schema.VerifyCompatibleVersion(client, dirPath, cfg.Keyspace)
+
+	return schema.VerifyCompatibleVersion(client, cfg.Keyspace, expectedVersion)
 }
 
 // setupSchema executes the setupSchemaTask
@@ -152,9 +165,13 @@ func doDropKeyspace(cfg CQLClientConfig, name string) {
 	cfg.Keyspace = systemKeyspace
 	client, err := newCQLClient(&cfg)
 	if err != nil {
+		logErr(fmt.Errorf("error creating client: %v", err))
 		return
 	}
-	client.dropKeyspace(name)
+	err = client.dropKeyspace(name)
+	if err != nil {
+		logErr(fmt.Errorf("error dropping keyspace %v: %v", name, err))
+	}
 	client.Close()
 }
 
@@ -167,6 +184,17 @@ func newCQLClientConfig(cli *cli.Context) (*CQLClientConfig, error) {
 	config.Timeout = cli.GlobalInt(schema.CLIOptTimeout)
 	config.Keyspace = cli.GlobalString(schema.CLIOptKeyspace)
 	config.numReplicas = cli.Int(schema.CLIOptReplicationFactor)
+
+	if cli.GlobalBool(schema.CLIFlagEnableTLS) {
+		config.TLS = &auth.TLS{
+			Enabled:                true,
+			CertFile:               cli.GlobalString(schema.CLIFlagTLSCertFile),
+			KeyFile:                cli.GlobalString(schema.CLIFlagTLSKeyFile),
+			CaFile:                 cli.GlobalString(schema.CLIFlagTLSCaFile),
+			EnableHostVerification: cli.GlobalBool(schema.CLIFlagTLSEnableHostVerification),
+		}
+	}
+
 	isDryRun := cli.Bool(schema.CLIOptDryrun)
 	if err := validateCQLClientConfig(config, isDryRun); err != nil {
 		return nil, err
@@ -201,4 +229,8 @@ func flag(opt string) string {
 func handleErr(err error) error {
 	log.Println(err)
 	return err
+}
+
+func logErr(err error) {
+	log.Println(err)
 }

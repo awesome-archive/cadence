@@ -26,32 +26,30 @@ import (
 	"time"
 
 	"github.com/uber-go/tally"
+
 	"github.com/uber/cadence/.gen/go/health"
+	"github.com/uber/cadence/.gen/go/health/metaserver"
 	m "github.com/uber/cadence/.gen/go/matching"
 	"github.com/uber/cadence/.gen/go/matching/matchingserviceserver"
 	gen "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/metrics"
-	"github.com/uber/cadence/common/persistence"
 	"github.com/uber/cadence/common/quotas"
-	"github.com/uber/cadence/common/service"
+	"github.com/uber/cadence/common/resource"
 )
 
 var _ matchingserviceserver.Interface = (*Handler)(nil)
 
-// Handler - Thrift handler inteface for history service
+// Handler - Thrift handler interface for history service
 type Handler struct {
-	taskPersistence persistence.TaskManager
-	metadataMgr     persistence.MetadataManager
-	engine          Engine
-	config          *Config
-	metricsClient   metrics.Client
-	startWG         sync.WaitGroup
-	domainCache     cache.DomainCache
-	rateLimiter     quotas.Limiter
-	service.Service
+	resource.Resource
+
+	engine        Engine
+	config        *Config
+	metricsClient metrics.Client
+	startWG       sync.WaitGroup
+	rateLimiter   quotas.Limiter
 }
 
 var (
@@ -59,15 +57,27 @@ var (
 )
 
 // NewHandler creates a thrift handler for the history service
-func NewHandler(sVice service.Service, config *Config, taskPersistence persistence.TaskManager, metadataMgr persistence.MetadataManager) *Handler {
+func NewHandler(
+	resource resource.Resource,
+	config *Config,
+) *Handler {
 	handler := &Handler{
-		Service:         sVice,
-		taskPersistence: taskPersistence,
-		metadataMgr:     metadataMgr,
-		config:          config,
+		Resource:      resource,
+		config:        config,
+		metricsClient: resource.GetMetricsClient(),
 		rateLimiter: quotas.NewDynamicRateLimiter(func() float64 {
 			return float64(config.RPS())
 		}),
+		engine: NewEngine(
+			resource.GetTaskManager(),
+			resource.GetHistoryClient(),
+			resource.GetMatchingClient(),
+			config,
+			resource.GetLogger(),
+			resource.GetMetricsClient(),
+			resource.GetDomainCache(),
+			resource.GetMatchingServiceResolver(),
+		),
 	}
 	// prevent us from trying to serve requests before matching engine is started and ready
 	handler.startWG.Add(1)
@@ -76,40 +86,18 @@ func NewHandler(sVice service.Service, config *Config, taskPersistence persisten
 
 // RegisterHandler register this handler, must be called before Start()
 func (h *Handler) RegisterHandler() {
-	h.Service.GetDispatcher().Register(matchingserviceserver.New(h))
+	h.Resource.GetDispatcher().Register(matchingserviceserver.New(h))
+	h.Resource.GetDispatcher().Register(metaserver.New(h))
 }
 
 // Start starts the handler
-func (h *Handler) Start() error {
-	h.Service.Start()
-
-	h.domainCache = cache.NewDomainCache(h.metadataMgr, h.GetClusterMetadata(), h.GetMetricsClient(), h.GetLogger())
-	h.domainCache.Start()
-	h.metricsClient = h.Service.GetMetricsClient()
-	client, err := h.Service.GetClientBean().GetMatchingClient(h.domainCache.GetDomainName)
-	if err != nil {
-		return err
-	}
-	h.engine = NewEngine(
-		h.taskPersistence,
-		h.GetClientBean().GetHistoryClient(),
-		client,
-		h.config,
-		h.Service.GetLogger(),
-		h.Service.GetMetricsClient(),
-		h.domainCache,
-	)
+func (h *Handler) Start() {
 	h.startWG.Done()
-	return nil
 }
 
 // Stop stops the handler
 func (h *Handler) Stop() {
 	h.engine.Stop()
-	h.domainCache.Stop()
-	h.taskPersistence.Close()
-	h.metadataMgr.Close()
-	h.Service.Stop()
 }
 
 // Health is for health check
@@ -195,7 +183,7 @@ func (h *Handler) PollForActivityTask(ctx context.Context,
 	if _, err := common.ValidateLongPollContextTimeoutIsSet(
 		ctx,
 		"PollForActivityTask",
-		h.Service.GetThrottledLogger(),
+		h.Resource.GetThrottledLogger(),
 	); err != nil {
 		return nil, h.handleErr(err, scope)
 	}
@@ -224,7 +212,7 @@ func (h *Handler) PollForDecisionTask(ctx context.Context,
 	if _, err := common.ValidateLongPollContextTimeoutIsSet(
 		ctx,
 		"PollForDecisionTask",
-		h.Service.GetThrottledLogger(),
+		h.Resource.GetThrottledLogger(),
 	); err != nil {
 		return nil, h.handleErr(err, scope)
 	}
@@ -296,6 +284,21 @@ func (h *Handler) DescribeTaskList(ctx context.Context, request *m.DescribeTaskL
 	}
 
 	response, err := h.engine.DescribeTaskList(ctx, request)
+	return response, h.handleErr(err, scope)
+}
+
+// ListTaskListPartitions returns information about partitions for a taskList
+func (h *Handler) ListTaskListPartitions(ctx context.Context, request *m.ListTaskListPartitionsRequest) (resp *gen.ListTaskListPartitionsResponse, retError error) {
+	defer log.CapturePanic(h.GetLogger(), &retError)
+	scope := metrics.MatchingListTaskListPartitionsScope
+	sw := h.startRequestProfile("ListTaskListPartitions", scope)
+	defer sw.Stop()
+
+	if ok := h.rateLimiter.Allow(); !ok {
+		return nil, h.handleErr(errMatchingHostThrottle, scope)
+	}
+
+	response, err := h.engine.ListTaskListPartitions(ctx, request)
 	return response, h.handleErr(err, scope)
 }
 

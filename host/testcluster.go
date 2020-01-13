@@ -25,7 +25,10 @@ import (
 	"os"
 
 	"github.com/uber-go/tally"
+	"go.uber.org/zap"
+
 	"github.com/uber/cadence/client"
+	adminClient "github.com/uber/cadence/client/admin"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/archiver"
 	"github.com/uber/cadence/common/archiver/filestore"
@@ -40,9 +43,9 @@ import (
 	"github.com/uber/cadence/common/persistence"
 	pes "github.com/uber/cadence/common/persistence/elasticsearch"
 	persistencetests "github.com/uber/cadence/common/persistence/persistence-tests"
+	"github.com/uber/cadence/common/persistence/sql/sqlplugin/mysql"
 	"github.com/uber/cadence/common/service/config"
 	"github.com/uber/cadence/common/service/dynamicconfig"
-	"go.uber.org/zap"
 )
 
 type (
@@ -66,7 +69,7 @@ type (
 	// TestClusterConfig are config for a test cluster
 	TestClusterConfig struct {
 		FrontendAddress       string
-		EnableEventsV2        bool
+		EnableNDC             bool
 		EnableArchival        bool
 		IsMasterCluster       bool
 		ClusterNo             int
@@ -76,6 +79,7 @@ type (
 		HistoryConfig         *HistoryConfig
 		ESConfig              *elasticsearch.Config
 		WorkerConfig          *WorkerConfig
+		MockAdminClient       map[string]adminClient.Client
 	}
 
 	// MessagingClientConfig is the config for messaging config
@@ -114,6 +118,20 @@ func NewCluster(options *TestClusterConfig, logger log.Logger) (*TestCluster, er
 	}
 
 	options.Persistence.StoreType = TestFlags.PersistenceType
+	if TestFlags.PersistenceType == config.StoreTypeSQL {
+		var ops *persistencetests.TestBaseOptions
+		if TestFlags.SQLPluginName == mysql.PluginName {
+			ops = mysql.GetTestClusterOption()
+		} else {
+			panic("not supported plugin " + TestFlags.SQLPluginName)
+		}
+		options.Persistence.SQLDBPluginName = TestFlags.SQLPluginName
+		options.Persistence.DBUsername = ops.DBUsername
+		options.Persistence.DBPassword = ops.DBPassword
+		options.Persistence.DBHost = ops.DBHost
+		options.Persistence.DBPort = ops.DBPort
+		options.Persistence.SchemaDir = ops.SchemaDir
+	}
 	options.Persistence.ClusterMetadata = clusterMetadata
 	testBase := persistencetests.NewTestBase(&options.Persistence)
 	testBase.Setup()
@@ -154,23 +172,22 @@ func NewCluster(options *TestClusterConfig, logger log.Logger) (*TestCluster, er
 		PersistenceConfig:   pConfig,
 		DispatcherProvider:  client.NewDNSYarpcDispatcherProvider(logger, 0),
 		MessagingClient:     messagingClient,
-		MetadataMgr:         testBase.MetadataProxy,
-		MetadataMgrV2:       testBase.MetadataManagerV2,
+		MetadataMgr:         testBase.MetadataManager,
 		ShardMgr:            testBase.ShardMgr,
-		HistoryMgr:          testBase.HistoryMgr,
 		HistoryV2Mgr:        testBase.HistoryV2Mgr,
 		ExecutionMgrFactory: testBase.ExecutionMgrFactory,
 		TaskMgr:             testBase.TaskMgr,
 		VisibilityMgr:       visibilityMgr,
 		Logger:              logger,
 		ClusterNo:           options.ClusterNo,
-		EnableEventsV2:      options.EnableEventsV2,
+		EnableNDC:           options.EnableNDC,
 		ESConfig:            options.ESConfig,
 		ESClient:            esClient,
 		ArchiverMetadata:    archiverBase.metadata,
 		ArchiverProvider:    archiverBase.provider,
 		HistoryConfig:       options.HistoryConfig,
 		WorkerConfig:        options.WorkerConfig,
+		MockAdminClient:     options.MockAdminClient,
 	}
 	cluster := NewCadence(cadenceParams)
 	if err := cluster.Start(); err != nil {
@@ -264,4 +281,14 @@ func (tc *TestCluster) GetFrontendClient() FrontendClient {
 // GetAdminClient returns an admin client from the test cluster
 func (tc *TestCluster) GetAdminClient() AdminClient {
 	return tc.host.GetAdminClient()
+}
+
+// GetHistoryClient returns a history client from the test cluster
+func (tc *TestCluster) GetHistoryClient() HistoryClient {
+	return tc.host.GetHistoryClient()
+}
+
+// GetExecutionManagerFactory returns an execution manager factory from the test cluster
+func (tc *TestCluster) GetExecutionManagerFactory() persistence.ExecutionManagerFactory {
+	return tc.host.GetExecutionManagerFactory()
 }

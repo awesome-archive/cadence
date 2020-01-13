@@ -21,112 +21,73 @@
 package sql
 
 import (
-	"fmt"
-	"time"
-
-	"github.com/jmoiron/sqlx"
+	"github.com/uber/cadence/common/persistence/sql"
+	"github.com/uber/cadence/common/persistence/sql/sqlplugin"
+	"github.com/uber/cadence/common/service/config"
 	"github.com/uber/cadence/tools/common/schema"
-	"github.com/uber/cadence/tools/sql/mysql"
 )
 
 type (
-	sqlConnectParams struct {
-		host       string
-		port       int
-		user       string
-		password   string
-		database   string
-		driverName string
-	}
-	sqlConn struct {
-		database string
-		db       *sqlx.DB
+	// Connection is the connection to database
+	Connection struct {
+		dbName  string
+		adminDb sqlplugin.AdminDB
 	}
 )
 
-const (
-	defaultSQLPort              = 3306
-	readSchemaVersionSQL        = `SELECT curr_version from schema_version where db_name=?`
-	writeSchemaVersionSQL       = `REPLACE into schema_version(db_name, creation_time, curr_version, min_compatible_version) VALUES (?,?,?,?)`
-	writeSchemaUpdateHistorySQL = `INSERT into schema_update_history(year, month, update_time, old_version, new_version, manifest_md5, description) VALUES(?,?,?,?,?,?,?)`
+var _ schema.DB = (*Connection)(nil)
 
-	createSchemaVersionTableSQL = `CREATE TABLE schema_version(db_name VARCHAR(255) not null PRIMARY KEY, ` +
-		`creation_time DATETIME(6), ` +
-		`curr_version VARCHAR(64), ` +
-		`min_compatible_version VARCHAR(64));`
-
-	createSchemaUpdateHistoryTableSQL = `CREATE TABLE schema_update_history(` +
-		`year int not null, ` +
-		`month int not null, ` +
-		`update_time DATETIME(6) not null, ` +
-		`description VARCHAR(255), ` +
-		`manifest_md5 VARCHAR(64), ` +
-		`new_version VARCHAR(64), ` +
-		`old_version VARCHAR(64), ` +
-		`PRIMARY KEY (year, month, update_time));`
-)
-
-var _ schema.DB = (*sqlConn)(nil)
-
-func newConn(params *sqlConnectParams) (*sqlConn, error) {
-	if params.driverName != mysql.DriverName {
-		return nil, fmt.Errorf("unsupported database driver: %v", params.driverName)
-	}
-	db, err := mysql.NewConnection(params.host, params.port, params.user, params.password, params.database)
+// NewConnection creates a new connection to database
+func NewConnection(cfg *config.SQL) (*Connection, error) {
+	db, err := sql.NewSQLAdminDB(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &sqlConn{db: db, database: params.database}, nil
+
+	return &Connection{
+		adminDb: db,
+		dbName:  cfg.DatabaseName,
+	}, nil
 }
 
 // CreateSchemaVersionTables sets up the schema version tables
-func (c *sqlConn) CreateSchemaVersionTables() error {
-	if err := c.Exec(createSchemaVersionTableSQL); err != nil {
-		return err
-	}
-	return c.Exec(createSchemaUpdateHistoryTableSQL)
+func (c *Connection) CreateSchemaVersionTables() error {
+	return c.adminDb.CreateSchemaVersionTables()
 }
 
 // ReadSchemaVersion returns the current schema version for the keyspace
-func (c *sqlConn) ReadSchemaVersion() (string, error) {
-	var version string
-	err := c.db.Get(&version, readSchemaVersionSQL, c.database)
-	return version, err
+func (c *Connection) ReadSchemaVersion() (string, error) {
+	return c.adminDb.ReadSchemaVersion(c.dbName)
 }
 
-// UpdateShemaVersion updates the schema version for the keyspace
-func (c *sqlConn) UpdateSchemaVersion(newVersion string, minCompatibleVersion string) error {
-	_, err := c.db.Exec(writeSchemaVersionSQL, c.database, time.Now(), newVersion, minCompatibleVersion)
-	return err
+// UpdateSchemaVersion updates the schema version for the keyspace
+func (c *Connection) UpdateSchemaVersion(newVersion string, minCompatibleVersion string) error {
+	return c.adminDb.UpdateSchemaVersion(c.dbName, newVersion, minCompatibleVersion)
 }
 
 // WriteSchemaUpdateLog adds an entry to the schema update history table
-func (c *sqlConn) WriteSchemaUpdateLog(oldVersion string, newVersion string, manifestMD5 string, desc string) error {
-	now := time.Now().UTC()
-	_, err := c.db.Exec(writeSchemaUpdateHistorySQL, now.Year(), int(now.Month()), now, oldVersion, newVersion, manifestMD5, desc)
-	return err
+func (c *Connection) WriteSchemaUpdateLog(oldVersion string, newVersion string, manifestMD5 string, desc string) error {
+	return c.adminDb.WriteSchemaUpdateLog(oldVersion, newVersion, manifestMD5, desc)
 }
 
 // Exec executes a sql statement
-func (c *sqlConn) Exec(stmt string) error {
-	_, err := c.db.Exec(stmt)
+func (c *Connection) Exec(stmt string, args ...interface{}) error {
+	err := c.adminDb.Exec(stmt, args...)
 	return err
 }
 
 // ListTables returns a list of tables in this database
-func (c *sqlConn) ListTables() ([]string, error) {
-	var tables []string
-	err := c.db.Select(&tables, fmt.Sprintf("SHOW TABLES FROM %v", c.database))
-	return tables, err
+func (c *Connection) ListTables() ([]string, error) {
+	return c.adminDb.ListTables(c.dbName)
 }
 
 // DropTable drops a given table from the database
-func (c *sqlConn) DropTable(name string) error {
-	return c.Exec(fmt.Sprintf("DROP TABLE %v", name))
+func (c *Connection) DropTable(name string) error {
+	return c.adminDb.DropTable(name)
 }
 
 // DropAllTables drops all tables from this database
-func (c *sqlConn) DropAllTables() error {
+func (c *Connection) DropAllTables() error {
 	tables, err := c.ListTables()
 	if err != nil {
 		return err
@@ -140,18 +101,21 @@ func (c *sqlConn) DropAllTables() error {
 }
 
 // CreateDatabase creates a database if it doesn't exist
-func (c *sqlConn) CreateDatabase(name string) error {
-	return c.Exec(fmt.Sprintf("CREATE database %v CHARACTER SET UTF8", name))
+func (c *Connection) CreateDatabase(name string) error {
+	return c.adminDb.CreateDatabase(name)
 }
 
 // DropDatabase drops a database
-func (c *sqlConn) DropDatabase(name string) error {
-	return c.Exec(fmt.Sprintf("DROP database %v", name))
+func (c *Connection) DropDatabase(name string) error {
+	return c.adminDb.DropDatabase(name)
 }
 
 // Close closes the sql client
-func (c *sqlConn) Close() {
-	if c.db != nil {
-		c.db.Close()
+func (c *Connection) Close() {
+	if c.adminDb != nil {
+		err := c.adminDb.Close()
+		if err != nil {
+			panic("cannot close connection")
+		}
 	}
 }

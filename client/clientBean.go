@@ -18,6 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -copyright_file ../LICENSE -package $GOPACKAGE -source $GOFILE -destination clientBean_mock.go -self_package github.com/uber/cadence/client
+
 package client
 
 import (
@@ -29,6 +31,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.uber.org/yarpc"
+	"go.uber.org/yarpc/api/peer"
+	"go.uber.org/yarpc/api/transport"
+	"go.uber.org/yarpc/peer/roundrobin"
+	"go.uber.org/yarpc/transport/tchannel"
+
 	"github.com/uber/cadence/client/admin"
 	"github.com/uber/cadence/client/frontend"
 	"github.com/uber/cadence/client/history"
@@ -36,11 +44,6 @@ import (
 	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
-	"go.uber.org/yarpc"
-	"go.uber.org/yarpc/api/peer"
-	"go.uber.org/yarpc/api/transport"
-	"go.uber.org/yarpc/peer/roundrobin"
-	"go.uber.org/yarpc/transport/tchannel"
 )
 
 const (
@@ -51,10 +54,15 @@ type (
 	// Bean in an collection of clients
 	Bean interface {
 		GetHistoryClient() history.Client
+		SetHistoryClient(client history.Client)
 		GetMatchingClient(domainIDToName DomainIDToNameFunc) (matching.Client, error)
+		SetMatchingClient(client matching.Client)
 		GetFrontendClient() frontend.Client
+		SetFrontendClient(client frontend.Client)
 		GetRemoteAdminClient(cluster string) admin.Client
+		SetRemoteAdminClient(cluster string, client admin.Client)
 		GetRemoteFrontendClient(cluster string) frontend.Client
+		SetRemoteFrontendClient(cluster string, client frontend.Client)
 	}
 
 	// DispatcherProvider provides a diapatcher to a given address
@@ -105,6 +113,10 @@ func NewClientBean(factory Factory, dispatcherProvider DispatcherProvider, clust
 	remoteAdminClients := map[string]admin.Client{}
 	remoteFrontendClients := map[string]frontend.Client{}
 	for clusterName, info := range clusterMetadata.GetAllClusterInfo() {
+		if !info.Enabled {
+			continue
+		}
+
 		dispatcher, err := dispatcherProvider.Get(info.RPCName, info.RPCAddress)
 		if err != nil {
 			return nil, err
@@ -146,6 +158,13 @@ func (h *clientBeanImpl) GetHistoryClient() history.Client {
 	return h.historyClient
 }
 
+func (h *clientBeanImpl) SetHistoryClient(
+	client history.Client,
+) {
+
+	h.historyClient = client
+}
+
 func (h *clientBeanImpl) GetMatchingClient(domainIDToName DomainIDToNameFunc) (matching.Client, error) {
 	if client := h.matchingClient.Load(); client != nil {
 		return client.(matching.Client), nil
@@ -153,8 +172,22 @@ func (h *clientBeanImpl) GetMatchingClient(domainIDToName DomainIDToNameFunc) (m
 	return h.lazyInitMatchingClient(domainIDToName)
 }
 
+func (h *clientBeanImpl) SetMatchingClient(
+	client matching.Client,
+) {
+
+	h.matchingClient.Store(client)
+}
+
 func (h *clientBeanImpl) GetFrontendClient() frontend.Client {
 	return h.frontendClient
+}
+
+func (h *clientBeanImpl) SetFrontendClient(
+	client frontend.Client,
+) {
+
+	h.frontendClient = client
 }
 
 func (h *clientBeanImpl) GetRemoteAdminClient(cluster string) admin.Client {
@@ -169,6 +202,14 @@ func (h *clientBeanImpl) GetRemoteAdminClient(cluster string) admin.Client {
 	return client
 }
 
+func (h *clientBeanImpl) SetRemoteAdminClient(
+	cluster string,
+	client admin.Client,
+) {
+
+	h.remoteAdminClients[cluster] = client
+}
+
 func (h *clientBeanImpl) GetRemoteFrontendClient(cluster string) frontend.Client {
 	client, ok := h.remoteFrontendClients[cluster]
 	if !ok {
@@ -179,6 +220,14 @@ func (h *clientBeanImpl) GetRemoteFrontendClient(cluster string) frontend.Client
 		))
 	}
 	return client
+}
+
+func (h *clientBeanImpl) SetRemoteFrontendClient(
+	cluster string,
+	client frontend.Client,
+) {
+
+	h.remoteFrontendClients[cluster] = client
 }
 
 func (h *clientBeanImpl) lazyInitMatchingClient(domainIDToName DomainIDToNameFunc) (matching.Client, error) {

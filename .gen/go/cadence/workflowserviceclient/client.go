@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 // 
-// Copyright (c) 2017 Uber Technologies, Inc.
+// Copyright (c) 2019 Uber Technologies, Inc.
 // 
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -28,7 +28,6 @@ package workflowserviceclient
 import (
 	context "context"
 	cadence "github.com/uber/cadence/.gen/go/cadence"
-	replicator "github.com/uber/cadence/.gen/go/replicator"
 	shared "github.com/uber/cadence/.gen/go/shared"
 	wire "go.uber.org/thriftrw/wire"
 	yarpc "go.uber.org/yarpc"
@@ -69,11 +68,10 @@ type Interface interface {
 		opts ...yarpc.CallOption,
 	) (*shared.DescribeWorkflowExecutionResponse, error)
 
-	GetReplicationMessages(
+	GetClusterInfo(
 		ctx context.Context,
-		Request *replicator.GetReplicationMessagesRequest,
 		opts ...yarpc.CallOption,
-	) (*replicator.GetReplicationMessagesResponse, error)
+	) (*shared.ClusterInfo, error)
 
 	GetSearchAttributes(
 		ctx context.Context,
@@ -109,6 +107,12 @@ type Interface interface {
 		ListRequest *shared.ListOpenWorkflowExecutionsRequest,
 		opts ...yarpc.CallOption,
 	) (*shared.ListOpenWorkflowExecutionsResponse, error)
+
+	ListTaskListPartitions(
+		ctx context.Context,
+		Request *shared.ListTaskListPartitionsRequest,
+		opts ...yarpc.CallOption,
+	) (*shared.ListTaskListPartitionsResponse, error)
 
 	ListWorkflowExecutions(
 		ctx context.Context,
@@ -400,13 +404,12 @@ func (c client) DescribeWorkflowExecution(
 	return
 }
 
-func (c client) GetReplicationMessages(
+func (c client) GetClusterInfo(
 	ctx context.Context,
-	_Request *replicator.GetReplicationMessagesRequest,
 	opts ...yarpc.CallOption,
-) (success *replicator.GetReplicationMessagesResponse, err error) {
+) (success *shared.ClusterInfo, err error) {
 
-	args := cadence.WorkflowService_GetReplicationMessages_Helper.Args(_Request)
+	args := cadence.WorkflowService_GetClusterInfo_Helper.Args()
 
 	var body wire.Value
 	body, err = c.c.Call(ctx, args, opts...)
@@ -414,12 +417,12 @@ func (c client) GetReplicationMessages(
 		return
 	}
 
-	var result cadence.WorkflowService_GetReplicationMessages_Result
+	var result cadence.WorkflowService_GetClusterInfo_Result
 	if err = result.FromWire(body); err != nil {
 		return
 	}
 
-	success, err = cadence.WorkflowService_GetReplicationMessages_Helper.UnwrapResponse(&result)
+	success, err = cadence.WorkflowService_GetClusterInfo_Helper.UnwrapResponse(&result)
 	return
 }
 
@@ -557,6 +560,29 @@ func (c client) ListOpenWorkflowExecutions(
 	}
 
 	success, err = cadence.WorkflowService_ListOpenWorkflowExecutions_Helper.UnwrapResponse(&result)
+	return
+}
+
+func (c client) ListTaskListPartitions(
+	ctx context.Context,
+	_Request *shared.ListTaskListPartitionsRequest,
+	opts ...yarpc.CallOption,
+) (success *shared.ListTaskListPartitionsResponse, err error) {
+
+	args := cadence.WorkflowService_ListTaskListPartitions_Helper.Args(_Request)
+
+	var body wire.Value
+	body, err = c.c.Call(ctx, args, opts...)
+	if err != nil {
+		return
+	}
+
+	var result cadence.WorkflowService_ListTaskListPartitions_Result
+	if err = result.FromWire(body); err != nil {
+		return
+	}
+
+	success, err = cadence.WorkflowService_ListTaskListPartitions_Helper.UnwrapResponse(&result)
 	return
 }
 

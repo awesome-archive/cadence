@@ -23,8 +23,8 @@ package history
 import (
 	"testing"
 
+	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
@@ -32,28 +32,25 @@ import (
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
-	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/log/loggerimpl"
 	"github.com/uber/cadence/common/persistence"
 )
 
 type (
 	historyBuilderSuite struct {
 		suite.Suite
-		// override suite.Suite.Assertions with require.Assertions; this means that s.NotNil(nil) will stop the test,
-		// not merely log an error
-
-		mockDomainCache *cache.DomainCacheMock
-
 		*require.Assertions
-		domainID        string
-		domainEntry     *cache.DomainCacheEntry
-		msBuilder       mutableState
-		builder         *historyBuilder
-		mockShard       *shardContextImpl
-		mockEventsCache *MockEventsCache
-		logger          log.Logger
+
+		controller      *gomock.Controller
+		mockShard       *shardContextTest
+		mockEventsCache *MockeventsCache
+		mockDomainCache *cache.MockDomainCache
+
+		domainID    string
+		domainEntry *cache.DomainCacheEntry
+		msBuilder   mutableState
+		builder     *historyBuilder
+		logger      log.Logger
 	}
 )
 
@@ -63,28 +60,38 @@ func TestHistoryBuilderSuite(t *testing.T) {
 }
 
 func (s *historyBuilderSuite) SetupTest() {
-	s.logger = loggerimpl.NewDevelopmentForTest(s.Suite)
-	s.mockDomainCache = &cache.DomainCacheMock{}
-	// Have to define our overridden assertions in the test setup. If we did it earlier, s.T() will return nil
 	s.Assertions = require.New(s.T())
-	s.domainID = validDomainID
-	s.domainEntry = cache.NewLocalDomainCacheEntryForTest(&persistence.DomainInfo{ID: s.domainID}, &persistence.DomainConfig{}, "", nil)
-	s.mockShard = &shardContextImpl{
-		shardInfo:                 &persistence.ShardInfo{ShardID: 0, RangeID: 1, TransferAckLevel: 0},
-		transferSequenceNumber:    1,
-		maxTransferSequenceNumber: 100000,
-		closeCh:                   make(chan int, 100),
-		config:                    NewDynamicConfigForTest(),
-		logger:                    s.logger,
-		timeSource:                clock.NewRealTimeSource(),
-		domainCache:               s.mockDomainCache,
-	}
-	s.mockEventsCache = &MockEventsCache{}
-	s.msBuilder = newMutableStateBuilder(s.mockShard, s.mockEventsCache,
-		s.logger, "")
-	s.builder = newHistoryBuilder(s.msBuilder, s.logger)
 
-	s.mockDomainCache.On("GetDomain", mock.Anything).Return(s.domainEntry, nil).Maybe()
+	s.controller = gomock.NewController(s.T())
+	s.mockShard = newTestShardContext(
+		s.controller,
+		&persistence.ShardInfo{
+			ShardID:          0,
+			RangeID:          1,
+			TransferAckLevel: 0,
+		},
+		NewDynamicConfigForTest(),
+	)
+
+	s.mockDomainCache = s.mockShard.resource.DomainCache
+	s.mockEventsCache = s.mockShard.mockEventsCache
+	s.mockDomainCache.EXPECT().GetDomain(gomock.Any()).Return(s.domainEntry, nil).AnyTimes()
+	s.mockEventsCache.EXPECT().putEvent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	s.logger = s.mockShard.GetLogger()
+
+	// Have to define our overridden assertions in the test setup. If we did it earlier, s.T() will return nil
+	s.domainID = testDomainID
+	s.domainEntry = cache.NewLocalDomainCacheEntryForTest(&persistence.DomainInfo{ID: s.domainID}, &persistence.DomainConfig{}, "", nil)
+
+	s.msBuilder = newMutableStateBuilder(s.mockShard, s.mockEventsCache,
+		s.logger, testLocalDomainEntry)
+	s.builder = newHistoryBuilder(s.msBuilder, s.logger)
+}
+
+func (s *historyBuilderSuite) TearDownTest() {
+	s.controller.Finish()
+	s.mockShard.Finish(s.T())
 }
 
 func (s *historyBuilderSuite) TestHistoryBuilderDynamicSuccess() {
@@ -258,7 +265,6 @@ func (s *historyBuilderSuite) TestHistoryBuilderWorkflowStartFailures() {
 	s.Equal(common.EmptyEventID, s.getPreviousDecisionStartedEventID())
 
 	_, err := s.msBuilder.AddWorkflowExecutionStartedEvent(
-		s.domainEntry,
 		we,
 		&history.StartWorkflowExecutionRequest{
 			DomainUUID: common.StringPtr(s.domainID),
@@ -526,7 +532,7 @@ func (s *historyBuilderSuite) TestHistoryBuilderFlushBufferedEvents() {
 	s.Equal(int64(10), s.getPreviousDecisionStartedEventID())
 
 	// flush buffered events. 12: Activity2Started, 13: Activity2Failed
-	s.msBuilder.FlushBufferedEvents()
+	s.NoError(s.msBuilder.FlushBufferedEvents())
 	s.Equal(int64(14), s.getNextEventID())
 	activity2StartedEvent2 := s.msBuilder.GetHistoryBuilder().history[11]
 	s.Equal(int64(12), activity2StartedEvent2.GetEventId())
@@ -698,8 +704,6 @@ func (s *historyBuilderSuite) getPreviousDecisionStartedEventID() int64 {
 func (s *historyBuilderSuite) addWorkflowExecutionStartedEvent(we workflow.WorkflowExecution, workflowType,
 	taskList string, input []byte, executionStartToCloseTimeout, taskStartToCloseTimeout int32,
 	identity string) *workflow.HistoryEvent {
-	s.mockEventsCache.On("putEvent", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
-		mock.Anything).Return()
 
 	request := &workflow.StartWorkflowExecutionRequest{
 		WorkflowId:                          common.StringPtr(*we.WorkflowId),
@@ -712,8 +716,8 @@ func (s *historyBuilderSuite) addWorkflowExecutionStartedEvent(we workflow.Workf
 	}
 
 	event, err := s.msBuilder.AddWorkflowExecutionStartedEvent(
-		s.domainEntry,
-		we, &history.StartWorkflowExecutionRequest{
+		we,
+		&history.StartWorkflowExecutionRequest{
 			DomainUUID:   common.StringPtr(s.domainID),
 			StartRequest: request,
 		},
@@ -754,8 +758,6 @@ func (s *historyBuilderSuite) addDecisionTaskCompletedEvent(scheduleID, startedI
 func (s *historyBuilderSuite) addActivityTaskScheduledEvent(decisionCompletedID int64, activityID, activityType,
 	taskList string, input []byte, timeout, queueTimeout, hearbeatTimeout int32) (*workflow.HistoryEvent,
 	*persistence.ActivityInfo) {
-	s.mockEventsCache.On("putEvent", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
-		mock.Anything).Return()
 	event, ai, err := s.msBuilder.AddActivityTaskScheduledEvent(decisionCompletedID,
 		&workflow.ScheduleActivityTaskDecisionAttributes{
 			ActivityId:                    common.StringPtr(activityID),

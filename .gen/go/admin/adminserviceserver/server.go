@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 // 
-// Copyright (c) 2017 Uber Technologies, Inc.
+// Copyright (c) 2019 Uber Technologies, Inc.
 // 
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -28,6 +28,7 @@ package adminserviceserver
 import (
 	context "context"
 	admin "github.com/uber/cadence/.gen/go/admin"
+	replicator "github.com/uber/cadence/.gen/go/replicator"
 	shared "github.com/uber/cadence/.gen/go/shared"
 	wire "go.uber.org/thriftrw/wire"
 	transport "go.uber.org/yarpc/api/transport"
@@ -46,6 +47,10 @@ type Interface interface {
 		Request *shared.CloseShardRequest,
 	) error
 
+	DescribeCluster(
+		ctx context.Context,
+	) (*admin.DescribeClusterResponse, error)
+
 	DescribeHistoryHost(
 		ctx context.Context,
 		Request *shared.DescribeHistoryHostRequest,
@@ -56,10 +61,35 @@ type Interface interface {
 		Request *admin.DescribeWorkflowExecutionRequest,
 	) (*admin.DescribeWorkflowExecutionResponse, error)
 
+	GetDLQReplicationMessages(
+		ctx context.Context,
+		Request *replicator.GetDLQReplicationMessagesRequest,
+	) (*replicator.GetDLQReplicationMessagesResponse, error)
+
+	GetDomainReplicationMessages(
+		ctx context.Context,
+		Request *replicator.GetDomainReplicationMessagesRequest,
+	) (*replicator.GetDomainReplicationMessagesResponse, error)
+
+	GetReplicationMessages(
+		ctx context.Context,
+		Request *replicator.GetReplicationMessagesRequest,
+	) (*replicator.GetReplicationMessagesResponse, error)
+
 	GetWorkflowExecutionRawHistory(
 		ctx context.Context,
 		GetRequest *admin.GetWorkflowExecutionRawHistoryRequest,
 	) (*admin.GetWorkflowExecutionRawHistoryResponse, error)
+
+	GetWorkflowExecutionRawHistoryV2(
+		ctx context.Context,
+		GetRequest *admin.GetWorkflowExecutionRawHistoryV2Request,
+	) (*admin.GetWorkflowExecutionRawHistoryV2Response, error)
+
+	ReapplyEvents(
+		ctx context.Context,
+		ReapplyEventsRequest *shared.ReapplyEventsRequest,
+	) error
 
 	RemoveTask(
 		ctx context.Context,
@@ -101,6 +131,17 @@ func New(impl Interface, opts ...thrift.RegisterOption) []transport.Procedure {
 			},
 
 			thrift.Method{
+				Name: "DescribeCluster",
+				HandlerSpec: thrift.HandlerSpec{
+
+					Type:  transport.Unary,
+					Unary: thrift.UnaryHandler(h.DescribeCluster),
+				},
+				Signature:    "DescribeCluster() (*admin.DescribeClusterResponse)",
+				ThriftModule: admin.ThriftModule,
+			},
+
+			thrift.Method{
 				Name: "DescribeHistoryHost",
 				HandlerSpec: thrift.HandlerSpec{
 
@@ -123,6 +164,39 @@ func New(impl Interface, opts ...thrift.RegisterOption) []transport.Procedure {
 			},
 
 			thrift.Method{
+				Name: "GetDLQReplicationMessages",
+				HandlerSpec: thrift.HandlerSpec{
+
+					Type:  transport.Unary,
+					Unary: thrift.UnaryHandler(h.GetDLQReplicationMessages),
+				},
+				Signature:    "GetDLQReplicationMessages(Request *replicator.GetDLQReplicationMessagesRequest) (*replicator.GetDLQReplicationMessagesResponse)",
+				ThriftModule: admin.ThriftModule,
+			},
+
+			thrift.Method{
+				Name: "GetDomainReplicationMessages",
+				HandlerSpec: thrift.HandlerSpec{
+
+					Type:  transport.Unary,
+					Unary: thrift.UnaryHandler(h.GetDomainReplicationMessages),
+				},
+				Signature:    "GetDomainReplicationMessages(Request *replicator.GetDomainReplicationMessagesRequest) (*replicator.GetDomainReplicationMessagesResponse)",
+				ThriftModule: admin.ThriftModule,
+			},
+
+			thrift.Method{
+				Name: "GetReplicationMessages",
+				HandlerSpec: thrift.HandlerSpec{
+
+					Type:  transport.Unary,
+					Unary: thrift.UnaryHandler(h.GetReplicationMessages),
+				},
+				Signature:    "GetReplicationMessages(Request *replicator.GetReplicationMessagesRequest) (*replicator.GetReplicationMessagesResponse)",
+				ThriftModule: admin.ThriftModule,
+			},
+
+			thrift.Method{
 				Name: "GetWorkflowExecutionRawHistory",
 				HandlerSpec: thrift.HandlerSpec{
 
@@ -130,6 +204,28 @@ func New(impl Interface, opts ...thrift.RegisterOption) []transport.Procedure {
 					Unary: thrift.UnaryHandler(h.GetWorkflowExecutionRawHistory),
 				},
 				Signature:    "GetWorkflowExecutionRawHistory(GetRequest *admin.GetWorkflowExecutionRawHistoryRequest) (*admin.GetWorkflowExecutionRawHistoryResponse)",
+				ThriftModule: admin.ThriftModule,
+			},
+
+			thrift.Method{
+				Name: "GetWorkflowExecutionRawHistoryV2",
+				HandlerSpec: thrift.HandlerSpec{
+
+					Type:  transport.Unary,
+					Unary: thrift.UnaryHandler(h.GetWorkflowExecutionRawHistoryV2),
+				},
+				Signature:    "GetWorkflowExecutionRawHistoryV2(GetRequest *admin.GetWorkflowExecutionRawHistoryV2Request) (*admin.GetWorkflowExecutionRawHistoryV2Response)",
+				ThriftModule: admin.ThriftModule,
+			},
+
+			thrift.Method{
+				Name: "ReapplyEvents",
+				HandlerSpec: thrift.HandlerSpec{
+
+					Type:  transport.Unary,
+					Unary: thrift.UnaryHandler(h.ReapplyEvents),
+				},
+				Signature:    "ReapplyEvents(ReapplyEventsRequest *shared.ReapplyEventsRequest)",
 				ThriftModule: admin.ThriftModule,
 			},
 
@@ -146,7 +242,7 @@ func New(impl Interface, opts ...thrift.RegisterOption) []transport.Procedure {
 		},
 	}
 
-	procedures := make([]transport.Procedure, 0, 6)
+	procedures := make([]transport.Procedure, 0, 12)
 	procedures = append(procedures, thrift.BuildProcedures(service, opts...)...)
 	return procedures
 }
@@ -182,6 +278,25 @@ func (h handler) CloseShard(ctx context.Context, body wire.Value) (thrift.Respon
 
 	hadError := err != nil
 	result, err := admin.AdminService_CloseShard_Helper.WrapResponse(err)
+
+	var response thrift.Response
+	if err == nil {
+		response.IsApplicationError = hadError
+		response.Body = result
+	}
+	return response, err
+}
+
+func (h handler) DescribeCluster(ctx context.Context, body wire.Value) (thrift.Response, error) {
+	var args admin.AdminService_DescribeCluster_Args
+	if err := args.FromWire(body); err != nil {
+		return thrift.Response{}, err
+	}
+
+	success, err := h.impl.DescribeCluster(ctx)
+
+	hadError := err != nil
+	result, err := admin.AdminService_DescribeCluster_Helper.WrapResponse(success, err)
 
 	var response thrift.Response
 	if err == nil {
@@ -229,6 +344,63 @@ func (h handler) DescribeWorkflowExecution(ctx context.Context, body wire.Value)
 	return response, err
 }
 
+func (h handler) GetDLQReplicationMessages(ctx context.Context, body wire.Value) (thrift.Response, error) {
+	var args admin.AdminService_GetDLQReplicationMessages_Args
+	if err := args.FromWire(body); err != nil {
+		return thrift.Response{}, err
+	}
+
+	success, err := h.impl.GetDLQReplicationMessages(ctx, args.Request)
+
+	hadError := err != nil
+	result, err := admin.AdminService_GetDLQReplicationMessages_Helper.WrapResponse(success, err)
+
+	var response thrift.Response
+	if err == nil {
+		response.IsApplicationError = hadError
+		response.Body = result
+	}
+	return response, err
+}
+
+func (h handler) GetDomainReplicationMessages(ctx context.Context, body wire.Value) (thrift.Response, error) {
+	var args admin.AdminService_GetDomainReplicationMessages_Args
+	if err := args.FromWire(body); err != nil {
+		return thrift.Response{}, err
+	}
+
+	success, err := h.impl.GetDomainReplicationMessages(ctx, args.Request)
+
+	hadError := err != nil
+	result, err := admin.AdminService_GetDomainReplicationMessages_Helper.WrapResponse(success, err)
+
+	var response thrift.Response
+	if err == nil {
+		response.IsApplicationError = hadError
+		response.Body = result
+	}
+	return response, err
+}
+
+func (h handler) GetReplicationMessages(ctx context.Context, body wire.Value) (thrift.Response, error) {
+	var args admin.AdminService_GetReplicationMessages_Args
+	if err := args.FromWire(body); err != nil {
+		return thrift.Response{}, err
+	}
+
+	success, err := h.impl.GetReplicationMessages(ctx, args.Request)
+
+	hadError := err != nil
+	result, err := admin.AdminService_GetReplicationMessages_Helper.WrapResponse(success, err)
+
+	var response thrift.Response
+	if err == nil {
+		response.IsApplicationError = hadError
+		response.Body = result
+	}
+	return response, err
+}
+
 func (h handler) GetWorkflowExecutionRawHistory(ctx context.Context, body wire.Value) (thrift.Response, error) {
 	var args admin.AdminService_GetWorkflowExecutionRawHistory_Args
 	if err := args.FromWire(body); err != nil {
@@ -239,6 +411,44 @@ func (h handler) GetWorkflowExecutionRawHistory(ctx context.Context, body wire.V
 
 	hadError := err != nil
 	result, err := admin.AdminService_GetWorkflowExecutionRawHistory_Helper.WrapResponse(success, err)
+
+	var response thrift.Response
+	if err == nil {
+		response.IsApplicationError = hadError
+		response.Body = result
+	}
+	return response, err
+}
+
+func (h handler) GetWorkflowExecutionRawHistoryV2(ctx context.Context, body wire.Value) (thrift.Response, error) {
+	var args admin.AdminService_GetWorkflowExecutionRawHistoryV2_Args
+	if err := args.FromWire(body); err != nil {
+		return thrift.Response{}, err
+	}
+
+	success, err := h.impl.GetWorkflowExecutionRawHistoryV2(ctx, args.GetRequest)
+
+	hadError := err != nil
+	result, err := admin.AdminService_GetWorkflowExecutionRawHistoryV2_Helper.WrapResponse(success, err)
+
+	var response thrift.Response
+	if err == nil {
+		response.IsApplicationError = hadError
+		response.Body = result
+	}
+	return response, err
+}
+
+func (h handler) ReapplyEvents(ctx context.Context, body wire.Value) (thrift.Response, error) {
+	var args admin.AdminService_ReapplyEvents_Args
+	if err := args.FromWire(body); err != nil {
+		return thrift.Response{}, err
+	}
+
+	err := h.impl.ReapplyEvents(ctx, args.ReapplyEventsRequest)
+
+	hadError := err != nil
+	result, err := admin.AdminService_ReapplyEvents_Helper.WrapResponse(err)
 
 	var response thrift.Response
 	if err == nil {

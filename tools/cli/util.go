@@ -36,11 +36,12 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/uber/cadence/common"
 	"github.com/urfave/cli"
 	"github.com/valyala/fastjson"
 	s "go.uber.org/cadence/.gen/go/shared"
 	"go.uber.org/cadence/client"
+
+	"github.com/uber/cadence/common"
 )
 
 // JSONHistorySerializer is used to encode history event in JSON
@@ -667,6 +668,8 @@ func processJSONInputHelper(c *cli.Context, jType jsonType) string {
 		input = c.String(flagNameOfRawInput)
 	} else if c.IsSet(flagNameOfInputFileName) {
 		inputFile := c.String(flagNameOfInputFileName)
+		// This method is purely used to parse input from the CLI. The input comes from a trusted user
+		// #nosec
 		data, err := ioutil.ReadFile(inputFile)
 		if err != nil {
 			ErrorAndExit("Error reading input file", err)
@@ -777,4 +780,12 @@ func removePrevious2LinesFromTerminal() {
 	fmt.Printf("\033[2K")
 	fmt.Printf("\033[1A")
 	fmt.Printf("\033[2K")
+}
+
+func showNextPage() bool {
+	fmt.Printf("Press %s to show next page, press %s to quit: ",
+		color.GreenString("Enter"), color.RedString("any other key then Enter"))
+	var input string
+	fmt.Scanln(&input)
+	return strings.Trim(input, " ") == ""
 }

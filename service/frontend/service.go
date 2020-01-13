@@ -1,4 +1,4 @@
-// Copyright (c) 2017 Uber Technologies, Inc.
+// Copyright (c) 2019 Uber Technologies, Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -21,17 +21,21 @@
 package frontend
 
 import (
+	"sync/atomic"
+
+	mock "github.com/stretchr/testify/mock"
+
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/archiver"
-	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/definition"
-	"github.com/uber/cadence/common/log/loggerimpl"
+	"github.com/uber/cadence/common/domain"
+	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/messaging"
 	"github.com/uber/cadence/common/mocks"
 	"github.com/uber/cadence/common/persistence"
+	persistenceClient "github.com/uber/cadence/common/persistence/client"
 	espersistence "github.com/uber/cadence/common/persistence/elasticsearch"
-	persistencefactory "github.com/uber/cadence/common/persistence/persistence-factory"
+	"github.com/uber/cadence/common/resource"
 	"github.com/uber/cadence/common/service"
 	"github.com/uber/cadence/common/service/config"
 	"github.com/uber/cadence/common/service/dynamicconfig"
@@ -54,6 +58,7 @@ type Config struct {
 	MaxIDLengthLimit                dynamicconfig.IntPropertyFn
 	EnableClientVersionCheck        dynamicconfig.BoolPropertyFn
 	MinRetentionDays                dynamicconfig.IntPropertyFn
+	DisallowQuery                   dynamicconfig.BoolPropertyFnWithDomainFilter
 
 	// Persistence settings
 	HistoryMgrNumConns dynamicconfig.IntPropertyFn
@@ -79,6 +84,9 @@ type Config struct {
 	SearchAttributesNumberOfKeysLimit dynamicconfig.IntPropertyFnWithDomainFilter
 	SearchAttributesSizeOfValueLimit  dynamicconfig.IntPropertyFnWithDomainFilter
 	SearchAttributesTotalSizeLimit    dynamicconfig.IntPropertyFnWithDomainFilter
+
+	// VisibilityArchival system protection
+	VisibilityArchivalQueryMaxPageSize dynamicconfig.IntPropertyFn
 }
 
 // NewConfig returns new service config with default values
@@ -98,165 +106,158 @@ func NewConfig(dc *dynamicconfig.Collection, numHistoryShards int, enableReadFro
 		DomainRPS:                           dc.GetIntPropertyFilteredByDomain(dynamicconfig.FrontendDomainRPS, 1200),
 		MaxIDLengthLimit:                    dc.GetIntProperty(dynamicconfig.MaxIDLengthLimit, 1000),
 		HistoryMgrNumConns:                  dc.GetIntProperty(dynamicconfig.FrontendHistoryMgrNumConns, 10),
-		MaxBadBinaries:                      dc.GetIntPropertyFilteredByDomain(dynamicconfig.FrontendMaxBadBinaries, 10),
+		MaxBadBinaries:                      dc.GetIntPropertyFilteredByDomain(dynamicconfig.FrontendMaxBadBinaries, domain.MaxBadBinaries),
 		EnableAdminProtection:               dc.GetBoolProperty(dynamicconfig.EnableAdminProtection, false),
 		AdminOperationToken:                 dc.GetStringProperty(dynamicconfig.AdminOperationToken, common.DefaultAdminOperationToken),
 		DisableListVisibilityByFilter:       dc.GetBoolPropertyFnWithDomainFilter(dynamicconfig.DisableListVisibilityByFilter, false),
 		BlobSizeLimitError:                  dc.GetIntPropertyFilteredByDomain(dynamicconfig.BlobSizeLimitError, 2*1024*1024),
 		BlobSizeLimitWarn:                   dc.GetIntPropertyFilteredByDomain(dynamicconfig.BlobSizeLimitWarn, 256*1024),
 		ThrottledLogRPS:                     dc.GetIntProperty(dynamicconfig.FrontendThrottledLogRPS, 20),
-		EnableDomainNotActiveAutoForwarding: dc.GetBoolPropertyFnWithDomainFilter(dynamicconfig.EnableDomainNotActiveAutoForwarding, false),
+		EnableDomainNotActiveAutoForwarding: dc.GetBoolPropertyFnWithDomainFilter(dynamicconfig.EnableDomainNotActiveAutoForwarding, true),
 		EnableClientVersionCheck:            dc.GetBoolProperty(dynamicconfig.EnableClientVersionCheck, false),
 		ValidSearchAttributes:               dc.GetMapProperty(dynamicconfig.ValidSearchAttributes, definition.GetDefaultIndexedKeys()),
 		SearchAttributesNumberOfKeysLimit:   dc.GetIntPropertyFilteredByDomain(dynamicconfig.SearchAttributesNumberOfKeysLimit, 100),
 		SearchAttributesSizeOfValueLimit:    dc.GetIntPropertyFilteredByDomain(dynamicconfig.SearchAttributesSizeOfValueLimit, 2*1024),
 		SearchAttributesTotalSizeLimit:      dc.GetIntPropertyFilteredByDomain(dynamicconfig.SearchAttributesTotalSizeLimit, 40*1024),
-		MinRetentionDays:                    dc.GetIntProperty(dynamicconfig.MinRetentionDays, 1),
+		MinRetentionDays:                    dc.GetIntProperty(dynamicconfig.MinRetentionDays, domain.MinRetentionDays),
+		VisibilityArchivalQueryMaxPageSize:  dc.GetIntProperty(dynamicconfig.VisibilityArchivalQueryMaxPageSize, 10000),
+		DisallowQuery:                       dc.GetBoolPropertyFnWithDomainFilter(dynamicconfig.DisallowQuery, false),
 	}
 }
 
 // Service represents the cadence-frontend service
 type Service struct {
-	stopC  chan struct{}
-	config *Config
-	params *service.BootstrapParams
+	resource.Resource
+
+	status       int32
+	handler      *AccessControlledWorkflowHandler
+	adminHandler *AdminHandler
+	stopC        chan struct{}
+	config       *Config
+	params       *service.BootstrapParams
 }
 
 // NewService builds a new cadence-frontend service
-func NewService(params *service.BootstrapParams) common.Daemon {
+func NewService(
+	params *service.BootstrapParams,
+) (resource.Resource, error) {
+
 	isAdvancedVisExistInConfig := len(params.PersistenceConfig.AdvancedVisibilityStore) != 0
-	config := NewConfig(dynamicconfig.NewCollection(params.DynamicConfig, params.Logger), params.PersistenceConfig.NumHistoryShards, isAdvancedVisExistInConfig)
-	params.ThrottledLogger = loggerimpl.NewThrottledLogger(params.Logger, config.ThrottledLogRPS)
-	params.UpdateLoggerWithServiceName(common.FrontendServiceName)
-	return &Service{
-		params: params,
-		config: config,
-		stopC:  make(chan struct{}),
+	serviceConfig := NewConfig(dynamicconfig.NewCollection(params.DynamicConfig, params.Logger), params.PersistenceConfig.NumHistoryShards, isAdvancedVisExistInConfig)
+
+	params.PersistenceConfig.HistoryMaxConns = serviceConfig.HistoryMgrNumConns()
+	params.PersistenceConfig.SetMaxQPS(params.PersistenceConfig.DefaultStore, serviceConfig.PersistenceMaxQPS())
+	params.PersistenceConfig.VisibilityConfig = &config.VisibilityConfig{
+		VisibilityListMaxQPS:            serviceConfig.VisibilityListMaxQPS,
+		EnableSampling:                  serviceConfig.EnableVisibilitySampling,
+		EnableReadFromClosedExecutionV2: serviceConfig.EnableReadFromClosedExecutionV2,
 	}
+
+	visibilityManagerInitializer := func(
+		persistenceBean persistenceClient.Bean,
+		logger log.Logger,
+	) (persistence.VisibilityManager, error) {
+		visibilityFromDB := persistenceBean.GetVisibilityManager()
+
+		var visibilityFromES persistence.VisibilityManager
+		if params.ESConfig != nil {
+			visibilityIndexName := params.ESConfig.Indices[common.VisibilityAppName]
+			visibilityConfigForES := &config.VisibilityConfig{
+				MaxQPS:                 serviceConfig.PersistenceMaxQPS,
+				VisibilityListMaxQPS:   serviceConfig.ESVisibilityListMaxQPS,
+				ESIndexMaxResultWindow: serviceConfig.ESIndexMaxResultWindow,
+				ValidSearchAttributes:  serviceConfig.ValidSearchAttributes,
+			}
+			visibilityFromES = espersistence.NewESVisibilityManager(visibilityIndexName, params.ESClient, visibilityConfigForES,
+				nil, params.MetricsClient, logger)
+		}
+		return persistence.NewVisibilityManagerWrapper(
+			visibilityFromDB,
+			visibilityFromES,
+			serviceConfig.EnableReadVisibilityFromES,
+			dynamicconfig.GetStringPropertyFn(common.AdvancedVisibilityWritingModeOff), // frontend visibility never write
+		), nil
+	}
+
+	serviceResource, err := resource.New(
+		params,
+		common.FrontendServiceName,
+		serviceConfig.ThrottledLogRPS,
+		visibilityManagerInitializer,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Service{
+		Resource: serviceResource,
+		status:   common.DaemonStatusInitialized,
+		config:   serviceConfig,
+		stopC:    make(chan struct{}),
+		params:   params,
+	}, nil
 }
 
 // Start starts the service
 func (s *Service) Start() {
-
-	var params = s.params
-	var log = params.Logger
-
-	log.Info("starting", tag.Service(common.FrontendServiceName))
-
-	base := service.New(params)
-
-	pConfig := params.PersistenceConfig
-	pConfig.HistoryMaxConns = s.config.HistoryMgrNumConns()
-	pConfig.SetMaxQPS(pConfig.DefaultStore, s.config.PersistenceMaxQPS())
-	pConfig.VisibilityConfig = &config.VisibilityConfig{
-		VisibilityListMaxQPS:            s.config.VisibilityListMaxQPS,
-		EnableSampling:                  s.config.EnableVisibilitySampling,
-		EnableReadFromClosedExecutionV2: s.config.EnableReadFromClosedExecutionV2,
-	}
-	pFactory := persistencefactory.New(&pConfig, params.ClusterMetadata.GetCurrentClusterName(), base.GetMetricsClient(), log)
-
-	metadata, err := pFactory.NewMetadataManager(persistencefactory.MetadataV1V2)
-	if err != nil {
-		log.Fatal("failed to create metadata manager", tag.Error(err))
+	if !atomic.CompareAndSwapInt32(&s.status, common.DaemonStatusInitialized, common.DaemonStatusStarted) {
+		return
 	}
 
-	visibilityFromDB, err := pFactory.NewVisibilityManager()
-	if err != nil {
-		log.Fatal("failed to create visibility manager", tag.Error(err))
-	}
+	logger := s.GetLogger()
+	logger.Info("frontend starting")
 
-	var visibilityFromES persistence.VisibilityManager
-	if params.ESConfig != nil {
-		visibilityIndexName := params.ESConfig.Indices[common.VisibilityAppName]
-		visibilityConfigForES := &config.VisibilityConfig{
-			MaxQPS:                 s.config.PersistenceMaxQPS,
-			VisibilityListMaxQPS:   s.config.ESVisibilityListMaxQPS,
-			ESIndexMaxResultWindow: s.config.ESIndexMaxResultWindow,
-			ValidSearchAttributes:  s.config.ValidSearchAttributes,
-		}
-		visibilityFromES = espersistence.NewESVisibilityManager(visibilityIndexName, params.ESClient, visibilityConfigForES,
-			nil, base.GetMetricsClient(), log)
-	}
-	visibility := persistence.NewVisibilityManagerWrapper(
-		visibilityFromDB,
-		visibilityFromES,
-		s.config.EnableReadVisibilityFromES,
-		dynamicconfig.GetStringPropertyFn(common.AdvancedVisibilityWritingModeOff), // frontend visibility never write
-	)
-
-	history, err := pFactory.NewHistoryManager()
-	if err != nil {
-		log.Fatal("Creating history manager persistence failed", tag.Error(err))
-	}
-	historyV2, err := pFactory.NewHistoryV2Manager()
-	if err != nil {
-		log.Fatal("Creating historyV2 manager persistence failed", tag.Error(err))
-	}
-
-	// TODO when global domain is enabled, uncomment the line below and remove the line after
-	var kafkaProducer messaging.Producer
-	if base.GetClusterMetadata().IsGlobalDomainEnabled() {
-		kafkaProducer, err = base.GetMessagingClient().NewProducerWithClusterName(base.GetClusterMetadata().GetCurrentClusterName())
-		if err != nil {
-			log.Fatal("Creating kafka producer failed", tag.Error(err))
+	var replicationMessageSink messaging.Producer
+	clusterMetadata := s.GetClusterMetadata()
+	if clusterMetadata.IsGlobalDomainEnabled() {
+		consumerConfig := clusterMetadata.GetReplicationConsumerConfig()
+		if consumerConfig != nil && consumerConfig.Type == config.ReplicationConsumerTypeRPC {
+			replicationMessageSink = s.GetDomainReplicationQueue()
+		} else {
+			var err error
+			replicationMessageSink, err = s.GetMessagingClient().NewProducerWithClusterName(
+				s.GetClusterMetadata().GetCurrentClusterName())
+			if err != nil {
+				logger.Fatal("Creating replicationMessageSink producer failed", tag.Error(err))
+			}
 		}
 	} else {
-		kafkaProducer = &mocks.KafkaProducer{}
+		replicationMessageSink = &mocks.KafkaProducer{}
+		replicationMessageSink.(*mocks.KafkaProducer).On("Publish", mock.Anything).Return(nil)
 	}
 
-	domainCache := cache.NewDomainCache(metadata, base.GetClusterMetadata(), base.GetMetricsClient(), base.GetLogger())
+	wfHandler := NewWorkflowHandler(s, s.config, replicationMessageSink)
+	dcRedirectionHandler := NewDCRedirectionHandler(wfHandler, s.params.DCRedirectionPolicy)
 
-	historyArchiverBootstrapContainer := &archiver.HistoryBootstrapContainer{
-		HistoryManager:   history,
-		HistoryV2Manager: historyV2,
-		Logger:           base.GetLogger(),
-		MetricsClient:    base.GetMetricsClient(),
-		ClusterMetadata:  base.GetClusterMetadata(),
-		DomainCache:      domainCache,
-	}
-	visibilityArchiverBootstrapContainer := &archiver.VisibilityBootstrapContainer{
-		Logger:          base.GetLogger(),
-		MetricsClient:   base.GetMetricsClient(),
-		ClusterMetadata: base.GetClusterMetadata(),
-		DomainCache:     domainCache,
-	}
-	err = params.ArchiverProvider.RegisterBootstrapContainer(common.FrontendServiceName, historyArchiverBootstrapContainer, visibilityArchiverBootstrapContainer)
-	if err != nil {
-		log.Fatal("Failed to register archiver bootstrap container", tag.Error(err))
-	}
+	s.handler = NewAccessControlledHandlerImpl(dcRedirectionHandler, s.params.Authorizer)
+	s.handler.RegisterHandler()
 
-	wfHandler := NewWorkflowHandler(base, s.config, metadata, history, historyV2, visibility, kafkaProducer, domainCache)
-	dcRedirectionHandler := NewDCRedirectionHandler(wfHandler, params.DCRedirectionPolicy)
-	dcRedirectionHandler.RegisterHandler()
+	s.adminHandler = NewAdminHandler(s, s.params, s.config)
+	s.adminHandler.RegisterHandler()
 
-	adminHandler := NewAdminHandler(base, pConfig.NumHistoryShards, metadata, history, historyV2, s.params)
-	adminHandler.RegisterHandler()
-
-	// must start base service first
-	base.Start()
-	err = dcRedirectionHandler.Start()
-	if err != nil {
-		log.Fatal("DC redirection handler failed to start", tag.Error(err))
-	}
-	err = adminHandler.Start()
-	if err != nil {
-		log.Fatal("Admin handler failed to start", tag.Error(err))
-	}
+	// must start resource first
+	s.Resource.Start()
+	s.handler.Start()
+	s.adminHandler.Start()
 
 	// base (service is not started in frontend or admin handler) in case of race condition in yarpc registration function
 
-	log.Info("started", tag.Service(common.FrontendServiceName))
+	logger.Info("frontend started")
 
 	<-s.stopC
-
-	base.Stop()
 }
 
 // Stop stops the service
 func (s *Service) Stop() {
-	select {
-	case s.stopC <- struct{}{}:
-	default:
+	if !atomic.CompareAndSwapInt32(&s.status, common.DaemonStatusStarted, common.DaemonStatusStopped) {
+		return
 	}
-	s.params.Logger.Info("stopped", tag.Service(common.FrontendServiceName))
+
+	close(s.stopC)
+
+	s.handler.Stop()
+	s.adminHandler.Stop()
+	s.Resource.Stop()
+
+	s.params.Logger.Info("frontend stopped")
 }

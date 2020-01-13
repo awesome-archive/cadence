@@ -52,15 +52,9 @@ type (
 		logger      log.Logger
 	}
 
-	historyRateLimitedPersistenceClient struct {
-		rateLimiter quotas.Limiter
-		persistence HistoryManager
-		logger      log.Logger
-	}
-
 	historyV2RateLimitedPersistenceClient struct {
 		rateLimiter quotas.Limiter
-		persistence HistoryV2Manager
+		persistence HistoryManager
 		logger      log.Logger
 	}
 
@@ -75,15 +69,21 @@ type (
 		persistence VisibilityManager
 		logger      log.Logger
 	}
+
+	queueRateLimitedPersistenceClient struct {
+		rateLimiter quotas.Limiter
+		persistence Queue
+		logger      log.Logger
+	}
 )
 
 var _ ShardManager = (*shardRateLimitedPersistenceClient)(nil)
 var _ ExecutionManager = (*workflowExecutionRateLimitedPersistenceClient)(nil)
 var _ TaskManager = (*taskRateLimitedPersistenceClient)(nil)
-var _ HistoryManager = (*historyRateLimitedPersistenceClient)(nil)
-var _ HistoryV2Manager = (*historyV2RateLimitedPersistenceClient)(nil)
+var _ HistoryManager = (*historyV2RateLimitedPersistenceClient)(nil)
 var _ MetadataManager = (*metadataRateLimitedPersistenceClient)(nil)
 var _ VisibilityManager = (*visibilityRateLimitedPersistenceClient)(nil)
+var _ Queue = (*queueRateLimitedPersistenceClient)(nil)
 
 // NewShardPersistenceRateLimitedClient creates a client to manage shards
 func NewShardPersistenceRateLimitedClient(persistence ShardManager, rateLimiter quotas.Limiter, logger log.Logger) ShardManager {
@@ -112,17 +112,8 @@ func NewTaskPersistenceRateLimitedClient(persistence TaskManager, rateLimiter qu
 	}
 }
 
-// NewHistoryPersistenceRateLimitedClient creates a HistoryManager client to manage workflow execution history
-func NewHistoryPersistenceRateLimitedClient(persistence HistoryManager, rateLimiter quotas.Limiter, logger log.Logger) HistoryManager {
-	return &historyRateLimitedPersistenceClient{
-		persistence: persistence,
-		rateLimiter: rateLimiter,
-		logger:      logger,
-	}
-}
-
 // NewHistoryV2PersistenceRateLimitedClient creates a HistoryManager client to manage workflow execution history
-func NewHistoryV2PersistenceRateLimitedClient(persistence HistoryV2Manager, rateLimiter quotas.Limiter, logger log.Logger) HistoryV2Manager {
+func NewHistoryV2PersistenceRateLimitedClient(persistence HistoryManager, rateLimiter quotas.Limiter, logger log.Logger) HistoryManager {
 	return &historyV2RateLimitedPersistenceClient{
 		persistence: persistence,
 		rateLimiter: rateLimiter,
@@ -142,6 +133,15 @@ func NewMetadataPersistenceRateLimitedClient(persistence MetadataManager, rateLi
 // NewVisibilityPersistenceRateLimitedClient creates a client to manage visibility
 func NewVisibilityPersistenceRateLimitedClient(persistence VisibilityManager, rateLimiter quotas.Limiter, logger log.Logger) VisibilityManager {
 	return &visibilityRateLimitedPersistenceClient{
+		persistence: persistence,
+		rateLimiter: rateLimiter,
+		logger:      logger,
+	}
+}
+
+// NewQueuePersistenceRateLimitedClient creates a client to manage queue
+func NewQueuePersistenceRateLimitedClient(persistence Queue, rateLimiter quotas.Limiter, logger log.Logger) Queue {
+	return &queueRateLimitedPersistenceClient{
 		persistence: persistence,
 		rateLimiter: rateLimiter,
 		logger:      logger,
@@ -236,15 +236,6 @@ func (p *workflowExecutionRateLimitedPersistenceClient) ResetWorkflowExecution(r
 	return err
 }
 
-// CompleteForkBranch complete forking process
-func (p *historyV2RateLimitedPersistenceClient) CompleteForkBranch(request *CompleteForkBranchRequest) error {
-	if ok := p.rateLimiter.Allow(); !ok {
-		return ErrPersistenceLimitExceeded
-	}
-	err := p.persistence.CompleteForkBranch(request)
-	return err
-}
-
 func (p *workflowExecutionRateLimitedPersistenceClient) DeleteWorkflowExecution(request *DeleteWorkflowExecutionRequest) error {
 	if ok := p.rateLimiter.Allow(); !ok {
 		return ErrPersistenceLimitExceeded
@@ -315,6 +306,35 @@ func (p *workflowExecutionRateLimitedPersistenceClient) CompleteReplicationTask(
 
 	err := p.persistence.CompleteReplicationTask(request)
 	return err
+}
+
+func (p *workflowExecutionRateLimitedPersistenceClient) RangeCompleteReplicationTask(request *RangeCompleteReplicationTaskRequest) error {
+	if ok := p.rateLimiter.Allow(); !ok {
+		return ErrPersistenceLimitExceeded
+	}
+
+	err := p.persistence.RangeCompleteReplicationTask(request)
+	return err
+}
+
+func (p *workflowExecutionRateLimitedPersistenceClient) PutReplicationTaskToDLQ(
+	request *PutReplicationTaskToDLQRequest,
+) error {
+	if ok := p.rateLimiter.Allow(); !ok {
+		return ErrPersistenceLimitExceeded
+	}
+
+	return p.persistence.PutReplicationTaskToDLQ(request)
+}
+
+func (p *workflowExecutionRateLimitedPersistenceClient) GetReplicationTasksFromDLQ(
+	request *GetReplicationTasksFromDLQRequest,
+) (*GetReplicationTasksFromDLQResponse, error) {
+	if ok := p.rateLimiter.Allow(); !ok {
+		return nil, ErrPersistenceLimitExceeded
+	}
+
+	return p.persistence.GetReplicationTasksFromDLQ(request)
 }
 
 func (p *workflowExecutionRateLimitedPersistenceClient) GetTimerIndexTasks(request *GetTimerIndexTasksRequest) (*GetTimerIndexTasksResponse, error) {
@@ -428,50 +448,6 @@ func (p *taskRateLimitedPersistenceClient) DeleteTaskList(request *DeleteTaskLis
 }
 
 func (p *taskRateLimitedPersistenceClient) Close() {
-	p.persistence.Close()
-}
-
-func (p *historyRateLimitedPersistenceClient) GetName() string {
-	return p.persistence.GetName()
-}
-
-func (p *historyRateLimitedPersistenceClient) AppendHistoryEvents(request *AppendHistoryEventsRequest) (*AppendHistoryEventsResponse, error) {
-	if ok := p.rateLimiter.Allow(); !ok {
-		return nil, ErrPersistenceLimitExceeded
-	}
-
-	resp, err := p.persistence.AppendHistoryEvents(request)
-	return resp, err
-}
-
-func (p *historyRateLimitedPersistenceClient) GetWorkflowExecutionHistory(request *GetWorkflowExecutionHistoryRequest) (*GetWorkflowExecutionHistoryResponse, error) {
-	if ok := p.rateLimiter.Allow(); !ok {
-		return nil, ErrPersistenceLimitExceeded
-	}
-
-	response, err := p.persistence.GetWorkflowExecutionHistory(request)
-	return response, err
-}
-
-func (p *historyRateLimitedPersistenceClient) GetWorkflowExecutionHistoryByBatch(request *GetWorkflowExecutionHistoryRequest) (*GetWorkflowExecutionHistoryByBatchResponse, error) {
-	if ok := p.rateLimiter.Allow(); !ok {
-		return nil, ErrPersistenceLimitExceeded
-	}
-
-	response, err := p.persistence.GetWorkflowExecutionHistoryByBatch(request)
-	return response, err
-}
-
-func (p *historyRateLimitedPersistenceClient) DeleteWorkflowExecutionHistory(request *DeleteWorkflowExecutionHistoryRequest) error {
-	if ok := p.rateLimiter.Allow(); !ok {
-		return ErrPersistenceLimitExceeded
-	}
-
-	err := p.persistence.DeleteWorkflowExecutionHistory(request)
-	return err
-}
-
-func (p *historyRateLimitedPersistenceClient) Close() {
 	p.persistence.Close()
 }
 
@@ -757,4 +733,48 @@ func (p *historyV2RateLimitedPersistenceClient) GetAllHistoryTreeBranches(reques
 	}
 	response, err := p.persistence.GetAllHistoryTreeBranches(request)
 	return response, err
+}
+
+func (p *queueRateLimitedPersistenceClient) EnqueueMessage(message []byte) error {
+	if ok := p.rateLimiter.Allow(); !ok {
+		return ErrPersistenceLimitExceeded
+	}
+
+	return p.persistence.EnqueueMessage(message)
+}
+
+func (p *queueRateLimitedPersistenceClient) ReadMessages(lastMessageID int, maxCount int) ([]*QueueMessage, error) {
+	if ok := p.rateLimiter.Allow(); !ok {
+		return nil, ErrPersistenceLimitExceeded
+	}
+
+	return p.persistence.ReadMessages(lastMessageID, maxCount)
+}
+
+func (p *queueRateLimitedPersistenceClient) UpdateAckLevel(messageID int, clusterName string) error {
+	if ok := p.rateLimiter.Allow(); !ok {
+		return ErrPersistenceLimitExceeded
+	}
+
+	return p.persistence.UpdateAckLevel(messageID, clusterName)
+}
+
+func (p *queueRateLimitedPersistenceClient) GetAckLevels() (map[string]int, error) {
+	if ok := p.rateLimiter.Allow(); !ok {
+		return nil, ErrPersistenceLimitExceeded
+	}
+
+	return p.persistence.GetAckLevels()
+}
+
+func (p *queueRateLimitedPersistenceClient) DeleteMessagesBefore(messageID int) error {
+	if ok := p.rateLimiter.Allow(); !ok {
+		return ErrPersistenceLimitExceeded
+	}
+
+	return p.persistence.DeleteMessagesBefore(messageID)
+}
+
+func (p *queueRateLimitedPersistenceClient) Close() {
+	p.persistence.Close()
 }

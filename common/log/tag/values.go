@@ -44,6 +44,10 @@ var (
 	WorkflowActionDecisionTaskTimedOut  = workflowAction("add-decisiontask-timedout-event")
 	WorkflowActionDecisionTaskFailed    = workflowAction("add-decisiontask-failed-event")
 
+	// in memory decision
+	WorkflowActionInMemoryDecisionTaskScheduled = workflowAction("add-in-memory-decisiontask-scheduled")
+	WorkflowActionInMemoryDecisionTaskStarted   = workflowAction("add-in-memory-decisiontask-started")
+
 	// activity
 	WorkflowActionActivityTaskScheduled       = workflowAction("add-activitytask-scheduled-event")
 	WorkflowActionActivityTaskStarted         = workflowAction("add-activitytask-started-event")
@@ -94,7 +98,6 @@ var (
 // Pre-defined values for TagSysComponent
 var (
 	ComponentTaskList                 = component("tasklist")
-	ComponentHistoryBuilder           = component("history-builder")
 	ComponentHistoryEngine            = component("history-engine")
 	ComponentHistoryCache             = component("history-cache")
 	ComponentEventsCache              = component("events-cache")
@@ -134,17 +137,18 @@ var (
 
 // Pre-defined values for SysErrorType
 var (
-	ErrorTypeInvalidHistoryAction        = errorType("InvalidHistoryAction")
-	ErrorTypeInvalidQueryTask            = errorType("InvalidQueryTask")
-	ErrorTypeQueryTaskFailed             = errorType("QueryTaskFailed")
-	ErrorTypePersistentStoreError        = errorType("PersistentStoreError")
-	ErrorTypeHistorySerializationError   = errorType("HistorySerializationError")
-	ErrorTypeHistoryDeserializationError = errorType("HistoryDeserializationError")
-	ErrorTypeDuplicateTask               = errorType("DuplicateTask")
-	ErrorTypeMultipleCompletionDecisions = errorType("MultipleCompletionDecisions")
-	ErrorTypeDuplicateTransferTask       = errorType("DuplicateTransferTask")
-	ErrorTypeDecisionFailed              = errorType("DecisionFailed")
-	ErrorTypeInvalidMutableStateAction   = errorType("InvalidMutableStateAction")
+	ErrorTypeInvalidHistoryAction         = errorType("InvalidHistoryAction")
+	ErrorTypeInvalidQueryTask             = errorType("InvalidQueryTask")
+	ErrorTypeQueryTaskFailed              = errorType("QueryTaskFailed")
+	ErrorTypePersistentStoreError         = errorType("PersistentStoreError")
+	ErrorTypeHistorySerializationError    = errorType("HistorySerializationError")
+	ErrorTypeHistoryDeserializationError  = errorType("HistoryDeserializationError")
+	ErrorTypeDuplicateTask                = errorType("DuplicateTask")
+	ErrorTypeMultipleCompletionDecisions  = errorType("MultipleCompletionDecisions")
+	ErrorTypeDuplicateTransferTask        = errorType("DuplicateTransferTask")
+	ErrorTypeDecisionFailed               = errorType("DecisionFailed")
+	ErrorTypeInvalidMutableStateAction    = errorType("InvalidMutableStateAction")
+	ErrorTypeInvalidMemDecisionTaskAction = errorType("InvalidMemDecisionTaskAction")
 )
 
 // Pre-defined values for SysShardUpdate

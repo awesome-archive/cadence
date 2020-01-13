@@ -23,8 +23,9 @@ package common
 import (
 	"time"
 
-	s "github.com/uber/cadence/.gen/go/shared"
 	"go.uber.org/cadence/.gen/go/shared"
+
+	s "github.com/uber/cadence/.gen/go/shared"
 )
 
 // IntPtr makes a copy and returns the pointer to an int.
@@ -150,6 +151,26 @@ func ArchivalStatusPtr(t s.ArchivalStatus) *s.ArchivalStatus {
 
 // ClientArchivalStatusPtr makes a copy and returns the pointer to a client ArchivalStatus.
 func ClientArchivalStatusPtr(t shared.ArchivalStatus) *shared.ArchivalStatus {
+	return &t
+}
+
+// QueryResultTypePtr makes a copy and returns the pointer to a QueryResultType
+func QueryResultTypePtr(t s.QueryResultType) *s.QueryResultType {
+	return &t
+}
+
+// QueryRejectConditionPtr makes a copy and returns the pointer to a QueryRejectCondition
+func QueryRejectConditionPtr(t s.QueryRejectCondition) *s.QueryRejectCondition {
+	return &t
+}
+
+// QueryConsistencyLevelPtr makes a copy and returns the pointer to a QueryConsistencyLevel
+func QueryConsistencyLevelPtr(t s.QueryConsistencyLevel) *s.QueryConsistencyLevel {
+	return &t
+}
+
+// QueryTaskCompletedTypePtr makes a copy and returns the pointer to a QueryTaskCompletedType
+func QueryTaskCompletedTypePtr(t s.QueryTaskCompletedType) *s.QueryTaskCompletedType {
 	return &t
 }
 
