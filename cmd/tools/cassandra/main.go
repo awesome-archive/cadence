@@ -21,10 +21,15 @@
 package main
 
 import (
-	"github.com/uber/cadence/tools/cassandra"
 	"os"
+
+	_ "github.com/uber/cadence/common/persistence/nosql/nosqlplugin/cassandra/gocql/public" // needed to load the default gocql client
+	"github.com/uber/cadence/tools/cassandra"
 )
 
 func main() {
-	cassandra.RunTool(os.Args)
+	err := cassandra.RunTool(os.Args)
+	if err != nil {
+		panic(err)
+	}
 }

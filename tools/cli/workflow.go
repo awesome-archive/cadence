@@ -22,13 +22,24 @@ package cli
 
 import (
 	"strings"
+	"time"
+
+	"github.com/urfave/cli"
 
 	"github.com/uber/cadence/service/worker/batcher"
-	"github.com/urfave/cli"
 )
 
 func newWorkflowCommands() []cli.Command {
 	return []cli.Command{
+		{
+			Name:    "restart",
+			Aliases: []string{"res"},
+			Usage:   "restarts a previous workflow execution",
+			Flags:   flagsForExecution,
+			Action: func(c *cli.Context) {
+				RestartWorkflow(c)
+			},
+		},
 		{
 			Name:        "activity",
 			Aliases:     []string{"act"},
@@ -45,8 +56,8 @@ func newWorkflowCommands() []cli.Command {
 		},
 		{
 			Name:        "showid",
-			Usage:       "show workflow history with given workflow_id and optional run_id (a shortcut of `show -w <wid> -r <rid>`)",
-			Description: "cadence workflow showid <workflow_id> <run_id>. workflow_id is required; run_id is optional",
+			Usage:       "show workflow history with given workflow_id and run_id (a shortcut of `show -w <wid> -r <rid>`). run_id is only required for archived history",
+			Description: "cadence workflow showid <workflow_id> <run_id>. workflow_id is required; run_id is only required for archived history",
 			Flags:       getFlagsForShowID(),
 			Action: func(c *cli.Context) {
 				ShowHistoryWithWID(c)
@@ -72,7 +83,7 @@ func newWorkflowCommands() []cli.Command {
 			Name:    "cancel",
 			Aliases: []string{"c"},
 			Usage:   "cancel a workflow execution",
-			Flags:   flagsForExecution,
+			Flags:   getFlagsForCancel(),
 			Action: func(c *cli.Context) {
 				CancelWorkflow(c)
 			},
@@ -81,50 +92,24 @@ func newWorkflowCommands() []cli.Command {
 			Name:    "signal",
 			Aliases: []string{"s"},
 			Usage:   "signal a workflow execution",
-			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagWorkflowIDWithAlias,
-					Usage: "WorkflowID",
-				},
-				cli.StringFlag{
-					Name:  FlagRunIDWithAlias,
-					Usage: "RunID",
-				},
-				cli.StringFlag{
-					Name:  FlagNameWithAlias,
-					Usage: "SignalName",
-				},
-				cli.StringFlag{
-					Name:  FlagInputWithAlias,
-					Usage: "Input for the signal, in JSON format.",
-				},
-				cli.StringFlag{
-					Name:  FlagInputFileWithAlias,
-					Usage: "Input for the signal from JSON file.",
-				},
-			},
+			Flags:   getFlagsForSignal(),
 			Action: func(c *cli.Context) {
 				SignalWorkflow(c)
+			},
+		},
+		{
+			Name:  "signalwithstart",
+			Usage: "signal the current open workflow if exists, or attempt to start a new run based on IDResuePolicy and signals it",
+			Flags: getFlagsForSignalWithStart(),
+			Action: func(c *cli.Context) {
+				SignalWithStartWorkflowExecution(c)
 			},
 		},
 		{
 			Name:    "terminate",
 			Aliases: []string{"term"},
 			Usage:   "terminate a new workflow execution",
-			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  FlagWorkflowIDWithAlias,
-					Usage: "WorkflowID",
-				},
-				cli.StringFlag{
-					Name:  FlagRunIDWithAlias,
-					Usage: "RunID",
-				},
-				cli.StringFlag{
-					Name:  FlagReasonWithAlias,
-					Usage: "The reason you want to terminate the workflow",
-				},
-			},
+			Flags:   getFlagsForTerminate(),
 			Action: func(c *cli.Context) {
 				TerminateWorkflow(c)
 			},
@@ -149,6 +134,14 @@ func newWorkflowCommands() []cli.Command {
 			},
 		},
 		{
+			Name:  "listarchived",
+			Usage: "list archived workflow executions",
+			Flags: getFlagsForListArchived(),
+			Action: func(c *cli.Context) {
+				ListArchivedWorkflow(c)
+			},
+		},
+		{
 			Name:    "scan",
 			Aliases: []string{"sc", "scanall"},
 			Usage: "scan workflow executions (need to enable Cadence server on ElasticSearch). " +
@@ -168,9 +161,10 @@ func newWorkflowCommands() []cli.Command {
 			},
 		},
 		{
-			Name:  "query",
-			Usage: "query workflow execution",
-			Flags: getFlagsForQuery(),
+			Name:        "query",
+			Usage:       "query workflow execution",
+			Description: "query result will be printed as JSON",
+			Flags:       getFlagsForQuery(),
 			Action: func(c *cli.Context) {
 				QueryWorkflow(c)
 			},
@@ -227,27 +221,44 @@ func newWorkflowCommands() []cli.Command {
 			Flags: []cli.Flag{
 				cli.StringFlag{
 					Name:  FlagWorkflowIDWithAlias,
-					Usage: "WorkflowID",
+					Usage: "WorkflowID, required",
 				},
 				cli.StringFlag{
 					Name:  FlagRunIDWithAlias,
-					Usage: "RunID",
+					Usage: "RunID, optional, default to the current/latest RunID",
 				},
 				cli.StringFlag{
-					Name:  FlagEventID,
-					Usage: "The eventID of any event after DecisionTaskStarted you want to reset to (exclusive). It can be DecisionTaskCompleted, DecisionTaskFailed or others",
+					Name: FlagEventID,
+					Usage: "The eventID of any event after DecisionTaskStarted you want to reset to (this event is exclusive in a new run. The new run " +
+						"history will fork and continue from the previous eventID of this). It can be DecisionTaskCompleted, DecisionTaskFailed or others",
 				},
 				cli.StringFlag{
 					Name:  FlagReason,
-					Usage: "reason to do the reset",
+					Usage: "reason to do the reset, required for tracking purpose",
 				},
 				cli.StringFlag{
 					Name:  FlagResetType,
 					Usage: "where to reset. Support one of these: " + strings.Join(mapKeysToArray(resetTypesMap), ","),
 				},
 				cli.StringFlag{
+					Name:  FlagDecisionOffset,
+					Usage: "based on the reset point calculated by resetType, this offset will move/offset the point by decision. Currently only negative number is supported, and only works with LastDecisionCompleted.",
+				},
+				cli.StringFlag{
 					Name:  FlagResetBadBinaryChecksum,
 					Usage: "Binary checksum for resetType of BadBinary",
+				},
+				cli.StringFlag{
+					Name: FlagEarliestTimeWithAlias,
+					Usage: "EarliestTime of decision start time, required for resetType of DecisionCompletedTime." +
+						"Supported formats are '2006-01-02T15:04:05+07:00', raw UnixNano and " +
+						"time range (N<duration>), where 0 < N < 1000000 and duration (full-notation/short-notation) can be second/s, " +
+						"minute/m, hour/h, day/d, week/w, month/M or year/y. For example, '15minute' or '15m' implies last 15 minutes, " +
+						"meaning that workflow will be reset to the first decision that completed in last 15 minutes.",
+				},
+				cli.BoolFlag{
+					Name:  FlagSkipSignalReapply,
+					Usage: "whether or not skipping signals reapply after the reset point",
 				},
 			},
 			Action: func(c *cli.Context) {
@@ -257,7 +268,7 @@ func newWorkflowCommands() []cli.Command {
 		{
 			Name: "reset-batch",
 			Usage: "reset workflow in batch by resetType: " + strings.Join(mapKeysToArray(resetTypesMap), ",") +
-				"batch source is from input file or visibility query.",
+				"To get base workflowIDs/runIDs to reset, source is from input file or visibility query.",
 			Flags: []cli.Flag{
 				cli.StringFlag{
 					Name:  FlagInputFileWithAlias,
@@ -273,13 +284,18 @@ func newWorkflowCommands() []cli.Command {
 					Usage: "Another input file to use for excluding from resetting, only workflowID is needed.",
 				},
 				cli.StringFlag{
+					Name: FlagExcludeWorkflowIDByQuery,
+					Usage: "Another visibility SQL like query, but for excluding the results by workflowIDs. This is useful because a single query cannot do join operation. One use case is to " +
+						"find failed workflows excluding any workflow that has another run that is open or completed.",
+				},
+				cli.StringFlag{
 					Name:  FlagInputSeparator,
-					Value: ",",
-					Usage: "Separator for input file",
+					Value: "\t",
+					Usage: "Separator for input file(default to tab)",
 				},
 				cli.StringFlag{
 					Name:  FlagReason,
-					Usage: "Reason for reset",
+					Usage: "Reason for reset, required for tracking purpose",
 				},
 				cli.IntFlag{
 					Name:  FlagParallism,
@@ -287,16 +303,52 @@ func newWorkflowCommands() []cli.Command {
 					Usage: "Number of goroutines to run in parallel. Each goroutine would process one line for every second.",
 				},
 				cli.BoolFlag{
-					Name:  FlagSkipCurrent,
-					Usage: "Skip the workflow if the current run is open.",
+					Name:  FlagSkipCurrentOpen,
+					Usage: "Skip the workflow if the current run is open for the same workflowID as base.",
+				},
+				cli.BoolFlag{
+					Name:  FlagSkipCurrentCompleted,
+					Usage: "Skip the workflow if the current run is completed for the same workflowID as base.",
+				},
+				cli.BoolFlag{
+					Name: FlagSkipBaseIsNotCurrent,
+					// TODO https://github.com/uber/cadence/issues/2930
+					// The right way to prevent needs server side implementation .
+					// This client side is only best effort
+					Usage: "Skip if base run is not current run.",
+				},
+				cli.BoolFlag{
+					Name:  FlagNonDeterministicOnly,
+					Usage: "Only apply onto workflows whose last event is decisionTaskFailed with non deterministic error.",
+				},
+				cli.BoolFlag{
+					Name:  FlagDryRun,
+					Usage: "Not do real action of reset(just logging in STDOUT)",
 				},
 				cli.StringFlag{
 					Name:  FlagResetType,
 					Usage: "where to reset. Support one of these: " + strings.Join(mapKeysToArray(resetTypesMap), ","),
 				},
 				cli.StringFlag{
+					Name: FlagDecisionOffset,
+					Usage: "based on the reset point calculated by resetType, this offset will move/offset the point by decision. " +
+						"Limitation: currently only negative number is supported, and only works with LastDecisionCompleted.",
+				},
+				cli.StringFlag{
 					Name:  FlagResetBadBinaryChecksum,
 					Usage: "Binary checksum for resetType of BadBinary",
+				},
+				cli.BoolFlag{
+					Name:  FlagSkipSignalReapply,
+					Usage: "whether or not skipping signals reapply after the reset point",
+				},
+				cli.StringFlag{
+					Name: FlagEarliestTimeWithAlias,
+					Usage: "EarliestTime of decision start time, required for resetType of DecisionCompletedTime." +
+						"Supported formats are '2006-01-02T15:04:05+07:00', raw UnixNano and " +
+						"time range (N<duration>), where 0 < N < 1000000 and duration (full-notation/short-notation) can be second/s, " +
+						"minute/m, hour/h, day/d, week/w, month/M or year/y. For example, '15minute' or '15m' implies last 15 minutes, " +
+						"meaning that workflow will be reset to the first decision that completed in last 15 minutes.",
 				},
 			},
 			Action: func(c *cli.Context) {
@@ -452,6 +504,14 @@ func newBatchCommands() []cli.Command {
 					Name:  FlagInputWithAlias,
 					Usage: "Optional input of signal",
 				},
+				cli.StringFlag{
+					Name:  FlagSourceClusterWithAlias,
+					Usage: "Required for batch replicate",
+				},
+				cli.StringFlag{
+					Name:  FlagTargetClusterWithAlias,
+					Usage: "Required for batch replicate",
+				},
 				cli.IntFlag{
 					Name:  FlagRPS,
 					Value: batcher.DefaultRPS,
@@ -460,6 +520,26 @@ func newBatchCommands() []cli.Command {
 				cli.BoolFlag{
 					Name:  FlagYes,
 					Usage: "Optional flag to disable confirmation prompt",
+				},
+				cli.IntFlag{
+					Name:  FlagPageSize,
+					Value: batcher.DefaultPageSize,
+					Usage: "PageSize of processiing",
+				},
+				cli.IntFlag{
+					Name:  FlagRetryAttempts,
+					Value: batcher.DefaultAttemptsOnRetryableError,
+					Usage: "Retry attempts for retriable errors",
+				},
+				cli.IntFlag{
+					Name:  FlagActivityHeartBeatTimeoutWithAlias,
+					Value: int(batcher.DefaultActivityHeartBeatTimeout / time.Second),
+					Usage: "Heartbeat timeout for batcher activity in seconds",
+				},
+				cli.IntFlag{
+					Name:  FlagConcurrency,
+					Value: batcher.DefaultConcurrency,
+					Usage: "Concurrency of batch activity",
 				},
 			},
 			Action: func(c *cli.Context) {

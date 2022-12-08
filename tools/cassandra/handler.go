@@ -23,11 +23,12 @@ package cassandra
 import (
 	"fmt"
 	"log"
-	"path"
 
-	"github.com/uber/cadence/common/service/config"
-	"github.com/uber/cadence/tools/common/schema"
 	"github.com/urfave/cli"
+
+	"github.com/uber/cadence/common/config"
+	"github.com/uber/cadence/schema/cassandra"
+	"github.com/uber/cadence/tools/common/schema"
 )
 
 const defaultNumReplicas = 1
@@ -43,38 +44,67 @@ type SetupSchemaConfig struct {
 // In most cases, the versions should match. However if after a schema upgrade there is a code
 // rollback, the code version (expected version) would fall lower than the actual version in
 // cassandra.
-func VerifyCompatibleVersion(cfg config.Persistence, rootPath string) error {
-	ds, ok := cfg.DataStores[cfg.DefaultStore]
-	if ok && ds.Cassandra != nil {
-		schemaPath := path.Join(rootPath, "schema/cassandra/cadence/versioned")
-		err := checkCompatibleVersion(*ds.Cassandra, ds.Cassandra.Keyspace, schemaPath)
-		if err != nil {
+func VerifyCompatibleVersion(
+	cfg config.Persistence,
+) error {
+	if ds, ok := cfg.DataStores[cfg.DefaultStore]; ok {
+		if err := verifyCompatibleVersion(ds, cassandra.Version); err != nil {
 			return err
 		}
 	}
-	ds, ok = cfg.DataStores[cfg.VisibilityStore]
-	if ok && ds.Cassandra != nil {
-		schemaPath := path.Join(rootPath, "schema/cassandra/visibility/versioned")
-		return checkCompatibleVersion(*ds.Cassandra, ds.Cassandra.Keyspace, schemaPath)
+
+	if ds, ok := cfg.DataStores[cfg.VisibilityStore]; ok {
+		if err := verifyCompatibleVersion(ds, cassandra.VisibilityVersion); err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
-// checkCompatibleVersion check the version compatibility
-func checkCompatibleVersion(cfg config.Cassandra, keyspace string, dirPath string) error {
-	client, err := newCQLClient(&CQLClientConfig{
-		Hosts:    cfg.Hosts,
-		Port:     cfg.Port,
-		User:     cfg.User,
-		Password: cfg.Password,
-		Keyspace: keyspace,
-		Timeout:  defaultTimeout,
+func verifyCompatibleVersion(
+	ds config.DataStore,
+	expectedCassandraVersion string,
+) error {
+	if ds.NoSQL == nil {
+		// not using nosql
+		return nil
+	}
+
+	// Use hardcoded instead of constant because of cycle dependency issue.
+	// However, this file will be refactor to support NoSQL soon. After the refactoring, cycle dependency issue
+	// should be gone and we can use constant at that time
+	if ds.NoSQL.PluginName != "cassandra" {
+		return fmt.Errorf("unknown NoSQL plugin name: %q", ds.NoSQL.PluginName)
+	}
+
+	return CheckCompatibleVersion(*ds.NoSQL, expectedCassandraVersion)
+}
+
+// CheckCompatibleVersion check the version compatibility
+func CheckCompatibleVersion(
+	cfg config.Cassandra,
+	expectedVersion string,
+) error {
+
+	client, err := NewCQLClient(&CQLClientConfig{
+		Hosts:                 cfg.Hosts,
+		Port:                  cfg.Port,
+		User:                  cfg.User,
+		Password:              cfg.Password,
+		Keyspace:              cfg.Keyspace,
+		AllowedAuthenticators: cfg.AllowedAuthenticators,
+		Timeout:               DefaultTimeout,
+		ConnectTimeout:        DefaultConnectTimeout,
+		TLS:                   cfg.TLS,
+		ProtoVersion:          cfg.ProtoVersion,
 	})
 	if err != nil {
-		return fmt.Errorf("unable to create CQL Client: %v", err.Error())
+		return fmt.Errorf("creating CQL client: %w", err)
 	}
 	defer client.Close()
-	return schema.VerifyCompatibleVersion(client, dirPath, cfg.Keyspace)
+
+	return schema.VerifyCompatibleVersion(client, cfg.Keyspace, expectedVersion)
 }
 
 // setupSchema executes the setupSchemaTask
@@ -85,7 +115,7 @@ func setupSchema(cli *cli.Context) error {
 	if err != nil {
 		return handleErr(schema.NewConfigError(err.Error()))
 	}
-	client, err := newCQLClient(config)
+	client, err := NewCQLClient(config)
 	if err != nil {
 		return handleErr(err)
 	}
@@ -103,14 +133,7 @@ func updateSchema(cli *cli.Context) error {
 	if err != nil {
 		return handleErr(schema.NewConfigError(err.Error()))
 	}
-	if config.Keyspace == schema.DryrunDBName {
-		cfg := *config
-		if err := doCreateKeyspace(cfg, cfg.Keyspace); err != nil {
-			return handleErr(fmt.Errorf("error creating dryrun Keyspace: %v", err))
-		}
-		defer doDropKeyspace(cfg, cfg.Keyspace)
-	}
-	client, err := newCQLClient(config)
+	client, err := NewCQLClient(config)
 	if err != nil {
 		return handleErr(err)
 	}
@@ -131,64 +154,69 @@ func createKeyspace(cli *cli.Context) error {
 	if keyspace == "" {
 		return handleErr(schema.NewConfigError("missing " + flag(schema.CLIOptKeyspace) + " argument "))
 	}
-	err = doCreateKeyspace(*config, keyspace)
+	datacenter := cli.String(schema.CLIOptDatacenter)
+	err = doCreateKeyspace(*config, keyspace, datacenter)
 	if err != nil {
 		return handleErr(fmt.Errorf("error creating Keyspace:%v", err))
 	}
 	return nil
 }
 
-func doCreateKeyspace(cfg CQLClientConfig, name string) error {
-	cfg.Keyspace = systemKeyspace
-	client, err := newCQLClient(&cfg)
+func doCreateKeyspace(cfg CQLClientConfig, name string, datacenter string) error {
+	cfg.Keyspace = SystemKeyspace
+	client, err := NewCQLClient(&cfg)
 	if err != nil {
 		return err
 	}
 	defer client.Close()
-	return client.createKeyspace(name)
-}
-
-func doDropKeyspace(cfg CQLClientConfig, name string) {
-	cfg.Keyspace = systemKeyspace
-	client, err := newCQLClient(&cfg)
-	if err != nil {
-		return
+	if datacenter != "" {
+		return client.CreateNTSKeyspace(name, datacenter)
 	}
-	client.dropKeyspace(name)
-	client.Close()
+	return client.CreateKeyspace(name)
 }
 
 func newCQLClientConfig(cli *cli.Context) (*CQLClientConfig, error) {
-	config := new(CQLClientConfig)
-	config.Hosts = cli.GlobalString(schema.CLIOptEndpoint)
-	config.Port = cli.GlobalInt(schema.CLIOptPort)
-	config.User = cli.GlobalString(schema.CLIOptUser)
-	config.Password = cli.GlobalString(schema.CLIOptPassword)
-	config.Timeout = cli.GlobalInt(schema.CLIOptTimeout)
-	config.Keyspace = cli.GlobalString(schema.CLIOptKeyspace)
-	config.numReplicas = cli.Int(schema.CLIOptReplicationFactor)
-	isDryRun := cli.Bool(schema.CLIOptDryrun)
-	if err := validateCQLClientConfig(config, isDryRun); err != nil {
+	cqlConfig := new(CQLClientConfig)
+	cqlConfig.Hosts = cli.GlobalString(schema.CLIOptEndpoint)
+	cqlConfig.Port = cli.GlobalInt(schema.CLIOptPort)
+	cqlConfig.User = cli.GlobalString(schema.CLIOptUser)
+	cqlConfig.Password = cli.GlobalString(schema.CLIOptPassword)
+	cqlConfig.AllowedAuthenticators = cli.GlobalStringSlice(schema.CLIOptAllowedAuthenticators)
+	cqlConfig.Timeout = cli.GlobalInt(schema.CLIOptTimeout)
+	cqlConfig.ConnectTimeout = cli.GlobalInt(schema.CLIOptConnectTimeout)
+	cqlConfig.Keyspace = cli.GlobalString(schema.CLIOptKeyspace)
+	cqlConfig.NumReplicas = cli.Int(schema.CLIOptReplicationFactor)
+	cqlConfig.ProtoVersion = cli.Int(schema.CLIOptProtoVersion)
+
+	if cli.GlobalBool(schema.CLIFlagEnableTLS) {
+		cqlConfig.TLS = &config.TLS{
+			Enabled:                true,
+			CertFile:               cli.GlobalString(schema.CLIFlagTLSCertFile),
+			KeyFile:                cli.GlobalString(schema.CLIFlagTLSKeyFile),
+			CaFile:                 cli.GlobalString(schema.CLIFlagTLSCaFile),
+			EnableHostVerification: cli.GlobalBool(schema.CLIFlagTLSEnableHostVerification),
+			ServerName:             cli.GlobalString(schema.CLIFlagTLSServerName),
+		}
+	}
+
+	if err := validateCQLClientConfig(cqlConfig); err != nil {
 		return nil, err
 	}
-	return config, nil
+	return cqlConfig, nil
 }
 
-func validateCQLClientConfig(config *CQLClientConfig, isDryRun bool) error {
+func validateCQLClientConfig(config *CQLClientConfig) error {
 	if len(config.Hosts) == 0 {
 		return schema.NewConfigError("missing cassandra endpoint argument " + flag(schema.CLIOptEndpoint))
 	}
 	if config.Keyspace == "" {
-		if !isDryRun {
-			return schema.NewConfigError("missing " + flag(schema.CLIOptKeyspace) + " argument ")
-		}
-		config.Keyspace = schema.DryrunDBName
+		return schema.NewConfigError("missing " + flag(schema.CLIOptKeyspace) + " argument ")
 	}
 	if config.Port == 0 {
-		config.Port = defaultCassandraPort
+		config.Port = DefaultCassandraPort
 	}
-	if config.numReplicas == 0 {
-		config.numReplicas = defaultNumReplicas
+	if config.NumReplicas == 0 {
+		config.NumReplicas = defaultNumReplicas
 	}
 
 	return nil

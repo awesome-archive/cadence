@@ -23,22 +23,23 @@ package cassandra
 import (
 	"os"
 
-	"github.com/uber/cadence/tools/common/schema"
 	"github.com/urfave/cli"
+
+	"github.com/uber/cadence/tools/common/schema"
 )
 
 // RunTool runs the cadence-cassandra-tool command line tool
 func RunTool(args []string) error {
-	app := buildCLIOptions()
+	app := BuildCLIOptions()
 	return app.Run(args)
 }
 
 // SetupSchema setups the cassandra schema
 func SetupSchema(config *SetupSchemaConfig) error {
-	if err := validateCQLClientConfig(&config.CQLClientConfig, false); err != nil {
+	if err := validateCQLClientConfig(&config.CQLClientConfig); err != nil {
 		return err
 	}
-	db, err := newCQLClient(&config.CQLClientConfig)
+	db, err := NewCQLClient(&config.CQLClientConfig)
 	if err != nil {
 		return err
 	}
@@ -54,7 +55,7 @@ func cliHandler(c *cli.Context, handler func(c *cli.Context) error) {
 	}
 }
 
-func buildCLIOptions() *cli.App {
+func BuildCLIOptions() *cli.App {
 
 	app := cli.NewApp()
 	app.Name = "cadence-cassandra-tool"
@@ -70,9 +71,9 @@ func buildCLIOptions() *cli.App {
 		},
 		cli.IntFlag{
 			Name:   schema.CLIFlagPort,
-			Value:  defaultCassandraPort,
+			Value:  DefaultCassandraPort,
 			Usage:  "Port of cassandra host to connect to",
-			EnvVar: "CASSANDRA_PORT",
+			EnvVar: "CASSANDRA_DB_PORT",
 		},
 		cli.StringFlag{
 			Name:   schema.CLIFlagUser,
@@ -86,11 +87,21 @@ func buildCLIOptions() *cli.App {
 			Usage:  "Password used for authentication for connecting to cassandra host",
 			EnvVar: "CASSANDRA_PASSWORD",
 		},
+		cli.StringSliceFlag{
+			Name:  schema.CLIFlagAllowedAuthenticators,
+			Value: &cli.StringSlice{""},
+			Usage: "Set allowed authenticators for servers with custom authenticators",
+		},
 		cli.IntFlag{
 			Name:   schema.CLIFlagTimeout,
-			Value:  defaultTimeout,
+			Value:  DefaultTimeout,
 			Usage:  "request Timeout in seconds used for cql client",
 			EnvVar: "CASSANDRA_TIMEOUT",
+		},
+		cli.IntFlag{
+			Name:  schema.CLIOptConnectTimeout,
+			Value: DefaultConnectTimeout,
+			Usage: "Connection Timeout in seconds used for cql client",
 		},
 		cli.StringFlag{
 			Name:   schema.CLIFlagKeyspace,
@@ -101,6 +112,42 @@ func buildCLIOptions() *cli.App {
 		cli.BoolFlag{
 			Name:  schema.CLIFlagQuiet,
 			Usage: "Don't set exit status to 1 on error",
+		},
+		cli.IntFlag{
+			Name:   schema.CLIFlagProtoVersion,
+			Usage:  "Protocol Version to connect to cassandra host",
+			EnvVar: "CASSANDRA_PROTO_VERSION",
+		},
+
+		cli.BoolFlag{
+			Name:   schema.CLIFlagEnableTLS,
+			Usage:  "enable TLS",
+			EnvVar: "CASSANDRA_ENABLE_TLS",
+		},
+		cli.StringFlag{
+			Name:   schema.CLIFlagTLSCertFile,
+			Usage:  "TLS cert file",
+			EnvVar: "CASSANDRA_TLS_CERT",
+		},
+		cli.StringFlag{
+			Name:   schema.CLIFlagTLSKeyFile,
+			Usage:  "TLS key file",
+			EnvVar: "CASSANDRA_TLS_KEY",
+		},
+		cli.StringFlag{
+			Name:   schema.CLIFlagTLSCaFile,
+			Usage:  "TLS CA file",
+			EnvVar: "CASSANDRA_TLS_CA",
+		},
+		cli.BoolFlag{
+			Name:   schema.CLIFlagTLSEnableHostVerification,
+			Usage:  "TLS host verification",
+			EnvVar: "CASSANDRA_TLS_VERIFY_HOST",
+		},
+		cli.StringFlag{
+			Name:   schema.CLIFlagTLSServerName,
+			Usage:  "TLS ServerName",
+			EnvVar: "CASSANDRA_TLS_SERVER_NAME",
 		},
 	}
 
@@ -156,11 +203,16 @@ func buildCLIOptions() *cli.App {
 		{
 			Name:    "create-Keyspace",
 			Aliases: []string{"create"},
-			Usage:   "creates a Keyspace with simple strategy",
+			Usage:   "creates a Keyspace with simple strategy. If datacenter is provided, will use network topology strategy",
 			Flags: []cli.Flag{
 				cli.StringFlag{
 					Name:  schema.CLIFlagKeyspace,
 					Usage: "name of the Keyspace",
+				},
+				cli.StringFlag{
+					Name:  schema.CLIFlagDatacenter,
+					Value: "",
+					Usage: "name of the cassandra datacenter, used when creating the keyspace with network topology strategy",
 				},
 				cli.IntFlag{
 					Name:  schema.CLIFlagReplicationFactor,

@@ -23,12 +23,12 @@ package archiver
 import (
 	"context"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 )
 
 type (
@@ -39,7 +39,6 @@ type (
 		DomainName           string
 		WorkflowID           string
 		RunID                string
-		EventStoreVersion    int32
 		BranchToken          []byte
 		NextEventID          int64
 		CloseFailoverVersion int64
@@ -57,14 +56,13 @@ type (
 
 	// GetHistoryResponse is the response of Get archived history
 	GetHistoryResponse struct {
-		HistoryBatches []*shared.History
+		HistoryBatches []*types.History
 		NextPageToken  []byte
 	}
 
 	// HistoryBootstrapContainer contains components needed by all history Archiver implementations
 	HistoryBootstrapContainer struct {
-		HistoryManager   persistence.HistoryManager
-		HistoryV2Manager persistence.HistoryV2Manager
+		HistoryV2Manager persistence.HistoryManager
 		Logger           log.Logger
 		MetricsClient    metrics.Client
 		ClusterMetadata  cluster.Metadata
@@ -89,16 +87,18 @@ type (
 	// ArchiveVisibilityRequest is request to Archive single workflow visibility record
 	ArchiveVisibilityRequest struct {
 		DomainID           string
+		DomainName         string // doesn't need to be archived
 		WorkflowID         string
 		RunID              string
 		WorkflowTypeName   string
 		StartTimestamp     int64
 		ExecutionTimestamp int64
 		CloseTimestamp     int64
-		CloseStatus        shared.WorkflowExecutionCloseStatus
+		CloseStatus        types.WorkflowExecutionCloseStatus
 		HistoryLength      int64
-		Memo               *shared.Memo
-		SearchAttributes   map[string][]byte
+		Memo               *types.Memo
+		SearchAttributes   map[string]string
+		HistoryArchivalURI string
 	}
 
 	// QueryVisibilityRequest is the request to query archived visibility records
@@ -111,7 +111,7 @@ type (
 
 	// QueryVisibilityResponse is the response of querying archived visibility records
 	QueryVisibilityResponse struct {
-		Executions    []*shared.WorkflowExecutionInfo
+		Executions    []*types.WorkflowExecutionInfo
 		NextPageToken []byte
 	}
 

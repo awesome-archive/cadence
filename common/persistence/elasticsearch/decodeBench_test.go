@@ -23,12 +23,16 @@ package elasticsearch
 import (
 	"bytes"
 	"encoding/json"
+	"testing"
+	"time"
+
+	es "github.com/uber/cadence/common/elasticsearch"
+
 	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/definition"
 	p "github.com/uber/cadence/common/persistence"
-	"testing"
-	"time"
+	"github.com/uber/cadence/common/types/mapper/thrift"
 )
 
 var (
@@ -41,8 +45,11 @@ var (
          "StartTime": 1547596872371000000,
          "WorkflowID": "6bfbc1e5-6ce4-4e22-bbfb-e0faa9a7a604-1-2256",
          "WorkflowType": "TestWorkflowExecute",
- 		 "Encoding" : "thriftrw",
- 	     "Memo" : "WQ0ACgsLAAAAAwAAAAJrMgAAAAkidmFuY2V4dSIAAAACazMAAAADMTIzAAAAAmsxAAAAUXsia2V5MSI6MTIzNDMyMSwia2V5MiI6ImEgc3RyaW5nIGlzIHZlcnkgbG9uZyIsIm1hcCI6eyJtS2V5IjoxMjM0MywiYXNkIjoiYXNkZiJ9fQA="}`)
+         "Encoding" : "thriftrw",
+         "TaskList" : "taskList",
+         "IsCron" : "false",
+         "NumClusters" : "2",
+         "Memo" : "WQ0ACgsLAAAAAwAAAAJrMgAAAAkidmFuY2V4dSIAAAACazMAAAADMTIzAAAAAmsxAAAAUXsia2V5MSI6MTIzNDMyMSwia2V5MiI6ImEgc3RyaW5nIGlzIHZlcnkgbG9uZyIsIm1hcCI6eyJtS2V5IjoxMjM0MywiYXNkIjoiYXNkZiJ9fQA="}`)
 )
 
 /*
@@ -50,25 +57,32 @@ BenchmarkJSONDecodeToType-8       200000              9321 ns/op
 BenchmarkJSONDecodeToMap-8        100000             12878 ns/op
 */
 
+// nolint
 func BenchmarkJSONDecodeToType(b *testing.B) {
 	bytes := (*json.RawMessage)(&data)
 	for i := 0; i < b.N; i++ {
-		var source *visibilityRecord
+		var source *es.VisibilityRecord
 		json.Unmarshal(*bytes, &source)
-		record := &p.VisibilityWorkflowExecutionInfo{
+		record := &p.InternalVisibilityWorkflowExecutionInfo{
+			DomainID:      source.DomainID,
+			WorkflowType:  source.WorkflowType,
 			WorkflowID:    source.WorkflowID,
 			RunID:         source.RunID,
 			TypeName:      source.WorkflowType,
 			StartTime:     time.Unix(0, source.StartTime),
 			ExecutionTime: time.Unix(0, source.ExecutionTime),
 			Memo:          p.NewDataBlob(source.Memo, common.EncodingType(source.Encoding)),
+			TaskList:      source.TaskList,
+			IsCron:        source.IsCron,
+			NumClusters:   source.NumClusters,
 		}
 		record.CloseTime = time.Unix(0, source.CloseTime)
-		record.Status = &source.CloseStatus
+		record.Status = thrift.ToWorkflowExecutionCloseStatus(&source.CloseStatus)
 		record.HistoryLength = source.HistoryLength
 	}
 }
 
+// nolint
 func BenchmarkJSONDecodeToMap(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var source map[string]interface{}
@@ -82,17 +96,22 @@ func BenchmarkJSONDecodeToMap(b *testing.B) {
 		closeStatus, _ := source[definition.CloseStatus].(json.Number).Int64()
 		historyLen, _ := source[definition.HistoryLength].(json.Number).Int64()
 
-		record := &p.VisibilityWorkflowExecutionInfo{
+		record := &p.InternalVisibilityWorkflowExecutionInfo{
+			DomainID:      source[definition.DomainID].(string),
+			WorkflowType:  source[definition.WorkflowType].(string),
 			WorkflowID:    source[definition.WorkflowID].(string),
 			RunID:         source[definition.RunID].(string),
 			TypeName:      source[definition.WorkflowType].(string),
 			StartTime:     time.Unix(0, startTime),
 			ExecutionTime: time.Unix(0, executionTime),
+			TaskList:      source[definition.TaskList].(string),
+			IsCron:        source[definition.IsCron].(bool),
+			NumClusters:   source[definition.NumClusters].(int16),
 			Memo:          p.NewDataBlob([]byte(source[definition.Memo].(string)), common.EncodingType(source[definition.Encoding].(string))),
 		}
 		record.CloseTime = time.Unix(0, closeTime)
 		status := (shared.WorkflowExecutionCloseStatus)(int32(closeStatus))
-		record.Status = &status
+		record.Status = thrift.ToWorkflowExecutionCloseStatus(&status)
 		record.HistoryLength = historyLen
 	}
 }

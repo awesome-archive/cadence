@@ -23,14 +23,17 @@ package sql
 import (
 	"os"
 
-	_ "github.com/go-sql-driver/mysql" // needed to load the mysql driver
-	"github.com/uber/cadence/tools/common/schema"
 	"github.com/urfave/cli"
+
+	cliflag "github.com/uber/cadence/tools/common/flag"
+	"github.com/uber/cadence/tools/common/schema"
 )
+
+const defaultSQLPort = 3306
 
 // RunTool runs the cadence-cassandra-tool command line tool
 func RunTool(args []string) error {
-	app := buildCLIOptions()
+	app := BuildCLIOptions()
 	return app.Run(args)
 }
 
@@ -43,7 +46,8 @@ func cliHandler(c *cli.Context, handler func(c *cli.Context) error) {
 	}
 }
 
-func buildCLIOptions() *cli.App {
+// BuildCLIOptions builds the options for cli
+func BuildCLIOptions() *cli.App {
 
 	app := cli.NewApp()
 	app.Name = "cadence-sql-tool"
@@ -82,14 +86,45 @@ func buildCLIOptions() *cli.App {
 			EnvVar: "SQL_DATABASE",
 		},
 		cli.StringFlag{
-			Name:   schema.CLIFlagDriverName,
+			Name:   schema.CLIFlagPluginName,
 			Value:  "mysql",
-			Usage:  "name of the sql driver",
-			EnvVar: "SQL_DRIVER",
+			Usage:  "name of the sql plugin",
+			EnvVar: "SQL_PLUGIN",
 		},
 		cli.BoolFlag{
 			Name:  schema.CLIFlagQuiet,
 			Usage: "Don't set exit status to 1 on error",
+		},
+		cli.GenericFlag{
+			Name:   schema.CLIFlagConnectAttributes,
+			Value:  &cliflag.StringMap{},
+			Usage:  "sql connect attributes (must be in key1=value1,key2=value2,...,keyN=valueN format, e.g. cluster=dca or cluster=dca,instance=cadence)",
+			EnvVar: "SQL_CONNECT_ATTRIBUTES",
+		},
+		cli.BoolFlag{
+			Name:   schema.CLIFlagEnableTLS,
+			Usage:  "enable TLS over sql connection",
+			EnvVar: "SQL_TLS",
+		},
+		cli.StringFlag{
+			Name:   schema.CLIFlagTLSCertFile,
+			Usage:  "sql tls client cert path (tls must be enabled)",
+			EnvVar: "SQL_TLS_CERT_FILE",
+		},
+		cli.StringFlag{
+			Name:   schema.CLIFlagTLSKeyFile,
+			Usage:  "sql tls client key path (tls must be enabled)",
+			EnvVar: "SQL_TLS_KEY_FILE",
+		},
+		cli.StringFlag{
+			Name:   schema.CLIFlagTLSCaFile,
+			Usage:  "sql tls client ca file (tls must be enabled)",
+			EnvVar: "SQL_TLS_CA_FILE",
+		},
+		cli.BoolFlag{
+			Name:   schema.CLIFlagTLSEnableHostVerification,
+			Usage:  "sql tls verify hostname and server cert (tls must be enabled)",
+			EnvVar: "SQL_TLS_ENABLE_HOST_VERIFICATION",
 		},
 	}
 
@@ -135,7 +170,7 @@ func buildCLIOptions() *cli.App {
 				},
 				cli.BoolFlag{
 					Name:  schema.CLIFlagDryrun,
-					Usage: "do a dryrun",
+					Usage: "do a dryrun, which will print queries only without executing them",
 				},
 			},
 			Action: func(c *cli.Context) {

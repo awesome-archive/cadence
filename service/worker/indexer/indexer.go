@@ -22,13 +22,15 @@ package indexer
 
 import (
 	"fmt"
+
 	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/config"
+	"github.com/uber/cadence/common/dynamicconfig"
 	es "github.com/uber/cadence/common/elasticsearch"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/messaging"
 	"github.com/uber/cadence/common/metrics"
-	"github.com/uber/cadence/common/service/dynamicconfig"
 )
 
 type (
@@ -36,10 +38,9 @@ type (
 	Indexer struct {
 		config              *Config
 		kafkaClient         messaging.Client
-		esClient            es.Client
+		esClient            es.GenericClient
 		logger              log.Logger
 		metricsClient       metrics.Client
-		dynamicCollection   *dynamicconfig.Collection
 		visibilityProcessor *indexProcessor
 		visibilityIndexName string
 	}
@@ -60,8 +61,14 @@ const (
 )
 
 // NewIndexer create a new Indexer
-func NewIndexer(config *Config, client messaging.Client, esClient es.Client, esConfig *es.Config,
-	logger log.Logger, metricsClient metrics.Client) *Indexer {
+func NewIndexer(
+	config *Config,
+	client messaging.Client,
+	esClient es.GenericClient,
+	esConfig *config.ElasticSearchConfig,
+	logger log.Logger,
+	metricsClient metrics.Client,
+) *Indexer {
 	logger = logger.WithTags(tag.ComponentIndexer)
 
 	return &Indexer{
@@ -75,7 +82,7 @@ func NewIndexer(config *Config, client messaging.Client, esClient es.Client, esC
 }
 
 // Start indexer
-func (x Indexer) Start() error {
+func (x *Indexer) Start() error {
 	visibilityApp := common.VisibilityAppName
 	visConsumerName := getConsumerName(x.visibilityIndexName)
 	x.visibilityProcessor = newIndexProcessor(visibilityApp, visConsumerName, x.kafkaClient, x.esClient,
@@ -84,7 +91,7 @@ func (x Indexer) Start() error {
 }
 
 // Stop indexer
-func (x Indexer) Stop() {
+func (x *Indexer) Stop() {
 	x.visibilityProcessor.Stop()
 }
 

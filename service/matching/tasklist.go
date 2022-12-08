@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/persistence"
 )
 
@@ -44,11 +45,6 @@ type (
 	}
 )
 
-const (
-	// taskListPartitionPrefix is the required naming prefix for any task list partition other than partition 0
-	taskListPartitionPrefix = "/__cadence_sys/"
-)
-
 // newTaskListName returns a fully qualified task list name.
 // Fully qualified names contain additional metadata about task list
 // derived from their given name. The additional metadata only makes sense
@@ -56,7 +52,7 @@ const (
 // one partition for a user specified task list, each of the
 // individual partitions have an internal name of the form
 //
-//     /__cadence_sys/[original-name]/[partitionID]
+//	/__cadence_sys/[original-name]/[partitionID]
 //
 // The name of the root partition is always the same as the user specified name. Rest of
 // the partitions follow the naming convention above. In addition, the task lists partitions
@@ -82,9 +78,16 @@ func (tn *qualifiedTaskListName) IsRoot() bool {
 	return tn.partition == 0
 }
 
+// GetRoot returns the root name for a task list
+func (tn *qualifiedTaskListName) GetRoot() string {
+	return tn.baseName
+}
+
 // Parent returns the name of the parent task list
 // input:
-//   degree: Number of children at each level of the tree
+//
+//	degree: Number of children at each level of the tree
+//
 // Returns empty string if this task list is the root
 func (tn *qualifiedTaskListName) Parent(degree int) string {
 	if tn.IsRoot() || degree == 0 {
@@ -98,16 +101,16 @@ func (tn *qualifiedTaskListName) mkName(partition int) string {
 	if partition == 0 {
 		return tn.baseName
 	}
-	return fmt.Sprintf("%v%v/%v", taskListPartitionPrefix, tn.baseName, partition)
+	return fmt.Sprintf("%v%v/%v", common.ReservedTaskListPrefix, tn.baseName, partition)
 }
 
 func (tn *qualifiedTaskListName) init() error {
-	if !strings.HasPrefix(tn.name, taskListPartitionPrefix) {
+	if !strings.HasPrefix(tn.name, common.ReservedTaskListPrefix) {
 		return nil
 	}
 
 	suffixOff := strings.LastIndex(tn.name, "/")
-	if suffixOff <= len(taskListPartitionPrefix) {
+	if suffixOff <= len(common.ReservedTaskListPrefix) {
 		return fmt.Errorf("invalid partitioned task list name %v", tn.name)
 	}
 
@@ -117,16 +120,21 @@ func (tn *qualifiedTaskListName) init() error {
 	}
 
 	tn.partition = p
-	tn.baseName = tn.name[len(taskListPartitionPrefix):suffixOff]
+	tn.baseName = tn.name[len(common.ReservedTaskListPrefix):suffixOff]
 	return nil
 }
 
-// newTaskListID returns taskListID which uniquely identfies as task list
-func newTaskListID(domainID, taskListName string, taskType int) (*taskListID, error) {
+// newTaskListID returns taskListID which uniquely identifies as task list
+func newTaskListID(
+	domainID string,
+	taskListName string,
+	taskType int,
+) (*taskListID, error) {
 	name, err := newTaskListName(taskListName)
 	if err != nil {
 		return nil, err
 	}
+
 	return &taskListID{
 		qualifiedTaskListName: name,
 		domainID:              domainID,

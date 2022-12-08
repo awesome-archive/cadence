@@ -22,15 +22,21 @@ package provider
 
 import (
 	"errors"
+	"sync"
+
+	"github.com/uber/cadence/common/archiver/gcloud"
 
 	"github.com/uber/cadence/common/archiver"
 	"github.com/uber/cadence/common/archiver/filestore"
-	"github.com/uber/cadence/common/service/config"
+	"github.com/uber/cadence/common/archiver/s3store"
+	"github.com/uber/cadence/common/config"
 )
 
 var (
 	// ErrUnknownScheme is the error for unknown archiver scheme
 	ErrUnknownScheme = errors.New("unknown archiver scheme")
+	// ErrNotSupported is the error for not supported archiver implementation
+	ErrNotSupported = errors.New("archiver provider not supported")
 	// ErrBootstrapContainerNotFound is the error for unable to find the bootstrap container given serviceName
 	ErrBootstrapContainerNotFound = errors.New("unable to find bootstrap container for the given service name")
 	// ErrArchiverConfigNotFound is the error for unable to find the config for an archiver given scheme
@@ -53,6 +59,8 @@ type (
 	}
 
 	archiverProvider struct {
+		sync.RWMutex
+
 		historyArchiverConfigs    *config.HistoryArchiverProvider
 		visibilityArchiverConfigs *config.VisibilityArchiverProvider
 
@@ -91,6 +99,9 @@ func (p *archiverProvider) RegisterBootstrapContainer(
 	historyContainer *archiver.HistoryBootstrapContainer,
 	visibilityContainter *archiver.VisibilityBootstrapContainer,
 ) error {
+	p.Lock()
+	defer p.Unlock()
+
 	if _, ok := p.historyContainers[serviceName]; ok && historyContainer != nil {
 		return ErrBootstrapContainerAlreadyRegistered
 	}
@@ -107,11 +118,14 @@ func (p *archiverProvider) RegisterBootstrapContainer(
 	return nil
 }
 
-func (p *archiverProvider) GetHistoryArchiver(scheme, serviceName string) (archiver.HistoryArchiver, error) {
+func (p *archiverProvider) GetHistoryArchiver(scheme, serviceName string) (historyArchiver archiver.HistoryArchiver, err error) {
 	archiverKey := p.getArchiverKey(scheme, serviceName)
+	p.RLock()
 	if historyArchiver, ok := p.historyArchivers[archiverKey]; ok {
+		p.RUnlock()
 		return historyArchiver, nil
 	}
+	p.RUnlock()
 
 	container, ok := p.historyContainers[serviceName]
 	if !ok {
@@ -123,40 +137,86 @@ func (p *archiverProvider) GetHistoryArchiver(scheme, serviceName string) (archi
 		if p.historyArchiverConfigs.Filestore == nil {
 			return nil, ErrArchiverConfigNotFound
 		}
-		historyArchiver, err := filestore.NewHistoryArchiver(container, p.historyArchiverConfigs.Filestore)
-		if err != nil {
-			return nil, err
+		historyArchiver, err = filestore.NewHistoryArchiver(container, p.historyArchiverConfigs.Filestore)
+
+	case gcloud.URIScheme:
+		if p.historyArchiverConfigs.Gstorage == nil {
+			return nil, ErrArchiverConfigNotFound
 		}
-		p.historyArchivers[archiverKey] = historyArchiver
-		return historyArchiver, nil
+
+		historyArchiver, err = gcloud.NewHistoryArchiver(container, p.historyArchiverConfigs.Gstorage)
+
+	case s3store.URIScheme:
+		if p.historyArchiverConfigs.S3store == nil {
+			return nil, ErrArchiverConfigNotFound
+		}
+		historyArchiver, err = s3store.NewHistoryArchiver(container, p.historyArchiverConfigs.S3store)
+	default:
+		return nil, ErrUnknownScheme
 	}
-	return nil, ErrUnknownScheme
+
+	if err != nil {
+		return nil, err
+	}
+
+	p.Lock()
+	defer p.Unlock()
+	if existingHistoryArchiver, ok := p.historyArchivers[archiverKey]; ok {
+		return existingHistoryArchiver, nil
+	}
+	p.historyArchivers[archiverKey] = historyArchiver
+	return historyArchiver, nil
 }
 
 func (p *archiverProvider) GetVisibilityArchiver(scheme, serviceName string) (archiver.VisibilityArchiver, error) {
 	archiverKey := p.getArchiverKey(scheme, serviceName)
+	p.RLock()
 	if visibilityArchiver, ok := p.visibilityArchivers[archiverKey]; ok {
+		p.RUnlock()
 		return visibilityArchiver, nil
 	}
+	p.RUnlock()
 
 	container, ok := p.visibilityContainers[serviceName]
 	if !ok {
 		return nil, ErrBootstrapContainerNotFound
 	}
 
+	var visibilityArchiver archiver.VisibilityArchiver
+	var err error
+
 	switch scheme {
 	case filestore.URIScheme:
 		if p.visibilityArchiverConfigs.Filestore == nil {
 			return nil, ErrArchiverConfigNotFound
 		}
-		visibilityArchiver, err := filestore.NewVisibilityArchiver(container, p.visibilityArchiverConfigs.Filestore)
-		if err != nil {
-			return nil, err
+		visibilityArchiver, err = filestore.NewVisibilityArchiver(container, p.visibilityArchiverConfigs.Filestore)
+	case s3store.URIScheme:
+		if p.visibilityArchiverConfigs.S3store == nil {
+			return nil, ErrArchiverConfigNotFound
 		}
-		p.visibilityArchivers[archiverKey] = visibilityArchiver
-		return visibilityArchiver, nil
+		visibilityArchiver, err = s3store.NewVisibilityArchiver(container, p.visibilityArchiverConfigs.S3store)
+	case gcloud.URIScheme:
+		if p.visibilityArchiverConfigs.Gstorage == nil {
+			return nil, ErrArchiverConfigNotFound
+		}
+		visibilityArchiver, err = gcloud.NewVisibilityArchiver(container, p.visibilityArchiverConfigs.Gstorage)
+
+	default:
+		return nil, ErrUnknownScheme
 	}
-	return nil, ErrUnknownScheme
+	if err != nil {
+		return nil, err
+	}
+
+	p.Lock()
+	defer p.Unlock()
+	if existingVisibilityArchiver, ok := p.visibilityArchivers[archiverKey]; ok {
+		return existingVisibilityArchiver, nil
+	}
+	p.visibilityArchivers[archiverKey] = visibilityArchiver
+	return visibilityArchiver, nil
+
 }
 
 func (p *archiverProvider) getArchiverKey(scheme, serviceName string) string {

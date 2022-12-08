@@ -21,41 +21,84 @@
 package tasklist
 
 import (
+	"context"
 	"time"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common/backoff"
 	p "github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 )
 
 var retryForeverPolicy = newRetryForeverPolicy()
 
-func (s *Scavenger) completeTasks(key *taskListKey, taskID int64, limit int) (int, error) {
-	var n int
+func (s *Scavenger) completeTasks(info *p.TaskListInfo, taskID int64, limit int) (int, error) {
+	var resp *p.CompleteTasksLessThanResponse
 	var err error
-	s.retryForever(func() error {
-		n, err = s.db.CompleteTasksLessThan(&p.CompleteTasksLessThanRequest{
-			DomainID:     key.DomainID,
-			TaskListName: key.Name,
-			TaskType:     key.TaskType,
+	domainName, errorDomain := s.cache.GetDomainName(info.DomainID)
+	if errorDomain != nil {
+		return 0, errorDomain
+	}
+	err = s.retryForever(func() error {
+		resp, err = s.db.CompleteTasksLessThan(s.ctx, &p.CompleteTasksLessThanRequest{
+			DomainID:     info.DomainID,
+			TaskListName: info.Name,
+			TaskType:     info.TaskType,
 			TaskID:       taskID,
 			Limit:        limit,
+			DomainName:   domainName,
 		})
 		return err
 	})
-	return n, err
+	if resp != nil {
+		return resp.TasksCompleted, err
+	}
+	return 0, err
 }
 
-func (s *Scavenger) getTasks(key *taskListKey, batchSize int) (*p.GetTasksResponse, error) {
+func (s *Scavenger) getOrphanTasks(limit int) (*p.GetOrphanTasksResponse, error) {
+	var tasks *p.GetOrphanTasksResponse
+	var err error
+	err = s.retryForever(func() error {
+		tasks, err = s.db.GetOrphanTasks(s.ctx, &p.GetOrphanTasksRequest{
+			Limit: limit,
+		})
+		return err
+	})
+	return tasks, err
+}
+
+func (s *Scavenger) completeTask(info *p.TaskListInfo, taskid int64) error {
+	var err error
+	domainName, errorDomain := s.cache.GetDomainName(info.DomainID)
+	if errorDomain != nil {
+		return errorDomain
+	}
+	err = s.retryForever(func() error {
+		err = s.db.CompleteTask(s.ctx, &p.CompleteTaskRequest{
+			TaskList:   info,
+			TaskID:     taskid,
+			DomainName: domainName,
+		})
+		return err
+	})
+	return err
+}
+
+func (s *Scavenger) getTasks(info *p.TaskListInfo, batchSize int) (*p.GetTasksResponse, error) {
 	var err error
 	var resp *p.GetTasksResponse
-	s.retryForever(func() error {
-		resp, err = s.db.GetTasks(&p.GetTasksRequest{
-			DomainID:  key.DomainID,
-			TaskList:  key.Name,
-			TaskType:  key.TaskType,
-			ReadLevel: -1, // get the first N tasks sorted by taskID
-			BatchSize: batchSize,
+	domainName, errorDomain := s.cache.GetDomainName(info.DomainID)
+	if errorDomain != nil {
+		return nil, errorDomain
+	}
+	err = s.retryForever(func() error {
+		resp, err = s.db.GetTasks(s.ctx, &p.GetTasksRequest{
+			DomainID:   info.DomainID,
+			TaskList:   info.Name,
+			TaskType:   info.TaskType,
+			ReadLevel:  -1, // get the first N tasks sorted by taskID
+			BatchSize:  batchSize,
+			DomainName: domainName,
 		})
 		return err
 	})
@@ -65,8 +108,8 @@ func (s *Scavenger) getTasks(key *taskListKey, batchSize int) (*p.GetTasksRespon
 func (s *Scavenger) listTaskList(pageSize int, pageToken []byte) (*p.ListTaskListResponse, error) {
 	var err error
 	var resp *p.ListTaskListResponse
-	s.retryForever(func() error {
-		resp, err = s.db.ListTaskList(&p.ListTaskListRequest{
+	err = s.retryForever(func() error {
+		resp, err = s.db.ListTaskList(s.ctx, &p.ListTaskListRequest{
 			PageSize:  pageSize,
 			PageToken: pageToken,
 		})
@@ -75,23 +118,37 @@ func (s *Scavenger) listTaskList(pageSize int, pageToken []byte) (*p.ListTaskLis
 	return resp, err
 }
 
-func (s *Scavenger) deleteTaskList(key *taskListKey, rangeID int64) error {
-	// retry only on service busy errors
-	return backoff.Retry(func() error {
-		return s.db.DeleteTaskList(&p.DeleteTaskListRequest{
-			DomainID:     key.DomainID,
-			TaskListName: key.Name,
-			TaskListType: key.TaskType,
-			RangeID:      rangeID,
+func (s *Scavenger) deleteTaskList(info *p.TaskListInfo) error {
+	domainName, errorDomain := s.cache.GetDomainName(info.DomainID)
+	if errorDomain != nil {
+		return errorDomain
+	}
+	op := func() error {
+		return s.db.DeleteTaskList(s.ctx, &p.DeleteTaskListRequest{
+			DomainID:     info.DomainID,
+			TaskListName: info.Name,
+			TaskListType: info.TaskType,
+			RangeID:      info.RangeID,
+			DomainName:   domainName,
 		})
-	}, retryForeverPolicy, func(err error) bool {
-		_, ok := err.(*shared.ServiceBusyError)
-		return ok
-	})
+	}
+	// retry only on service busy errors
+	throttleRetry := backoff.NewThrottleRetry(
+		backoff.WithRetryPolicy(retryForeverPolicy),
+		backoff.WithRetryableError(func(err error) bool {
+			_, ok := err.(*types.ServiceBusyError)
+			return ok
+		}),
+	)
+	return throttleRetry.Do(context.Background(), op)
 }
 
 func (s *Scavenger) retryForever(op func() error) error {
-	return backoff.Retry(op, retryForeverPolicy, s.isRetryable)
+	throttleRetry := backoff.NewThrottleRetry(
+		backoff.WithRetryPolicy(retryForeverPolicy),
+		backoff.WithRetryableError(s.isRetryable),
+	)
+	return throttleRetry.Do(context.Background(), op)
 }
 
 func newRetryForeverPolicy() backoff.RetryPolicy {

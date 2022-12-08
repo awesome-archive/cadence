@@ -62,12 +62,6 @@ func newInt32(key string, value int32) Tag {
 	}
 }
 
-func newDoubleTag(key string, value float64) Tag {
-	return Tag{
-		field: zap.Float64(key, value),
-	}
-}
-
 func newBoolTag(key string, value bool) Tag {
 	return Tag{
 		field: zap.Bool(key, value),
@@ -102,5 +96,11 @@ func newObjectTag(key string, value interface{}) Tag {
 func newPredefinedStringTag(key string, value string) Tag {
 	return Tag{
 		field: zap.String(key, value),
+	}
+}
+
+func newPredefinedDynamicTag(key string, value interface{}) Tag {
+	return Tag{
+		field: zap.Any(key, value),
 	}
 }

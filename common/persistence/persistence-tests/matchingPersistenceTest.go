@@ -21,6 +21,7 @@
 package persistencetests
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"testing"
@@ -29,9 +30,9 @@ import (
 	"github.com/pborman/uuid"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
-	gen "github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common"
+
 	p "github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/types"
 )
 
 type (
@@ -68,14 +69,17 @@ func (s *MatchingPersistenceSuite) SetupTest() {
 
 // TestCreateTask test
 func (s *MatchingPersistenceSuite) TestCreateTask() {
+	ctx, cancel := context.WithTimeout(context.Background(), testContextTimeout)
+	defer cancel()
+
 	domainID := "11adbd1b-f164-4ea7-b2f3-2e857a5048f1"
-	workflowExecution := gen.WorkflowExecution{WorkflowId: common.StringPtr("create-task-test"),
-		RunId: common.StringPtr("c949447a-691a-4132-8b2a-a5b38106793c")}
-	task0, err0 := s.CreateDecisionTask(domainID, workflowExecution, "a5b38106793c", 5)
+	workflowExecution := types.WorkflowExecution{WorkflowID: "create-task-test",
+		RunID: "c949447a-691a-4132-8b2a-a5b38106793c"}
+	task0, err0 := s.CreateDecisionTask(ctx, domainID, workflowExecution, "a5b38106793c", 5)
 	s.NoError(err0)
 	s.NotNil(task0, "Expected non empty task identifier.")
 
-	tasks1, err1 := s.CreateActivityTasks(domainID, workflowExecution, map[int64]string{
+	tasks1, err1 := s.CreateActivityTasks(ctx, domainID, workflowExecution, map[int64]string{
 		10: "a5b38106793c"})
 	s.NoError(err1)
 	s.NotNil(tasks1, "Expected valid task identifiers.")
@@ -91,17 +95,17 @@ func (s *MatchingPersistenceSuite) TestCreateTask() {
 		50: uuid.New(),
 		60: uuid.New(),
 	}
-	tasks2, err2 := s.CreateActivityTasks(domainID, workflowExecution, tasks)
+	tasks2, err2 := s.CreateActivityTasks(ctx, domainID, workflowExecution, tasks)
 	s.NoError(err2)
 	s.Equal(5, len(tasks2), "expected single valid task identifier.")
 
 	for sid, tlName := range tasks {
-		resp, err := s.GetTasks(domainID, tlName, p.TaskListTypeActivity, 100)
+		resp, err := s.GetTasks(ctx, domainID, tlName, p.TaskListTypeActivity, 100)
 		s.NoError(err)
 		s.Equal(1, len(resp.Tasks))
 		s.Equal(domainID, resp.Tasks[0].DomainID)
-		s.Equal(*workflowExecution.WorkflowId, resp.Tasks[0].WorkflowID)
-		s.Equal(*workflowExecution.RunId, resp.Tasks[0].RunID)
+		s.Equal(workflowExecution.WorkflowID, resp.Tasks[0].WorkflowID)
+		s.Equal(workflowExecution.RunID, resp.Tasks[0].RunID)
 		s.Equal(sid, resp.Tasks[0].ScheduleID)
 		s.True(resp.Tasks[0].CreatedTime.UnixNano() > 0)
 		if s.TaskMgr.GetName() != "cassandra" {
@@ -114,15 +118,18 @@ func (s *MatchingPersistenceSuite) TestCreateTask() {
 
 // TestGetDecisionTasks test
 func (s *MatchingPersistenceSuite) TestGetDecisionTasks() {
+	ctx, cancel := context.WithTimeout(context.Background(), testContextTimeout)
+	defer cancel()
+
 	domainID := "aeac8287-527b-4b35-80a9-667cb47e7c6d"
-	workflowExecution := gen.WorkflowExecution{WorkflowId: common.StringPtr("get-decision-task-test"),
-		RunId: common.StringPtr("db20f7e2-1a1e-40d9-9278-d8b886738e05")}
+	workflowExecution := types.WorkflowExecution{WorkflowID: "get-decision-task-test",
+		RunID: "db20f7e2-1a1e-40d9-9278-d8b886738e05"}
 	taskList := "d8b886738e05"
-	task0, err0 := s.CreateDecisionTask(domainID, workflowExecution, taskList, 5)
+	task0, err0 := s.CreateDecisionTask(ctx, domainID, workflowExecution, taskList, 5)
 	s.NoError(err0)
 	s.NotNil(task0, "Expected non empty task identifier.")
 
-	tasks1Response, err1 := s.GetTasks(domainID, taskList, p.TaskListTypeDecision, 1)
+	tasks1Response, err1 := s.GetTasks(ctx, domainID, taskList, p.TaskListTypeDecision, 1)
 	s.NoError(err1)
 	s.NotNil(tasks1Response.Tasks, "expected valid list of tasks.")
 	s.Equal(1, len(tasks1Response.Tasks), "Expected 1 decision task.")
@@ -131,14 +138,14 @@ func (s *MatchingPersistenceSuite) TestGetDecisionTasks() {
 
 // TestGetTasksWithNoMaxReadLevel test
 func (s *MatchingPersistenceSuite) TestGetTasksWithNoMaxReadLevel() {
-	if s.TaskMgr.GetName() == "cassandra" {
-		s.T().Skip("this test is not applicable for cassandra persistence")
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), testContextTimeout)
+	defer cancel()
+
 	domainID := "f1116985-d1f1-40e0-aba9-83344db915bc"
-	workflowExecution := gen.WorkflowExecution{WorkflowId: common.StringPtr("complete-decision-task-test"),
-		RunId: common.StringPtr("2aa0a74e-16ee-4f27-983d-48b07ec1915d")}
+	workflowExecution := types.WorkflowExecution{WorkflowID: "complete-decision-task-test",
+		RunID: "2aa0a74e-16ee-4f27-983d-48b07ec1915d"}
 	taskList := "48b07ec1915d"
-	_, err0 := s.CreateActivityTasks(domainID, workflowExecution, map[int64]string{
+	_, err0 := s.CreateActivityTasks(ctx, domainID, workflowExecution, map[int64]string{
 		10: taskList,
 		20: taskList,
 		30: taskList,
@@ -162,7 +169,7 @@ func (s *MatchingPersistenceSuite) TestGetTasksWithNoMaxReadLevel() {
 
 	for _, tc := range testCases {
 		s.Run(fmt.Sprintf("tc_%v_%v", tc.batchSz, tc.readLevel), func() {
-			response, err := s.TaskMgr.GetTasks(&p.GetTasksRequest{
+			response, err := s.TaskMgr.GetTasks(ctx, &p.GetTasksRequest{
 				DomainID:  domainID,
 				TaskList:  taskList,
 				TaskType:  p.TaskListTypeActivity,
@@ -180,11 +187,14 @@ func (s *MatchingPersistenceSuite) TestGetTasksWithNoMaxReadLevel() {
 
 // TestCompleteDecisionTask test
 func (s *MatchingPersistenceSuite) TestCompleteDecisionTask() {
+	ctx, cancel := context.WithTimeout(context.Background(), testContextTimeout)
+	defer cancel()
+
 	domainID := "f1116985-d1f1-40e0-aba9-83344db915bc"
-	workflowExecution := gen.WorkflowExecution{WorkflowId: common.StringPtr("complete-decision-task-test"),
-		RunId: common.StringPtr("2aa0a74e-16ee-4f27-983d-48b07ec1915d")}
+	workflowExecution := types.WorkflowExecution{WorkflowID: "complete-decision-task-test",
+		RunID: "2aa0a74e-16ee-4f27-983d-48b07ec1915d"}
 	taskList := "48b07ec1915d"
-	tasks0, err0 := s.CreateActivityTasks(domainID, workflowExecution, map[int64]string{
+	tasks0, err0 := s.CreateActivityTasks(ctx, domainID, workflowExecution, map[int64]string{
 		10: taskList,
 		20: taskList,
 		30: taskList,
@@ -198,7 +208,7 @@ func (s *MatchingPersistenceSuite) TestCompleteDecisionTask() {
 		s.NotEmpty(t, "Expected non empty task identifier.")
 	}
 
-	tasksWithID1Response, err1 := s.GetTasks(domainID, taskList, p.TaskListTypeActivity, 5)
+	tasksWithID1Response, err1 := s.GetTasks(ctx, domainID, taskList, p.TaskListTypeActivity, 5)
 
 	s.NoError(err1)
 	tasksWithID1 := tasksWithID1Response.Tasks
@@ -207,24 +217,27 @@ func (s *MatchingPersistenceSuite) TestCompleteDecisionTask() {
 	s.Equal(5, len(tasksWithID1), "Expected 5 activity tasks.")
 	for _, t := range tasksWithID1 {
 		s.Equal(domainID, t.DomainID)
-		s.Equal(*workflowExecution.WorkflowId, t.WorkflowID)
-		s.Equal(*workflowExecution.RunId, t.RunID)
+		s.Equal(workflowExecution.WorkflowID, t.WorkflowID)
+		s.Equal(workflowExecution.RunID, t.RunID)
 		s.True(t.TaskID > 0)
 
-		err2 := s.CompleteTask(domainID, taskList, p.TaskListTypeActivity, t.TaskID, 100)
+		err2 := s.CompleteTask(ctx, domainID, taskList, p.TaskListTypeActivity, t.TaskID, 100)
 		s.NoError(err2)
 	}
 }
 
 // TestCompleteTasksLessThan test
 func (s *MatchingPersistenceSuite) TestCompleteTasksLessThan() {
+	ctx, cancel := context.WithTimeout(context.Background(), testContextTimeout)
+	defer cancel()
+
 	domainID := uuid.New()
 	taskList := "range-complete-task-tl0"
-	wfExec := gen.WorkflowExecution{
-		WorkflowId: common.StringPtr("range-complete-task-test"),
-		RunId:      common.StringPtr(uuid.New()),
+	wfExec := types.WorkflowExecution{
+		WorkflowID: "range-complete-task-test",
+		RunID:      uuid.New(),
 	}
-	_, err := s.CreateActivityTasks(domainID, wfExec, map[int64]string{
+	_, err := s.CreateActivityTasks(ctx, domainID, wfExec, map[int64]string{
 		10: taskList,
 		20: taskList,
 		30: taskList,
@@ -234,7 +247,7 @@ func (s *MatchingPersistenceSuite) TestCompleteTasksLessThan() {
 	})
 	s.NoError(err)
 
-	resp, err := s.GetTasks(domainID, taskList, p.TaskListTypeActivity, 10)
+	resp, err := s.GetTasks(ctx, domainID, taskList, p.TaskListTypeActivity, 10)
 	s.NoError(err)
 	s.NotNil(resp.Tasks)
 	s.Equal(6, len(resp.Tasks), "getTasks returned wrong number of tasks")
@@ -269,15 +282,15 @@ func (s *MatchingPersistenceSuite) TestCompleteTasksLessThan() {
 	for _, tc := range testCases {
 		req.TaskID = tc.taskID
 		req.Limit = tc.limit
-		nRows, err := s.TaskMgr.CompleteTasksLessThan(req)
+		result, err := s.TaskMgr.CompleteTasksLessThan(ctx, req)
 		s.NoError(err)
-		resp, err := s.GetTasks(domainID, taskList, p.TaskListTypeActivity, 10)
+		resp, err := s.GetTasks(ctx, domainID, taskList, p.TaskListTypeActivity, 10)
 		s.NoError(err)
-		if nRows == p.UnknownNumRowsAffected {
+		if result.TasksCompleted == p.UnknownNumRowsAffected {
 			s.Equal(0, len(resp.Tasks), "expected all tasks to be deleted")
 			break
 		}
-		s.Equal(remaining-len(tc.output), nRows, "expected only LIMIT number of rows to be deleted")
+		s.Equal(remaining-len(tc.output), result.TasksCompleted, "expected only LIMIT number of rows to be deleted")
 		s.Equal(len(tc.output), len(resp.Tasks), "rangeCompleteTask deleted wrong set of tasks")
 		for i := range tc.output {
 			s.Equal(tc.output[i], resp.Tasks[i].TaskID)
@@ -291,7 +304,11 @@ func (s *MatchingPersistenceSuite) TestLeaseAndUpdateTaskList() {
 	domainID := "00136543-72ad-4615-b7e9-44bca9775b45"
 	taskList := "aaaaaaa"
 	leaseTime := time.Now()
-	response, err := s.TaskMgr.LeaseTaskList(&p.LeaseTaskListRequest{
+
+	ctx, cancel := context.WithTimeout(context.Background(), testContextTimeout)
+	defer cancel()
+
+	response, err := s.TaskMgr.LeaseTaskList(ctx, &p.LeaseTaskListRequest{
 		DomainID: domainID,
 		TaskList: taskList,
 		TaskType: p.TaskListTypeActivity,
@@ -303,7 +320,7 @@ func (s *MatchingPersistenceSuite) TestLeaseAndUpdateTaskList() {
 	s.True(tli.LastUpdated.After(leaseTime) || tli.LastUpdated.Equal(leaseTime))
 
 	leaseTime = time.Now()
-	response, err = s.TaskMgr.LeaseTaskList(&p.LeaseTaskListRequest{
+	response, err = s.TaskMgr.LeaseTaskList(ctx, &p.LeaseTaskListRequest{
 		DomainID: domainID,
 		TaskList: taskList,
 		TaskType: p.TaskListTypeActivity,
@@ -314,7 +331,7 @@ func (s *MatchingPersistenceSuite) TestLeaseAndUpdateTaskList() {
 	s.EqualValues(0, tli.AckLevel)
 	s.True(tli.LastUpdated.After(leaseTime) || tli.LastUpdated.Equal(leaseTime))
 
-	response, err = s.TaskMgr.LeaseTaskList(&p.LeaseTaskListRequest{
+	_, err = s.TaskMgr.LeaseTaskList(ctx, &p.LeaseTaskListRequest{
 		DomainID: domainID,
 		TaskList: taskList,
 		TaskType: p.TaskListTypeActivity,
@@ -332,13 +349,13 @@ func (s *MatchingPersistenceSuite) TestLeaseAndUpdateTaskList() {
 		AckLevel: 0,
 		Kind:     p.TaskListKindNormal,
 	}
-	_, err = s.TaskMgr.UpdateTaskList(&p.UpdateTaskListRequest{
+	_, err = s.TaskMgr.UpdateTaskList(ctx, &p.UpdateTaskListRequest{
 		TaskListInfo: taskListInfo,
 	})
 	s.NoError(err)
 
 	taskListInfo.RangeID = 3
-	_, err = s.TaskMgr.UpdateTaskList(&p.UpdateTaskListRequest{
+	_, err = s.TaskMgr.UpdateTaskList(ctx, &p.UpdateTaskListRequest{
 		TaskListInfo: taskListInfo,
 	})
 	s.Error(err)
@@ -348,7 +365,11 @@ func (s *MatchingPersistenceSuite) TestLeaseAndUpdateTaskList() {
 func (s *MatchingPersistenceSuite) TestLeaseAndUpdateTaskListSticky() {
 	domainID := uuid.New()
 	taskList := "aaaaaaa"
-	response, err := s.TaskMgr.LeaseTaskList(&p.LeaseTaskListRequest{
+
+	ctx, cancel := context.WithTimeout(context.Background(), testContextTimeout)
+	defer cancel()
+
+	response, err := s.TaskMgr.LeaseTaskList(ctx, &p.LeaseTaskListRequest{
 		DomainID:     domainID,
 		TaskList:     taskList,
 		TaskType:     p.TaskListTypeDecision,
@@ -364,23 +385,26 @@ func (s *MatchingPersistenceSuite) TestLeaseAndUpdateTaskListSticky() {
 		DomainID: domainID,
 		Name:     taskList,
 		TaskType: p.TaskListTypeDecision,
-		RangeID:  2,
+		RangeID:  tli.RangeID,
 		AckLevel: 0,
 		Kind:     p.TaskListKindSticky,
 	}
-	_, err = s.TaskMgr.UpdateTaskList(&p.UpdateTaskListRequest{
+	_, err = s.TaskMgr.UpdateTaskList(ctx, &p.UpdateTaskListRequest{
 		TaskListInfo: taskListInfo,
 	})
-	s.NoError(err) // because update with ttl doesn't check rangeID
+	s.NoError(err)
 }
 
 func (s *MatchingPersistenceSuite) deleteAllTaskList() {
+	ctx, cancel := context.WithTimeout(context.Background(), testContextTimeout)
+	defer cancel()
+
 	var nextPageToken []byte
 	for {
-		resp, err := s.TaskMgr.ListTaskList(&p.ListTaskListRequest{PageSize: 10, PageToken: nextPageToken})
+		resp, err := s.TaskMgr.ListTaskList(ctx, &p.ListTaskListRequest{PageSize: 10, PageToken: nextPageToken})
 		s.NoError(err)
 		for _, it := range resp.Items {
-			err = s.TaskMgr.DeleteTaskList(&p.DeleteTaskListRequest{
+			err = s.TaskMgr.DeleteTaskList(ctx, &p.DeleteTaskListRequest{
 				DomainID:     it.DomainID,
 				TaskListName: it.Name,
 				TaskListType: it.TaskType,
@@ -398,10 +422,15 @@ func (s *MatchingPersistenceSuite) deleteAllTaskList() {
 // TestListWithOneTaskList test
 func (s *MatchingPersistenceSuite) TestListWithOneTaskList() {
 	if s.TaskMgr.GetName() == "cassandra" {
-		s.T().Skip("ListTaskList API is currently not supported in cassandra")
+		// ListTaskList API is currently not supported in cassandra
+		return
 	}
 	s.deleteAllTaskList()
-	resp, err := s.TaskMgr.ListTaskList(&p.ListTaskListRequest{PageSize: 10})
+
+	ctx, cancel := context.WithTimeout(context.Background(), testContextTimeout)
+	defer cancel()
+
+	resp, err := s.TaskMgr.ListTaskList(ctx, &p.ListTaskListRequest{PageSize: 10})
 	s.NoError(err)
 	s.Nil(resp.NextPageToken)
 	s.Equal(0, len(resp.Items))
@@ -412,7 +441,7 @@ func (s *MatchingPersistenceSuite) TestListWithOneTaskList() {
 	for i := 0; i < 10; i++ {
 		rangeID++
 		updatedTime := time.Now()
-		_, err := s.TaskMgr.LeaseTaskList(&p.LeaseTaskListRequest{
+		_, err := s.TaskMgr.LeaseTaskList(ctx, &p.LeaseTaskListRequest{
 			DomainID:     domainID,
 			TaskList:     "list-task-list-test-tl0",
 			TaskType:     p.TaskListTypeActivity,
@@ -420,7 +449,7 @@ func (s *MatchingPersistenceSuite) TestListWithOneTaskList() {
 		})
 		s.NoError(err)
 
-		resp, err := s.TaskMgr.ListTaskList(&p.ListTaskListRequest{PageSize: 10})
+		resp, err := s.TaskMgr.ListTaskList(ctx, &p.ListTaskListRequest{PageSize: 10})
 		s.NoError(err)
 
 		s.Equal(1, len(resp.Items))
@@ -434,7 +463,7 @@ func (s *MatchingPersistenceSuite) TestListWithOneTaskList() {
 
 		ackLevel++
 		updatedTime = time.Now()
-		_, err = s.TaskMgr.UpdateTaskList(&p.UpdateTaskListRequest{
+		_, err = s.TaskMgr.UpdateTaskList(ctx, &p.UpdateTaskListRequest{
 			TaskListInfo: &p.TaskListInfo{
 				DomainID: domainID,
 				Name:     "list-task-list-test-tl0",
@@ -446,7 +475,7 @@ func (s *MatchingPersistenceSuite) TestListWithOneTaskList() {
 		})
 		s.NoError(err)
 
-		resp, err = s.TaskMgr.ListTaskList(&p.ListTaskListRequest{PageSize: 10})
+		resp, err = s.TaskMgr.ListTaskList(ctx, &p.ListTaskListRequest{PageSize: 10})
 		s.NoError(err)
 		s.Equal(1, len(resp.Items))
 		s.True(resp.Items[0].LastUpdated.After(updatedTime) || resp.Items[0].LastUpdated.Equal(updatedTime))
@@ -457,14 +486,19 @@ func (s *MatchingPersistenceSuite) TestListWithOneTaskList() {
 // TestListWithMultipleTaskList test
 func (s *MatchingPersistenceSuite) TestListWithMultipleTaskList() {
 	if s.TaskMgr.GetName() == "cassandra" {
-		s.T().Skip("ListTaskList API is currently not supported in cassandra")
+		// ListTaskList API is currently not supported in cassandra"
+		return
 	}
 	s.deleteAllTaskList()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testContextTimeout)
+	defer cancel()
+
 	domainID := uuid.New()
 	tlNames := make(map[string]struct{})
 	for i := 0; i < 10; i++ {
 		name := fmt.Sprintf("test-list-with-multiple-%v", i)
-		_, err := s.TaskMgr.LeaseTaskList(&p.LeaseTaskListRequest{
+		_, err := s.TaskMgr.LeaseTaskList(ctx, &p.LeaseTaskListRequest{
 			DomainID:     domainID,
 			TaskList:     name,
 			TaskType:     p.TaskListTypeActivity,
@@ -475,7 +509,7 @@ func (s *MatchingPersistenceSuite) TestListWithMultipleTaskList() {
 		listedNames := make(map[string]struct{})
 		var nextPageToken []byte
 		for {
-			resp, err := s.TaskMgr.ListTaskList(&p.ListTaskListRequest{PageSize: 10, PageToken: nextPageToken})
+			resp, err := s.TaskMgr.ListTaskList(ctx, &p.ListTaskListRequest{PageSize: 1, PageToken: nextPageToken})
 			s.NoError(err)
 			for _, it := range resp.Items {
 				s.Equal(domainID, it.DomainID)
@@ -492,9 +526,101 @@ func (s *MatchingPersistenceSuite) TestListWithMultipleTaskList() {
 		}
 		s.Equal(tlNames, listedNames, "list API returned wrong set of task list names")
 	}
+
+	// final test again pagination
+	total := 0
+	var nextPageToken []byte
+	for {
+		resp, err := s.TaskMgr.ListTaskList(ctx, &p.ListTaskListRequest{
+			PageSize:  6,
+			PageToken: nextPageToken,
+		})
+		s.NoError(err)
+		total += len(resp.Items)
+		if resp.NextPageToken == nil {
+			break
+		}
+		nextPageToken = resp.NextPageToken
+	}
+	s.Equal(10, total)
+
 	s.deleteAllTaskList()
-	resp, err := s.TaskMgr.ListTaskList(&p.ListTaskListRequest{PageSize: 10})
+	resp, err := s.TaskMgr.ListTaskList(ctx, &p.ListTaskListRequest{PageSize: 10})
 	s.NoError(err)
 	s.Nil(resp.NextPageToken)
 	s.Equal(0, len(resp.Items))
+}
+
+func (s *MatchingPersistenceSuite) TestGetOrphanTasks() {
+	if os.Getenv("SKIP_GET_ORPHAN_TASKS") != "" {
+		s.T().Skipf("GetOrphanTasks not supported in %v", s.TaskMgr.GetName())
+	}
+	if s.TaskMgr.GetName() == "cassandra" {
+		// GetOrphanTasks API is currently not supported in cassandra"
+		return
+	}
+	s.deleteAllTaskList()
+
+	ctx, cancel := context.WithTimeout(context.Background(), testContextTimeout)
+	defer cancel()
+
+	oresp, err := s.TaskMgr.GetOrphanTasks(ctx, &p.GetOrphanTasksRequest{Limit: 10})
+	s.NoError(err)
+	// existing orphans that caused by other tests
+	existingOrphans := len(oresp.Tasks)
+
+	domainID := uuid.New()
+	name := "test-list-with-orphans"
+	resp, err := s.TaskMgr.LeaseTaskList(ctx, &p.LeaseTaskListRequest{
+		DomainID:     domainID,
+		TaskList:     name,
+		TaskType:     p.TaskListTypeActivity,
+		TaskListKind: p.TaskListKindNormal,
+	})
+	s.NoError(err)
+
+	wid := uuid.New()
+	rid := uuid.New()
+	s.TaskMgr.CreateTasks(ctx, &p.CreateTasksRequest{
+		TaskListInfo: resp.TaskListInfo,
+		Tasks: []*p.CreateTaskInfo{
+			{
+				Execution: types.WorkflowExecution{WorkflowID: wid, RunID: rid},
+				Data: &p.TaskInfo{
+					DomainID:               domainID,
+					WorkflowID:             wid,
+					RunID:                  rid,
+					TaskID:                 0,
+					ScheduleID:             0,
+					ScheduleToStartTimeout: 0,
+					Expiry:                 time.Now(),
+					CreatedTime:            time.Now(),
+				},
+				TaskID: 0,
+			},
+		},
+	})
+
+	oresp, err = s.TaskMgr.GetOrphanTasks(ctx, &p.GetOrphanTasksRequest{Limit: 10})
+	s.NoError(err)
+
+	s.Equal(existingOrphans, len(oresp.Tasks))
+
+	s.deleteAllTaskList()
+
+	oresp, err = s.TaskMgr.GetOrphanTasks(ctx, &p.GetOrphanTasksRequest{Limit: 10})
+	s.NoError(err)
+
+	s.Equal(existingOrphans+1, len(oresp.Tasks))
+	found := false
+	for _, it := range oresp.Tasks {
+		if it.DomainID != domainID {
+			continue
+		}
+		s.Equal(p.TaskListTypeActivity, it.TaskType)
+		s.Equal(int64(0), it.TaskID)
+		s.Equal(name, it.TaskListName)
+		found = true
+	}
+	s.True(found)
 }

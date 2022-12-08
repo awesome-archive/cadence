@@ -95,6 +95,12 @@ func (m *ClientImpl) RecordTimer(scopeIdx int, timerIdx int, d time.Duration) {
 	m.childScopes[scopeIdx].Timer(name).Record(d)
 }
 
+// RecordHistogramDuration record and emit a duration
+func (m *ClientImpl) RecordHistogramDuration(scopeIdx int, timerIdx int, d time.Duration) {
+	name := string(m.metricDefs[timerIdx].metricName)
+	m.childScopes[scopeIdx].Histogram(name, m.getBuckets(timerIdx)).RecordDuration(d)
+}
+
 // UpdateGauge reports Gauge type metric
 func (m *ClientImpl) UpdateGauge(scopeIdx int, gaugeIdx int, value float64) {
 	name := string(m.metricDefs[gaugeIdx].metricName)
@@ -104,7 +110,15 @@ func (m *ClientImpl) UpdateGauge(scopeIdx int, gaugeIdx int, value float64) {
 // Scope return a new internal metrics scope that can be used to add additional
 // information to the metrics emitted
 func (m *ClientImpl) Scope(scopeIdx int, tags ...Tag) Scope {
-	return newMetricsScope(m.childScopes[scopeIdx], m.metricDefs, false).Tagged(tags...)
+	scope := m.childScopes[scopeIdx]
+	return newMetricsScope(scope, scope, m.metricDefs, false).Tagged(tags...)
+}
+
+func (m *ClientImpl) getBuckets(id int) tally.Buckets {
+	if m.metricDefs[id].buckets != nil {
+		return m.metricDefs[id].buckets
+	}
+	return tally.DefaultBuckets
 }
 
 func getMetricDefs(serviceIdx ServiceIdx) map[int]metricDefinition {

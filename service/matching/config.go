@@ -25,15 +25,20 @@ import (
 
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/common/dynamicconfig"
 )
 
 type (
 	// Config represents configuration for cadence-matching service
 	Config struct {
-		PersistenceMaxQPS dynamicconfig.IntPropertyFn
-		EnableSyncMatch   dynamicconfig.BoolPropertyFnWithTaskListInfoFilters
-		RPS               dynamicconfig.IntPropertyFn
+		PersistenceMaxQPS       dynamicconfig.IntPropertyFn
+		PersistenceGlobalMaxQPS dynamicconfig.IntPropertyFn
+		EnableSyncMatch         dynamicconfig.BoolPropertyFnWithTaskListInfoFilters
+		UserRPS                 dynamicconfig.IntPropertyFn
+		WorkerRPS               dynamicconfig.IntPropertyFn
+		DomainUserRPS           dynamicconfig.IntPropertyFnWithDomainFilter
+		DomainWorkerRPS         dynamicconfig.IntPropertyFnWithDomainFilter
+		ShutdownDrainDuration   dynamicconfig.DurationPropertyFn
 
 		// taskListManager configuration
 		RangeSize                    int64
@@ -58,6 +63,12 @@ type (
 		MaxTaskBatchSize                dynamicconfig.IntPropertyFnWithTaskListInfoFilters
 
 		ThrottledLogRPS dynamicconfig.IntPropertyFn
+
+		// debugging configuration
+		EnableDebugMode             bool // note that this value is initialized once on service start
+		EnableTaskInfoLogByDomainID dynamicconfig.BoolPropertyFnWithDomainIDFilter
+
+		ActivityTaskSyncMatchWaitTime dynamicconfig.DurationPropertyFnWithDomainFilter
 	}
 
 	forwarderConfig struct {
@@ -90,88 +101,95 @@ type (
 // NewConfig returns new service config with default values
 func NewConfig(dc *dynamicconfig.Collection) *Config {
 	return &Config{
-		PersistenceMaxQPS:               dc.GetIntProperty(dynamicconfig.MatchingPersistenceMaxQPS, 3000),
-		EnableSyncMatch:                 dc.GetBoolPropertyFilteredByTaskListInfo(dynamicconfig.MatchingEnableSyncMatch, true),
-		RPS:                             dc.GetIntProperty(dynamicconfig.MatchingRPS, 1200),
+		PersistenceMaxQPS:               dc.GetIntProperty(dynamicconfig.MatchingPersistenceMaxQPS),
+		PersistenceGlobalMaxQPS:         dc.GetIntProperty(dynamicconfig.MatchingPersistenceGlobalMaxQPS),
+		EnableSyncMatch:                 dc.GetBoolPropertyFilteredByTaskListInfo(dynamicconfig.MatchingEnableSyncMatch),
+		UserRPS:                         dc.GetIntProperty(dynamicconfig.MatchingUserRPS),
+		WorkerRPS:                       dc.GetIntProperty(dynamicconfig.MatchingWorkerRPS),
+		DomainUserRPS:                   dc.GetIntPropertyFilteredByDomain(dynamicconfig.MatchingDomainUserRPS),
+		DomainWorkerRPS:                 dc.GetIntPropertyFilteredByDomain(dynamicconfig.MatchingDomainWorkerRPS),
 		RangeSize:                       100000,
-		GetTasksBatchSize:               dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingGetTasksBatchSize, 1000),
-		UpdateAckInterval:               dc.GetDurationPropertyFilteredByTaskListInfo(dynamicconfig.MatchingUpdateAckInterval, 1*time.Minute),
-		IdleTasklistCheckInterval:       dc.GetDurationPropertyFilteredByTaskListInfo(dynamicconfig.MatchingIdleTasklistCheckInterval, 5*time.Minute),
-		MaxTasklistIdleTime:             dc.GetDurationPropertyFilteredByTaskListInfo(dynamicconfig.MaxTasklistIdleTime, 5*time.Minute),
-		LongPollExpirationInterval:      dc.GetDurationPropertyFilteredByTaskListInfo(dynamicconfig.MatchingLongPollExpirationInterval, time.Minute),
-		MinTaskThrottlingBurstSize:      dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingMinTaskThrottlingBurstSize, 1),
-		MaxTaskDeleteBatchSize:          dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingMaxTaskDeleteBatchSize, 100),
-		OutstandingTaskAppendsThreshold: dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingOutstandingTaskAppendsThreshold, 250),
-		MaxTaskBatchSize:                dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingMaxTaskBatchSize, 100),
-		ThrottledLogRPS:                 dc.GetIntProperty(dynamicconfig.MatchingThrottledLogRPS, 20),
-		NumTasklistWritePartitions:      dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingNumTasklistWritePartitions, 1),
-		NumTasklistReadPartitions:       dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingNumTasklistReadPartitions, 1),
-		ForwarderMaxOutstandingPolls:    dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingForwarderMaxOutstandingPolls, 1),
-		ForwarderMaxOutstandingTasks:    dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingForwarderMaxOutstandingTasks, 1),
-		ForwarderMaxRatePerSecond:       dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingForwarderMaxRatePerSecond, 10),
-		ForwarderMaxChildrenPerNode:     dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingForwarderMaxChildrenPerNode, 20),
+		GetTasksBatchSize:               dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingGetTasksBatchSize),
+		UpdateAckInterval:               dc.GetDurationPropertyFilteredByTaskListInfo(dynamicconfig.MatchingUpdateAckInterval),
+		IdleTasklistCheckInterval:       dc.GetDurationPropertyFilteredByTaskListInfo(dynamicconfig.MatchingIdleTasklistCheckInterval),
+		MaxTasklistIdleTime:             dc.GetDurationPropertyFilteredByTaskListInfo(dynamicconfig.MaxTasklistIdleTime),
+		LongPollExpirationInterval:      dc.GetDurationPropertyFilteredByTaskListInfo(dynamicconfig.MatchingLongPollExpirationInterval),
+		MinTaskThrottlingBurstSize:      dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingMinTaskThrottlingBurstSize),
+		MaxTaskDeleteBatchSize:          dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingMaxTaskDeleteBatchSize),
+		OutstandingTaskAppendsThreshold: dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingOutstandingTaskAppendsThreshold),
+		MaxTaskBatchSize:                dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingMaxTaskBatchSize),
+		ThrottledLogRPS:                 dc.GetIntProperty(dynamicconfig.MatchingThrottledLogRPS),
+		NumTasklistWritePartitions:      dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingNumTasklistWritePartitions),
+		NumTasklistReadPartitions:       dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingNumTasklistReadPartitions),
+		ForwarderMaxOutstandingPolls:    dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingForwarderMaxOutstandingPolls),
+		ForwarderMaxOutstandingTasks:    dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingForwarderMaxOutstandingTasks),
+		ForwarderMaxRatePerSecond:       dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingForwarderMaxRatePerSecond),
+		ForwarderMaxChildrenPerNode:     dc.GetIntPropertyFilteredByTaskListInfo(dynamicconfig.MatchingForwarderMaxChildrenPerNode),
+		ShutdownDrainDuration:           dc.GetDurationProperty(dynamicconfig.MatchingShutdownDrainDuration),
+		EnableDebugMode:                 dc.GetBoolProperty(dynamicconfig.EnableDebugMode)(),
+		EnableTaskInfoLogByDomainID:     dc.GetBoolPropertyFilteredByDomainID(dynamicconfig.MatchingEnableTaskInfoLogByDomainID),
+		ActivityTaskSyncMatchWaitTime:   dc.GetDurationPropertyFilteredByDomain(dynamicconfig.MatchingActivityTaskSyncMatchWaitTime),
 	}
 }
 
 func newTaskListConfig(id *taskListID, config *Config, domainCache cache.DomainCache) (*taskListConfig, error) {
-	domainEntry, err := domainCache.GetDomainByID(id.domainID)
+	domainName, err := domainCache.GetDomainName(id.domainID)
 	if err != nil {
 		return nil, err
 	}
 
-	domain := domainEntry.GetInfo().Name
 	taskListName := id.name
 	taskType := id.taskType
 	return &taskListConfig{
 		RangeSize: config.RangeSize,
 		GetTasksBatchSize: func() int {
-			return config.GetTasksBatchSize(domain, taskListName, taskType)
+			return config.GetTasksBatchSize(domainName, taskListName, taskType)
 		},
 		UpdateAckInterval: func() time.Duration {
-			return config.UpdateAckInterval(domain, taskListName, taskType)
+			return config.UpdateAckInterval(domainName, taskListName, taskType)
 		},
 		IdleTasklistCheckInterval: func() time.Duration {
-			return config.IdleTasklistCheckInterval(domain, taskListName, taskType)
+			return config.IdleTasklistCheckInterval(domainName, taskListName, taskType)
 		},
 		MaxTasklistIdleTime: func() time.Duration {
-			return config.MaxTasklistIdleTime(domain, taskListName, taskType)
+			return config.MaxTasklistIdleTime(domainName, taskListName, taskType)
 		},
 		MinTaskThrottlingBurstSize: func() int {
-			return config.MinTaskThrottlingBurstSize(domain, taskListName, taskType)
+			return config.MinTaskThrottlingBurstSize(domainName, taskListName, taskType)
 		},
 		EnableSyncMatch: func() bool {
-			return config.EnableSyncMatch(domain, taskListName, taskType)
+			return config.EnableSyncMatch(domainName, taskListName, taskType)
 		},
 		LongPollExpirationInterval: func() time.Duration {
-			return config.LongPollExpirationInterval(domain, taskListName, taskType)
+			return config.LongPollExpirationInterval(domainName, taskListName, taskType)
 		},
 		MaxTaskDeleteBatchSize: func() int {
-			return config.MaxTaskDeleteBatchSize(domain, taskListName, taskType)
+			return config.MaxTaskDeleteBatchSize(domainName, taskListName, taskType)
 		},
 		OutstandingTaskAppendsThreshold: func() int {
-			return config.OutstandingTaskAppendsThreshold(domain, taskListName, taskType)
+			return config.OutstandingTaskAppendsThreshold(domainName, taskListName, taskType)
 		},
 		MaxTaskBatchSize: func() int {
-			return config.MaxTaskBatchSize(domain, taskListName, taskType)
+			return config.MaxTaskBatchSize(domainName, taskListName, taskType)
 		},
 		NumWritePartitions: func() int {
-			return common.MaxInt(1, config.NumTasklistWritePartitions(domain, taskListName, taskType))
+			return common.MaxInt(1, config.NumTasklistWritePartitions(domainName, taskListName, taskType))
 		},
 		NumReadPartitions: func() int {
-			return common.MaxInt(1, config.NumTasklistReadPartitions(domain, taskListName, taskType))
+			return common.MaxInt(1, config.NumTasklistReadPartitions(domainName, taskListName, taskType))
 		},
 		forwarderConfig: forwarderConfig{
 			ForwarderMaxOutstandingPolls: func() int {
-				return config.ForwarderMaxOutstandingPolls(domain, taskListName, taskType)
+				return config.ForwarderMaxOutstandingPolls(domainName, taskListName, taskType)
 			},
 			ForwarderMaxOutstandingTasks: func() int {
-				return config.ForwarderMaxOutstandingTasks(domain, taskListName, taskType)
+				return config.ForwarderMaxOutstandingTasks(domainName, taskListName, taskType)
 			},
 			ForwarderMaxRatePerSecond: func() int {
-				return config.ForwarderMaxRatePerSecond(domain, taskListName, taskType)
+				return config.ForwarderMaxRatePerSecond(domainName, taskListName, taskType)
 			},
 			ForwarderMaxChildrenPerNode: func() int {
-				return common.MaxInt(1, config.ForwarderMaxChildrenPerNode(domain, taskListName, taskType))
+				return common.MaxInt(1, config.ForwarderMaxChildrenPerNode(domainName, taskListName, taskType))
 			},
 		},
 	}, nil

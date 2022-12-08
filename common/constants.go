@@ -22,6 +22,8 @@ package common
 
 import (
 	"time"
+
+	"github.com/uber/cadence/.gen/go/shadower"
 )
 
 const (
@@ -43,17 +45,17 @@ const (
 	FirstBlobPageToken = 1
 	// LastBlobNextPageToken is the next page token on the last blob for each history archival
 	LastBlobNextPageToken = -1
+	// EndMessageID is the id of the end message, here we use the int64 max
+	EndMessageID int64 = 1<<63 - 1
+	// EmptyMessageID is the default start message ID for replication level
+	EmptyMessageID = -1
+	// InitialPreviousFailoverVersion is the initial previous failover version
+	InitialPreviousFailoverVersion int64 = -1
 )
 
 const (
-	// FrontendServiceName is the name of the frontend service
-	FrontendServiceName = "cadence-frontend"
-	// HistoryServiceName is the name of the history service
-	HistoryServiceName = "cadence-history"
-	// MatchingServiceName is the name of the matching service
-	MatchingServiceName = "cadence-matching"
-	// WorkerServiceName is the name of the worker service
-	WorkerServiceName = "cadence-worker"
+	// EmptyUUID is the placeholder for UUID when it's empty
+	EmptyUUID = "emptyUuid"
 )
 
 // Data encoding types
@@ -63,6 +65,7 @@ const (
 	EncodingTypeGob      EncodingType = "gob"
 	EncodingTypeUnknown  EncodingType = "unknow"
 	EncodingTypeEmpty    EncodingType = ""
+	EncodingTypeProto    EncodingType = "proto3"
 )
 
 type (
@@ -76,6 +79,8 @@ const MaxTaskTimeout = 31622400
 const (
 	// GetHistoryMaxPageSize is the max page size for get history
 	GetHistoryMaxPageSize = 1000
+	// ReadDLQMessagesPageSize is the max page size for read DLQ messages
+	ReadDLQMessagesPageSize = 1000
 )
 
 const (
@@ -83,17 +88,27 @@ const (
 	VisibilityAppName = "visibility"
 )
 
+// This was flagged by salus as potentially hardcoded credentials. This is a false positive by the scanner and should be
+// disregarded.
+// #nosec
 const (
 	// SystemGlobalDomainName is global domain name for cadence system workflows running globally
 	SystemGlobalDomainName = "cadence-system-global"
-	// SystemLocalDomainName is domain name for cadence system workflows running in local cluster
-	SystemLocalDomainName = "cadence-system"
 	// SystemDomainID is domain id for all cadence system workflows
 	SystemDomainID = "32049b68-7872-4094-8e63-d0dd59896a83"
+	// SystemLocalDomainName is domain name for cadence system workflows running in local cluster
+	SystemLocalDomainName = "cadence-system"
 	// SystemDomainRetentionDays is retention config for all cadence system workflows
 	SystemDomainRetentionDays = 7
-	// DefaultAdminOperationToken is the default dynamic config value for AdminOperationToken
-	DefaultAdminOperationToken = "CadenceTeamONLY"
+	// BatcherDomainID is domain id for batcher local domain
+	BatcherDomainID = "3116607e-419b-4783-85fc-47726a4c3fe9"
+	// BatcherLocalDomainName is domain name for batcher workflows running in local cluster
+	// Batcher cannot use SystemLocalDomain because auth
+	BatcherLocalDomainName = "cadence-batcher"
+	// ShadowerDomainID is domain id for workflow shadower local domain
+	ShadowerDomainID = "59c51119-1b41-4a28-986d-d6e377716f82"
+	// ShadowerLocalDomainName
+	ShadowerLocalDomainName = shadower.LocalDomainName
 )
 
 const (
@@ -108,6 +123,13 @@ const (
 const (
 	// DefaultTransactionSizeLimit is the largest allowed transaction size to persistence
 	DefaultTransactionSizeLimit = 14 * 1024 * 1024
+)
+
+const (
+	// DefaultIDLengthWarnLimit is the warning length for various ID types
+	DefaultIDLengthWarnLimit = 128
+	// DefaultIDLengthErrorLimit is the maximum length allowed for various ID types
+	DefaultIDLengthErrorLimit = 1000
 )
 
 const (
@@ -127,4 +149,113 @@ const (
 	AdvancedVisibilityWritingModeOn = "on"
 	// AdvancedVisibilityWritingModeDual means write to both normal visibility and advanced visibility store
 	AdvancedVisibilityWritingModeDual = "dual"
+)
+
+const (
+	// DomainDataKeyForManagedFailover is key of DomainData for managed failover
+	DomainDataKeyForManagedFailover = "IsManagedByCadence"
+	// DomainDataKeyForPreferredCluster is the key of DomainData for domain rebalance
+	DomainDataKeyForPreferredCluster = "PreferredCluster"
+	// DomainDataKeyForReadGroups stores which groups have read permission of the domain API
+	DomainDataKeyForReadGroups = "READ_GROUPS"
+	// DomainDataKeyForWriteGroups stores which groups have write permission of the domain API
+	DomainDataKeyForWriteGroups = "WRITE_GROUPS"
+)
+
+type (
+	// TaskType is the enum for representing different task types
+	TaskType int
+)
+
+const (
+	// TaskTypeTransfer is the task type for transfer task
+	// starting from 2 here to be consistent with the row type define for cassandra
+	// TODO: we can remove +2 from the following definition
+	// we don't have to make them consistent with cassandra definition
+	// there's also no row type for sql or other nosql persistence implementation
+	TaskTypeTransfer TaskType = iota + 2
+	// TaskTypeTimer is the task type for timer task
+	TaskTypeTimer
+	// TaskTypeReplication is the task type for replication task
+	TaskTypeReplication
+	// TaskTypeCrossCluster is the task type for cross cluster task
+	TaskTypeCrossCluster TaskType = 6
+)
+
+const (
+	// DefaultESAnalyzerPause controls if we want to dynamically pause the analyzer
+	DefaultESAnalyzerPause = false
+	// DefaultCorruptWorkflowWatchdogPause controls if we want to dynamically pause the watchdog
+	DefaultCorruptWorkflowWatchdogPause = false
+	// DefaultESAnalyzerTimeWindow controls how many days to go back for ElasticSearch Analyzer
+	DefaultESAnalyzerTimeWindow = time.Hour * 24 * 30
+	// DefaultESAnalyzerMaxNumDomains controls how many domains to check
+	DefaultESAnalyzerMaxNumDomains = 500
+	// DefaultESAnalyzerMaxNumWorkflowTypes controls how many workflow types per domain to check
+	DefaultESAnalyzerMaxNumWorkflowTypes = 100
+	// DefaultESAnalyzerNumWorkflowsToRefresh controls how many workflows per workflow type should be refreshed
+	DefaultESAnalyzerNumWorkflowsToRefresh = 100
+	// DefaultESAnalyzerBufferWaitTime controls min time required to consider a worklow stuck
+	DefaultESAnalyzerBufferWaitTime = time.Minute * 30
+	// DefaultESAnalyzerMinNumWorkflowsForAvg controls how many workflows to have at least to rely on workflow run time avg per type
+	DefaultESAnalyzerMinNumWorkflowsForAvg = 100
+	// DefaultESAnalyzerLimitToTypes controls if we want to limit ESAnalyzer only to some workflow types
+	DefaultESAnalyzerLimitToTypes = ""
+	// DefaultESAnalyzerEnableAvgDurationBasedChecks controls if we want to enable avg duration based refreshes
+	DefaultESAnalyzerEnableAvgDurationBasedChecks = false
+	// DefaultESAnalyzerLimitToDomains controls if we want to limit ESAnalyzer only to some domains
+	DefaultESAnalyzerLimitToDomains = ""
+	// DefaultESAnalyzerWorkflowDurationWarnThreshold defines warning threshold for a workflow duration
+	DefaultESAnalyzerWorkflowDurationWarnThresholds = ""
+)
+
+// StickyTaskConditionFailedErrorMsg error msg for sticky task ConditionFailedError
+const StickyTaskConditionFailedErrorMsg = "StickyTaskConditionFailedError"
+
+// MemoKeyForOperator is the memo key for operator
+const MemoKeyForOperator = "operator"
+
+// ReservedTaskListPrefix is the required naming prefix for any task list partition other than partition 0
+const ReservedTaskListPrefix = "/__cadence_sys/"
+
+type (
+	// VisibilityOperation is an enum that represents visibility message types
+	VisibilityOperation string
+)
+
+// Enum for visibility message type
+const (
+	RecordStarted          VisibilityOperation = "RecordStarted"
+	RecordClosed           VisibilityOperation = "RecordClosed"
+	UpsertSearchAttributes VisibilityOperation = "UpsertSearchAttributes"
+)
+
+const (
+	numBitsPerLevel = 3
+
+	// NoPriority is the value returned if no priority is ever assigned to the task
+	NoPriority = -1
+)
+
+const (
+	// HighPriorityClass is the priority class for high priority tasks
+	HighPriorityClass = iota << numBitsPerLevel
+	// DefaultPriorityClass is the priority class for default priority tasks
+	DefaultPriorityClass
+	// LowPriorityClass is the priority class for low priority tasks
+	LowPriorityClass
+)
+
+const (
+	// HighPrioritySubclass is the priority subclass for high priority tasks
+	HighPrioritySubclass = iota
+	// DefaultPrioritySubclass is the priority subclass for high priority tasks
+	DefaultPrioritySubclass
+	// LowPrioritySubclass is the priority subclass for high priority tasks
+	LowPrioritySubclass
+)
+
+const (
+	// DefaultHistoryMaxAutoResetPoints is the default maximum number for auto reset points
+	DefaultHistoryMaxAutoResetPoints = 20
 )

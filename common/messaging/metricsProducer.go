@@ -21,6 +21,8 @@
 package messaging
 
 import (
+	"context"
+
 	"github.com/uber/cadence/common/metrics"
 )
 
@@ -32,32 +34,21 @@ type (
 )
 
 // NewMetricProducer creates a new instance of producer that emits metrics
-func NewMetricProducer(producer Producer,
-	metricsClient metrics.Client) Producer {
+func NewMetricProducer(
+	producer Producer,
+	metricsClient metrics.Client,
+) Producer {
 	return &metricsProducer{
 		producer:      producer,
 		metricsClient: metricsClient,
 	}
 }
 
-func (p *metricsProducer) PublishBatch(msgs []interface{}) error {
-	p.metricsClient.IncCounter(metrics.MessagingClientPublishBatchScope, metrics.CadenceClientRequests)
-
-	sw := p.metricsClient.StartTimer(metrics.MessagingClientPublishBatchScope, metrics.CadenceClientLatency)
-	err := p.producer.PublishBatch(msgs)
-	sw.Stop()
-
-	if err != nil {
-		p.metricsClient.IncCounter(metrics.MessagingClientPublishBatchScope, metrics.CadenceClientFailures)
-	}
-	return err
-}
-
-func (p *metricsProducer) Publish(msg interface{}) error {
+func (p *metricsProducer) Publish(ctx context.Context, msg interface{}) error {
 	p.metricsClient.IncCounter(metrics.MessagingClientPublishScope, metrics.CadenceClientRequests)
 
 	sw := p.metricsClient.StartTimer(metrics.MessagingClientPublishScope, metrics.CadenceClientLatency)
-	err := p.producer.Publish(msg)
+	err := p.producer.Publish(ctx, msg)
 	sw.Stop()
 
 	if err != nil {
@@ -67,5 +58,9 @@ func (p *metricsProducer) Publish(msg interface{}) error {
 }
 
 func (p *metricsProducer) Close() error {
-	return p.producer.Close()
+	if closeableProducer, ok := p.producer.(CloseableProducer); ok {
+		return closeableProducer.Close()
+	}
+
+	return nil
 }

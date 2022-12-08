@@ -26,11 +26,11 @@ import "log"
 // that sets up cassandra schema on
 // a specified keyspace
 type SetupTask struct {
-	db     DB
+	db     SchemaClient
 	config *SetupConfig
 }
 
-func newSetupSchemaTask(db DB, config *SetupConfig) *SetupTask {
+func newSetupSchemaTask(db SchemaClient, config *SetupConfig) *SetupTask {
 	return &SetupTask{
 		db:     db,
 		config: config,
@@ -43,7 +43,10 @@ func (task *SetupTask) Run() error {
 	log.Printf("Starting schema setup, config=%+v\n", config)
 
 	if config.Overwrite {
-		task.db.DropAllTables()
+		err := task.db.DropAllTables()
+		if err != nil {
+			return err
+		}
 	}
 
 	if !config.DisableVersioning {
@@ -62,7 +65,7 @@ func (task *SetupTask) Run() error {
 		log.Println("----- Creating types and tables -----")
 		for _, stmt := range stmts {
 			log.Println(rmspaceRegex.ReplaceAllString(stmt, " "))
-			if err := task.db.Exec(stmt); err != nil {
+			if err := task.db.ExecDDLQuery(stmt); err != nil {
 				return err
 			}
 		}

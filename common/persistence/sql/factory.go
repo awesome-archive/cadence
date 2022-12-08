@@ -21,13 +21,16 @@
 package sql
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 
+	"github.com/uber/cadence/common/persistence/serialization"
+
+	"github.com/uber/cadence/common/config"
 	"github.com/uber/cadence/common/log"
 	p "github.com/uber/cadence/common/persistence"
-	"github.com/uber/cadence/common/persistence/sql/storage"
-	"github.com/uber/cadence/common/persistence/sql/storage/sqldb"
-	"github.com/uber/cadence/common/service/config"
+	"github.com/uber/cadence/common/persistence/sql/sqlplugin"
 )
 
 type (
@@ -37,6 +40,8 @@ type (
 		dbConn      dbConn
 		clusterName string
 		logger      log.Logger
+		parser      serialization.Parser
+		dc          *p.DynamicConfiguration
 	}
 
 	// dbConn represents a logical mysql connection - its a
@@ -44,7 +49,7 @@ type (
 	// additional reference counting
 	dbConn struct {
 		sync.Mutex
-		sqldb.Interface
+		sqlplugin.DB
 		refCnt int
 		cfg    *config.SQL
 	}
@@ -52,12 +57,20 @@ type (
 
 // NewFactory returns an instance of a factory object which can be used to create
 // datastores backed by any kind of SQL store
-func NewFactory(cfg config.SQL, clusterName string, logger log.Logger) *Factory {
+func NewFactory(
+	cfg config.SQL,
+	clusterName string,
+	logger log.Logger,
+	parser serialization.Parser,
+	dc *p.DynamicConfiguration,
+) *Factory {
 	return &Factory{
 		cfg:         cfg,
 		clusterName: clusterName,
 		logger:      logger,
 		dbConn:      newRefCountedDBConn(&cfg),
+		parser:      parser,
+		dc:          dc,
 	}
 }
 
@@ -67,7 +80,7 @@ func (f *Factory) NewTaskStore() (p.TaskStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newTaskPersistence(conn, f.cfg.NumShards, f.logger)
+	return newTaskPersistence(conn, f.cfg.NumShards, f.logger, f.parser)
 }
 
 // NewShardStore returns a new shard store
@@ -76,7 +89,7 @@ func (f *Factory) NewShardStore() (p.ShardStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newShardPersistence(conn, f.clusterName, f.logger)
+	return NewShardPersistence(conn, f.clusterName, f.logger, f.parser)
 }
 
 // NewHistoryStore returns a new history store
@@ -85,35 +98,16 @@ func (f *Factory) NewHistoryStore() (p.HistoryStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newHistoryPersistence(conn, f.logger)
+	return NewHistoryV2Persistence(conn, f.logger, f.parser)
 }
 
-// NewHistoryV2Store returns a new history store
-func (f *Factory) NewHistoryV2Store() (p.HistoryV2Store, error) {
+// NewDomainStore returns a new metadata store
+func (f *Factory) NewDomainStore() (p.DomainStore, error) {
 	conn, err := f.dbConn.get()
 	if err != nil {
 		return nil, err
 	}
-	return newHistoryV2Persistence(conn, f.logger)
-}
-
-// NewMetadataStore returns a new metadata store
-func (f *Factory) NewMetadataStore() (p.MetadataStore, error) {
-	conn, err := f.dbConn.get()
-	if err != nil {
-		return nil, err
-	}
-	return newMetadataPersistenceV2(conn, f.clusterName, f.logger)
-}
-
-// NewMetadataStoreV1 returns the default metadatastore
-func (f *Factory) NewMetadataStoreV1() (p.MetadataStore, error) {
-	return f.NewMetadataStore()
-}
-
-// NewMetadataStoreV2 returns the default metadatastore
-func (f *Factory) NewMetadataStoreV2() (p.MetadataStore, error) {
-	return f.NewMetadataStore()
+	return newMetadataPersistenceV2(conn, f.clusterName, f.logger, f.parser)
 }
 
 // NewExecutionStore returns an ExecutionStore for a given shardID
@@ -122,12 +116,28 @@ func (f *Factory) NewExecutionStore(shardID int) (p.ExecutionStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewSQLExecutionStore(conn, f.logger, shardID)
+	return NewSQLExecutionStore(conn, f.logger, shardID, f.parser, f.dc)
 }
 
 // NewVisibilityStore returns a visibility store
-func (f *Factory) NewVisibilityStore() (p.VisibilityStore, error) {
+// TODO sortByCloseTime will be removed and implemented for https://github.com/uber/cadence/issues/3621
+func (f *Factory) NewVisibilityStore(sortByCloseTime bool) (p.VisibilityStore, error) {
 	return NewSQLVisibilityStore(f.cfg, f.logger)
+}
+
+// NewQueue returns a new queue backed by sql
+func (f *Factory) NewQueue(queueType p.QueueType) (p.Queue, error) {
+	conn, err := f.dbConn.get()
+	if err != nil {
+		return nil, err
+	}
+
+	return newQueueStore(conn, f.logger, queueType)
+}
+
+// NewConfigStore returns a new config store backed by sql. Not Yet Implemented.
+func (f *Factory) NewConfigStore() (p.ConfigStore, error) {
+	return nil, errors.New("sql config store not yet implemented")
 }
 
 // Close closes the factory
@@ -146,15 +156,15 @@ func newRefCountedDBConn(cfg *config.SQL) dbConn {
 // get returns a mysql db connection and increments a reference count
 // this method will create a new connection, if an existing connection
 // does not exist
-func (c *dbConn) get() (sqldb.Interface, error) {
+func (c *dbConn) get() (sqlplugin.DB, error) {
 	c.Lock()
 	defer c.Unlock()
 	if c.refCnt == 0 {
-		conn, err := storage.NewSQLDB(c.cfg)
+		conn, err := NewSQLDB(c.cfg)
 		if err != nil {
 			return nil, err
 		}
-		c.Interface = conn
+		c.DB = conn
 	}
 	c.refCnt++
 	return c, nil
@@ -164,8 +174,12 @@ func (c *dbConn) get() (sqldb.Interface, error) {
 func (c *dbConn) forceClose() {
 	c.Lock()
 	defer c.Unlock()
-	if c.Interface != nil {
-		c.Interface.Close()
+	if c.DB != nil {
+		err := c.DB.Close()
+		if err != nil {
+			fmt.Println("failed to close database connection, may leak some connection", err)
+		}
+
 	}
 	c.refCnt = 0
 }
@@ -176,8 +190,8 @@ func (c *dbConn) Close() error {
 	defer c.Unlock()
 	c.refCnt--
 	if c.refCnt == 0 {
-		err := c.Interface.Close()
-		c.Interface = nil
+		err := c.DB.Close()
+		c.DB = nil
 		return err
 	}
 	return nil

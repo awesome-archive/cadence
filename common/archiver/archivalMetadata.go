@@ -24,10 +24,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/service/config"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/common/config"
+	"github.com/uber/cadence/common/dynamicconfig"
+	"github.com/uber/cadence/common/types"
 )
 
 type (
@@ -43,7 +43,7 @@ type (
 		ClusterConfiguredForArchival() bool
 		GetClusterStatus() ArchivalStatus
 		ReadEnabled() bool
-		GetDomainDefaultStatus() shared.ArchivalStatus
+		GetDomainDefaultStatus() types.ArchivalStatus
 		GetDomainDefaultURI() string
 	}
 
@@ -55,8 +55,9 @@ type (
 	archivalConfig struct {
 		staticClusterStatus  ArchivalStatus
 		dynamicClusterStatus dynamicconfig.StringPropertyFn
-		enableRead           dynamicconfig.BoolPropertyFn
-		domainDefaultStatus  shared.ArchivalStatus
+		staticEnableRead     bool
+		dynamicEnableRead    dynamicconfig.BoolPropertyFn
+		domainDefaultStatus  types.ArchivalStatus
 		domainDefaultURI     string
 	}
 
@@ -85,16 +86,18 @@ func NewArchivalMetadata(
 ) ArchivalMetadata {
 	historyConfig := NewArchivalConfig(
 		historyStatus,
-		dc.GetStringProperty(dynamicconfig.HistoryArchivalStatus, historyStatus),
-		dc.GetBoolProperty(dynamicconfig.EnableReadFromHistoryArchival, historyReadEnabled),
+		dc.GetStringProperty(dynamicconfig.HistoryArchivalStatus),
+		historyReadEnabled,
+		dc.GetBoolProperty(dynamicconfig.EnableReadFromHistoryArchival),
 		domainDefaults.History.Status,
 		domainDefaults.History.URI,
 	)
 
 	visibilityConfig := NewArchivalConfig(
 		visibilityStatus,
-		dc.GetStringProperty(dynamicconfig.VisibilityArchivalStatus, visibilityStatus),
-		dc.GetBoolProperty(dynamicconfig.EnableReadFromVisibilityArchival, visibilityReadEnabled),
+		dc.GetStringProperty(dynamicconfig.VisibilityArchivalStatus),
+		visibilityReadEnabled,
+		dc.GetBoolProperty(dynamicconfig.EnableReadFromVisibilityArchival),
 		domainDefaults.Visibility.Status,
 		domainDefaults.Visibility.URI,
 	)
@@ -117,7 +120,8 @@ func (metadata *archivalMetadata) GetVisibilityConfig() ArchivalConfig {
 func NewArchivalConfig(
 	staticClusterStatusStr string,
 	dynamicClusterStatus dynamicconfig.StringPropertyFn,
-	enableRead dynamicconfig.BoolPropertyFn,
+	staticEnableRead bool,
+	dynamicEnableRead dynamicconfig.BoolPropertyFn,
 	domainDefaultStatusStr string,
 	domainDefaultURI string,
 ) ArchivalConfig {
@@ -133,7 +137,8 @@ func NewArchivalConfig(
 	return &archivalConfig{
 		staticClusterStatus:  staticClusterStatus,
 		dynamicClusterStatus: dynamicClusterStatus,
-		enableRead:           enableRead,
+		staticEnableRead:     staticEnableRead,
+		dynamicEnableRead:    dynamicEnableRead,
 		domainDefaultStatus:  domainDefaultStatus,
 		domainDefaultURI:     domainDefaultURI,
 	}
@@ -144,8 +149,9 @@ func NewDisabledArchvialConfig() ArchivalConfig {
 	return &archivalConfig{
 		staticClusterStatus:  ArchivalDisabled,
 		dynamicClusterStatus: nil,
-		enableRead:           nil,
-		domainDefaultStatus:  shared.ArchivalStatusDisabled,
+		staticEnableRead:     false,
+		dynamicEnableRead:    nil,
+		domainDefaultStatus:  types.ArchivalStatusDisabled,
 		domainDefaultURI:     "",
 	}
 }
@@ -177,10 +183,10 @@ func (a *archivalConfig) ReadEnabled() bool {
 	if !a.ClusterConfiguredForArchival() {
 		return false
 	}
-	return a.enableRead()
+	return a.staticEnableRead && a.dynamicEnableRead()
 }
 
-func (a *archivalConfig) GetDomainDefaultStatus() shared.ArchivalStatus {
+func (a *archivalConfig) GetDomainDefaultStatus() types.ArchivalStatus {
 	return a.domainDefaultStatus
 }
 
@@ -201,13 +207,13 @@ func getClusterArchivalStatus(str string) (ArchivalStatus, error) {
 	return ArchivalDisabled, fmt.Errorf("invalid archival status of %v for cluster, valid status are: {\"\", \"disabled\", \"paused\", \"enabled\"}", str)
 }
 
-func getDomainArchivalStatus(str string) (shared.ArchivalStatus, error) {
+func getDomainArchivalStatus(str string) (types.ArchivalStatus, error) {
 	str = strings.TrimSpace(strings.ToLower(str))
 	switch str {
 	case "", common.ArchivalDisabled:
-		return shared.ArchivalStatusDisabled, nil
+		return types.ArchivalStatusDisabled, nil
 	case common.ArchivalEnabled:
-		return shared.ArchivalStatusEnabled, nil
+		return types.ArchivalStatusEnabled, nil
 	}
-	return shared.ArchivalStatusDisabled, fmt.Errorf("invalid archival status of %v for domain, valid status are: {\"\", \"disabled\", \"enabled\"}", str)
+	return types.ArchivalStatusDisabled, fmt.Errorf("invalid archival status of %v for domain, valid status are: {\"\", \"disabled\", \"enabled\"}", str)
 }

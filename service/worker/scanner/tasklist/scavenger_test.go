@@ -21,29 +21,40 @@
 package tasklist
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
+	"go.uber.org/zap"
+
+	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/dynamicconfig"
 	"github.com/uber/cadence/common/log/loggerimpl"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/mocks"
 	p "github.com/uber/cadence/common/persistence"
-	"go.uber.org/zap"
 )
 
 type (
 	ScavengerTestSuite struct {
 		suite.Suite
-		taskListTable *mockTaskListTable
-		taskTables    map[string]*mockTaskTable
-		taskMgr       *mocks.TaskManager
-		scvgr         *Scavenger
+		taskListTable   *mockTaskListTable
+		taskTables      map[string]*mockTaskTable
+		taskMgr         *mocks.TaskManager
+		scvgr           *Scavenger
+		scvgrCancelFn   context.CancelFunc
+		mockDomainCache *cache.MockDomainCache
 	}
+)
+
+const (
+	scavengerTestTimeout = 10 * time.Second
 )
 
 var errTest = errors.New("transient error")
@@ -61,10 +72,23 @@ func (s *ScavengerTestSuite) SetupTest() {
 		s.Require().NoError(err)
 	}
 	logger := loggerimpl.NewLogger(zapLogger)
-	s.scvgr = NewScavenger(s.taskMgr, metrics.NewClient(tally.NoopScope, metrics.Worker), logger)
-	maxTasksPerJob = 4
-	nWorkers = 4
-	executorPollInterval = time.Millisecond * 50
+	ctrl := gomock.NewController(s.T())
+	s.mockDomainCache = cache.NewMockDomainCache(ctrl)
+	scvgrCtx, scvgrCancelFn := context.WithTimeout(context.Background(), scavengerTestTimeout)
+	s.scvgr = NewScavenger(
+		scvgrCtx,
+		s.taskMgr,
+		metrics.NewClient(tally.NoopScope, metrics.Worker),
+		logger,
+		&Options{
+			EnableCleaning:           dynamicconfig.GetBoolPropertyFn(true),
+			TaskBatchSizeFn:          dynamicconfig.GetIntPropertyFn(16),
+			GetOrphanTasksPageSizeFn: dynamicconfig.GetIntPropertyFn(16),
+			ExecutorPollInterval:     time.Millisecond * 50,
+		},
+		s.mockDomainCache,
+	)
+	s.scvgrCancelFn = scvgrCancelFn
 }
 
 func (s *ScavengerTestSuite) TestAllExpiredTasks() {
@@ -77,6 +101,7 @@ func (s *ScavengerTestSuite) TestAllExpiredTasks() {
 		tt.generate(nTasks, true)
 		s.taskTables[name] = tt
 	}
+	s.mockDomainCache.EXPECT().GetDomainName(gomock.Any()).Return("test_domain_name", nil).AnyTimes()
 	s.setupTaskMgrMocks()
 	s.runScavenger()
 	for tl, tbl := range s.taskTables {
@@ -96,6 +121,7 @@ func (s *ScavengerTestSuite) TestAllAliveTasks() {
 		tt.generate(nTasks, false)
 		s.taskTables[name] = tt
 	}
+	s.mockDomainCache.EXPECT().GetDomainName(gomock.Any()).Return("test_domain_name", nil).AnyTimes()
 	s.setupTaskMgrMocks()
 	s.runScavenger()
 	for tl, tbl := range s.taskTables {
@@ -116,6 +142,7 @@ func (s *ScavengerTestSuite) TestExpiredTasksFollowedByAlive() {
 		tt.generate(nTasks/2, false)
 		s.taskTables[name] = tt
 	}
+	s.mockDomainCache.EXPECT().GetDomainName(gomock.Any()).Return("test_domain_name", nil).AnyTimes()
 	s.setupTaskMgrMocks()
 	s.runScavenger()
 	for tl, tbl := range s.taskTables {
@@ -137,6 +164,7 @@ func (s *ScavengerTestSuite) TestAliveTasksFollowedByExpired() {
 		tt.generate(nTasks/2, true)
 		s.taskTables[name] = tt
 	}
+	s.mockDomainCache.EXPECT().GetDomainName(gomock.Any()).Return("test_domain_name", nil).AnyTimes()
 	s.setupTaskMgrMocks()
 	s.runScavenger()
 	for tl, tbl := range s.taskTables {
@@ -156,6 +184,7 @@ func (s *ScavengerTestSuite) TestAllExpiredTasksWithErrors() {
 		tt.generate(nTasks, true)
 		s.taskTables[name] = tt
 	}
+	s.mockDomainCache.EXPECT().GetDomainName(gomock.Any()).Return("test_domain_name", nil).AnyTimes()
 	s.setupTaskMgrMocksWithErrors()
 	s.runScavenger()
 	for _, tbl := range s.taskTables {
@@ -168,7 +197,7 @@ func (s *ScavengerTestSuite) TestAllExpiredTasksWithErrors() {
 
 func (s *ScavengerTestSuite) runScavenger() {
 	s.scvgr.Start()
-	timer := time.NewTimer(10 * time.Second)
+	timer := time.NewTimer(scavengerTestTimeout)
 	select {
 	case <-s.scvgr.stopC:
 		timer.Stop()
@@ -179,31 +208,39 @@ func (s *ScavengerTestSuite) runScavenger() {
 }
 
 func (s *ScavengerTestSuite) setupTaskMgrMocks() {
-	s.taskMgr.On("ListTaskList", mock.Anything).Return(
-		func(req *p.ListTaskListRequest) *p.ListTaskListResponse {
+	s.taskMgr.On("ListTaskList", mock.Anything, mock.Anything).Return(
+		func(_ context.Context, req *p.ListTaskListRequest) *p.ListTaskListResponse {
 			items, next := s.taskListTable.list(req.PageToken, req.PageSize)
 			return &p.ListTaskListResponse{Items: items, NextPageToken: next}
 		}, nil)
-	s.taskMgr.On("DeleteTaskList", mock.Anything).Return(
-		func(req *p.DeleteTaskListRequest) error {
+	s.taskMgr.On("DeleteTaskList", mock.Anything, mock.Anything).Return(
+		func(_ context.Context, req *p.DeleteTaskListRequest) error {
 			s.taskListTable.delete(req.TaskListName)
 			return nil
 		})
-	s.taskMgr.On("GetTasks", mock.Anything).Return(
-		func(req *p.GetTasksRequest) *p.GetTasksResponse {
+	s.taskMgr.On("GetTasks", mock.Anything, mock.Anything).Return(
+		func(_ context.Context, req *p.GetTasksRequest) *p.GetTasksResponse {
 			result := s.taskTables[req.TaskList].get(req.BatchSize)
 			return &p.GetTasksResponse{Tasks: result}
 		}, nil)
-	s.taskMgr.On("CompleteTasksLessThan", mock.Anything).Return(
-		func(req *p.CompleteTasksLessThanRequest) int {
-			return s.taskTables[req.TaskListName].deleteLessThan(req.TaskID, req.Limit)
+	s.taskMgr.On("CompleteTasksLessThan", mock.Anything, mock.Anything).Return(
+		func(_ context.Context, req *p.CompleteTasksLessThanRequest) *p.CompleteTasksLessThanResponse {
+			rowsDeleted := s.taskTables[req.TaskListName].deleteLessThan(req.TaskID, req.Limit)
+			return &p.CompleteTasksLessThanResponse{TasksCompleted: rowsDeleted}
+		}, nil)
+	s.taskMgr.On("GetOrphanTasks", mock.Anything, mock.Anything).Return(
+		func(_ context.Context, req *p.GetOrphanTasksRequest) *p.GetOrphanTasksResponse {
+			return &p.GetOrphanTasksResponse{
+				Tasks: make([]*p.TaskKey, 0),
+			}
 		}, nil)
 }
 
 func (s *ScavengerTestSuite) setupTaskMgrMocksWithErrors() {
-	s.taskMgr.On("ListTaskList", mock.Anything).Return(nil, errTest).Once()
-	s.taskMgr.On("GetTasks", mock.Anything).Return(nil, errTest).Once()
-	s.taskMgr.On("CompleteTasksLessThan", mock.Anything).Return(0, errTest).Once()
-	s.taskMgr.On("DeleteTaskList", mock.Anything).Return(errTest).Once()
+	s.taskMgr.On("ListTaskList", mock.Anything, mock.Anything).Return(nil, errTest).Once()
+	s.taskMgr.On("GetTasks", mock.Anything, mock.Anything).Return(nil, errTest).Once()
+	s.taskMgr.On("CompleteTasksLessThan", mock.Anything, mock.Anything).Return(nil, errTest).Once()
+	s.taskMgr.On("DeleteTaskList", mock.Anything, mock.Anything).Return(errTest).Once()
+	s.taskMgr.On("GetOrphanTasks", mock.Anything, mock.Anything).Return(nil, errTest).Once()
 	s.setupTaskMgrMocks()
 }

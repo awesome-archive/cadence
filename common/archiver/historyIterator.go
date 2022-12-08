@@ -18,15 +18,19 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination historyIterator_mock.go -self_package github.com/uber/cadence/common/archiver
+
 package archiver
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 
-	"github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/persistence"
+	persistenceutils "github.com/uber/cadence/common/persistence/persistence-utils"
+	"github.com/uber/cadence/common/types"
 )
 
 const (
@@ -58,7 +62,7 @@ type (
 	// HistoryBlob is the serializable data that forms the body of a blob
 	HistoryBlob struct {
 		Header *HistoryBlobHeader `json:"header"`
-		Body   []*shared.History  `json:"body"`
+		Body   []*types.History   `json:"body"`
 	}
 
 	historyIteratorState struct {
@@ -69,9 +73,9 @@ type (
 	historyIterator struct {
 		historyIteratorState
 
+		ctx                   context.Context
 		request               *ArchiveHistoryRequest
-		historyManager        persistence.HistoryManager
-		historyV2Manager      persistence.HistoryV2Manager
+		historyV2Manager      persistence.HistoryManager
 		sizeEstimator         SizeEstimator
 		historyPageSize       int
 		targetHistoryBlobSize int
@@ -84,23 +88,23 @@ var (
 
 // NewHistoryIterator returns a new HistoryIterator
 func NewHistoryIterator(
+	ctx context.Context,
 	request *ArchiveHistoryRequest,
-	historyManager persistence.HistoryManager,
-	historyV2Manager persistence.HistoryV2Manager,
+	historyV2Manager persistence.HistoryManager,
 	targetHistoryBlobSize int,
 ) HistoryIterator {
-	return newHistoryIterator(request, historyManager, historyV2Manager, targetHistoryBlobSize)
+	return newHistoryIterator(ctx, request, historyV2Manager, targetHistoryBlobSize)
 }
 
 // NewHistoryIteratorFromState returns a new HistoryIterator with specified state
 func NewHistoryIteratorFromState(
+	ctx context.Context,
 	request *ArchiveHistoryRequest,
-	historyManager persistence.HistoryManager,
-	historyV2Manager persistence.HistoryV2Manager,
+	historyV2Manager persistence.HistoryManager,
 	targetHistoryBlobSize int,
 	initialState []byte,
 ) (HistoryIterator, error) {
-	it := newHistoryIterator(request, historyManager, historyV2Manager, targetHistoryBlobSize)
+	it := newHistoryIterator(ctx, request, historyV2Manager, targetHistoryBlobSize)
 	if initialState == nil {
 		return it, nil
 	}
@@ -111,9 +115,9 @@ func NewHistoryIteratorFromState(
 }
 
 func newHistoryIterator(
+	ctx context.Context,
 	request *ArchiveHistoryRequest,
-	historyManager persistence.HistoryManager,
-	historyV2Manager persistence.HistoryV2Manager,
+	historyV2Manager persistence.HistoryManager,
 	targetHistoryBlobSize int,
 ) *historyIterator {
 	return &historyIterator{
@@ -121,8 +125,8 @@ func newHistoryIterator(
 			NextEventID:       common.FirstEventID,
 			FinishedIteration: false,
 		},
+		ctx:                   ctx,
 		request:               request,
-		historyManager:        historyManager,
 		historyV2Manager:      historyV2Manager,
 		historyPageSize:       historyPageSize,
 		targetHistoryBlobSize: targetHistoryBlobSize,
@@ -135,7 +139,7 @@ func (i *historyIterator) Next() (*HistoryBlob, error) {
 		return nil, errIteratorDepleted
 	}
 
-	historyBatches, newIterState, err := i.readHistoryBatches(i.NextEventID)
+	historyBatches, newIterState, err := i.readHistoryBatches(i.ctx, i.NextEventID)
 	if err != nil {
 		return nil, err
 	}
@@ -154,10 +158,10 @@ func (i *historyIterator) Next() (*HistoryBlob, error) {
 		WorkflowID:           common.StringPtr(i.request.WorkflowID),
 		RunID:                common.StringPtr(i.request.RunID),
 		IsLast:               common.BoolPtr(i.FinishedIteration),
-		FirstFailoverVersion: firstEvent.Version,
-		LastFailoverVersion:  lastEvent.Version,
-		FirstEventID:         firstEvent.EventId,
-		LastEventID:          lastEvent.EventId,
+		FirstFailoverVersion: common.Int64Ptr(firstEvent.Version),
+		LastFailoverVersion:  common.Int64Ptr(lastEvent.Version),
+		FirstEventID:         common.Int64Ptr(firstEvent.ID),
+		LastEventID:          common.Int64Ptr(lastEvent.ID),
 		EventCount:           common.Int64Ptr(eventCount),
 	}
 
@@ -177,14 +181,14 @@ func (i *historyIterator) GetState() ([]byte, error) {
 	return json.Marshal(i.historyIteratorState)
 }
 
-func (i *historyIterator) readHistoryBatches(firstEventID int64) ([]*shared.History, historyIteratorState, error) {
+func (i *historyIterator) readHistoryBatches(ctx context.Context, firstEventID int64) ([]*types.History, historyIteratorState, error) {
 	size := 0
 	targetSize := i.targetHistoryBlobSize
-	var historyBatches []*shared.History
+	var historyBatches []*types.History
 	newIterState := historyIteratorState{}
 	for size < targetSize {
-		currHistoryBatches, err := i.readHistory(firstEventID)
-		if _, ok := err.(*shared.EntityNotExistsError); ok && firstEventID != common.FirstEventID {
+		currHistoryBatches, err := i.readHistory(ctx, firstEventID)
+		if _, ok := err.(*types.EntityNotExistsError); ok && firstEventID != common.FirstEventID {
 			newIterState.FinishedIteration = true
 			return historyBatches, newIterState, nil
 		}
@@ -198,7 +202,7 @@ func (i *historyIterator) readHistoryBatches(firstEventID int64) ([]*shared.Hist
 			}
 			size += historyBatchSize
 			historyBatches = append(historyBatches, batch)
-			firstEventID = *batch.Events[len(batch.Events)-1].EventId + 1
+			firstEventID = batch.Events[len(batch.Events)-1].ID + 1
 
 			// In case targetSize is satisfied before reaching the end of current set of batches, return immediately.
 			// Otherwise, we need to look ahead to see if there's more history batches.
@@ -212,8 +216,8 @@ func (i *historyIterator) readHistoryBatches(firstEventID int64) ([]*shared.Hist
 
 	// If you are here, it means the target size is met after adding the last batch of read history.
 	// We need to check if there's more history batches.
-	_, err := i.readHistory(firstEventID)
-	if _, ok := err.(*shared.EntityNotExistsError); ok && firstEventID != common.FirstEventID {
+	_, err := i.readHistory(ctx, firstEventID)
+	if _, ok := err.(*types.EntityNotExistsError); ok && firstEventID != common.FirstEventID {
 		newIterState.FinishedIteration = true
 		return historyBatches, newIterState, nil
 	}
@@ -225,33 +229,18 @@ func (i *historyIterator) readHistoryBatches(firstEventID int64) ([]*shared.Hist
 	return historyBatches, newIterState, nil
 }
 
-func (i *historyIterator) readHistory(firstEventID int64) ([]*shared.History, error) {
-	if i.request.EventStoreVersion == persistence.EventStoreVersionV2 {
-		req := &persistence.ReadHistoryBranchRequest{
-			BranchToken: i.request.BranchToken,
-			MinEventID:  firstEventID,
-			MaxEventID:  common.EndEventID,
-			PageSize:    i.historyPageSize,
-			ShardID:     common.IntPtr(i.request.ShardID),
-		}
-		historyBatches, _, _, err := persistence.ReadFullPageV2EventsByBatch(i.historyV2Manager, req)
-		return historyBatches, err
+func (i *historyIterator) readHistory(ctx context.Context, firstEventID int64) ([]*types.History, error) {
+	req := &persistence.ReadHistoryBranchRequest{
+		BranchToken: i.request.BranchToken,
+		MinEventID:  firstEventID,
+		MaxEventID:  common.EndEventID,
+		PageSize:    i.historyPageSize,
+		ShardID:     common.IntPtr(i.request.ShardID),
+		DomainName:  i.request.DomainName,
 	}
-	req := &persistence.GetWorkflowExecutionHistoryRequest{
-		DomainID: i.request.DomainID,
-		Execution: shared.WorkflowExecution{
-			WorkflowId: common.StringPtr(i.request.WorkflowID),
-			RunId:      common.StringPtr(i.request.RunID),
-		},
-		FirstEventID: firstEventID,
-		NextEventID:  common.EndEventID,
-		PageSize:     i.historyPageSize,
-	}
-	resp, err := i.historyManager.GetWorkflowExecutionHistoryByBatch(req)
-	if err != nil {
-		return nil, err
-	}
-	return resp.History, nil
+	historyBatches, _, _, err := persistenceutils.ReadFullPageV2EventsByBatch(ctx, i.historyV2Manager, req)
+	return historyBatches, err
+
 }
 
 // reset resets iterator to a certain state given its encoded representation

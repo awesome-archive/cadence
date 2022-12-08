@@ -21,6 +21,7 @@
 package matching
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 
@@ -33,6 +34,7 @@ type (
 	taskListDB struct {
 		sync.Mutex
 		domainID     string
+		domainName   string
 		taskListName string
 		taskListKind int
 		taskType     int
@@ -53,13 +55,14 @@ type (
 //
 // This class will serialize writes to persistence that do condition updates. There are
 // two reasons for doing this:
-// - To work around known Cassandra issue where concurrent LWT to the same partition cause timeout errors
-// - To provide the guarantee that there is only writer who updates taskList in persistence at any given point in time
-//   This guarantee makes some of the other code simpler and there is no impact to perf because updates to tasklist are
-//   spread out and happen in background routines
-func newTaskListDB(store persistence.TaskManager, domainID string, name string, taskType int, kind int, logger log.Logger) *taskListDB {
+//   - To work around known Cassandra issue where concurrent LWT to the same partition cause timeout errors
+//   - To provide the guarantee that there is only writer who updates taskList in persistence at any given point in time
+//     This guarantee makes some of the other code simpler and there is no impact to perf because updates to tasklist are
+//     spread out and happen in background routines
+func newTaskListDB(store persistence.TaskManager, domainID string, domainName string, name string, taskType int, kind int, logger log.Logger) *taskListDB {
 	return &taskListDB{
 		domainID:     domainID,
+		domainName:   domainName,
 		taskListName: name,
 		taskListKind: kind,
 		taskType:     taskType,
@@ -80,12 +83,13 @@ func (db *taskListDB) RangeID() int64 {
 func (db *taskListDB) RenewLease() (taskListState, error) {
 	db.Lock()
 	defer db.Unlock()
-	resp, err := db.store.LeaseTaskList(&persistence.LeaseTaskListRequest{
+	resp, err := db.store.LeaseTaskList(context.Background(), &persistence.LeaseTaskListRequest{
 		DomainID:     db.domainID,
 		TaskList:     db.taskListName,
 		TaskType:     db.taskType,
 		TaskListKind: db.taskListKind,
 		RangeID:      atomic.LoadInt64(&db.rangeID),
+		DomainName:   db.domainName,
 	})
 	if err != nil {
 		return taskListState{}, err
@@ -99,7 +103,7 @@ func (db *taskListDB) RenewLease() (taskListState, error) {
 func (db *taskListDB) UpdateState(ackLevel int64) error {
 	db.Lock()
 	defer db.Unlock()
-	_, err := db.store.UpdateTaskList(&persistence.UpdateTaskListRequest{
+	_, err := db.store.UpdateTaskList(context.Background(), &persistence.UpdateTaskListRequest{
 		TaskListInfo: &persistence.TaskListInfo{
 			DomainID: db.domainID,
 			Name:     db.taskListName,
@@ -108,6 +112,7 @@ func (db *taskListDB) UpdateState(ackLevel int64) error {
 			RangeID:  db.rangeID,
 			Kind:     db.taskListKind,
 		},
+		DomainName: db.domainName,
 	})
 	if err == nil {
 		db.ackLevel = ackLevel
@@ -119,7 +124,7 @@ func (db *taskListDB) UpdateState(ackLevel int64) error {
 func (db *taskListDB) CreateTasks(tasks []*persistence.CreateTaskInfo) (*persistence.CreateTasksResponse, error) {
 	db.Lock()
 	defer db.Unlock()
-	return db.store.CreateTasks(&persistence.CreateTasksRequest{
+	return db.store.CreateTasks(context.Background(), &persistence.CreateTasksRequest{
 		TaskListInfo: &persistence.TaskListInfo{
 			DomainID: db.domainID,
 			Name:     db.taskListName,
@@ -128,31 +133,34 @@ func (db *taskListDB) CreateTasks(tasks []*persistence.CreateTaskInfo) (*persist
 			RangeID:  db.rangeID,
 			Kind:     db.taskListKind,
 		},
-		Tasks: tasks,
+		Tasks:      tasks,
+		DomainName: db.domainName,
 	})
 }
 
 // GetTasks returns a batch of tasks between the given range
 func (db *taskListDB) GetTasks(minTaskID int64, maxTaskID int64, batchSize int) (*persistence.GetTasksResponse, error) {
-	return db.store.GetTasks(&persistence.GetTasksRequest{
+	return db.store.GetTasks(context.Background(), &persistence.GetTasksRequest{
 		DomainID:     db.domainID,
 		TaskList:     db.taskListName,
 		TaskType:     db.taskType,
 		BatchSize:    batchSize,
 		ReadLevel:    minTaskID,  // exclusive
 		MaxReadLevel: &maxTaskID, // inclusive
+		DomainName:   db.domainName,
 	})
 }
 
 // CompleteTask deletes a single task from this task list
 func (db *taskListDB) CompleteTask(taskID int64) error {
-	err := db.store.CompleteTask(&persistence.CompleteTaskRequest{
+	err := db.store.CompleteTask(context.Background(), &persistence.CompleteTaskRequest{
 		TaskList: &persistence.TaskListInfo{
 			DomainID: db.domainID,
 			Name:     db.taskListName,
 			TaskType: db.taskType,
 		},
-		TaskID: taskID,
+		TaskID:     taskID,
+		DomainName: db.domainName,
 	})
 	if err != nil {
 		db.logger.Error("Persistent store operation failure",
@@ -169,12 +177,13 @@ func (db *taskListDB) CompleteTask(taskID int64) error {
 // the upper bound of number of tasks that can be deleted by this method. It may
 // or may not be honored
 func (db *taskListDB) CompleteTasksLessThan(taskID int64, limit int) (int, error) {
-	n, err := db.store.CompleteTasksLessThan(&persistence.CompleteTasksLessThanRequest{
+	resp, err := db.store.CompleteTasksLessThan(context.Background(), &persistence.CompleteTasksLessThanRequest{
 		DomainID:     db.domainID,
 		TaskListName: db.taskListName,
 		TaskType:     db.taskType,
 		TaskID:       taskID,
 		Limit:        limit,
+		DomainName:   db.domainName,
 	})
 	if err != nil {
 		db.logger.Error("Persistent store operation failure",
@@ -183,6 +192,7 @@ func (db *taskListDB) CompleteTasksLessThan(taskID int64, limit int) (int, error
 			tag.TaskID(taskID),
 			tag.TaskType(db.taskType),
 			tag.WorkflowTaskListName(db.taskListName))
+		return 0, err
 	}
-	return n, err
+	return resp.TasksCompleted, nil
 }

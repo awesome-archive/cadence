@@ -22,17 +22,19 @@ package schema
 
 import (
 	"fmt"
-	"io/ioutil"
 	"regexp"
 	"strconv"
 	"strings"
 )
 
 // represents names of the form vx.x where x.x is a (major, minor) version pair
-var versionStrRegex = regexp.MustCompile("^v\\d+(\\.\\d+)?$")
+var versionStrRegex = regexp.MustCompile(`^v\d+(\.\d+)?$`)
 
 // represents names of the form x.x where minor version is always single digit
-var versionNumRegex = regexp.MustCompile("^\\d+(\\.\\d+)?$")
+var versionNumRegex = regexp.MustCompile(`^\d+(\.\d+)?$`)
+
+// represents names of the form sx.x-y.y where x.x and y.y. are (major, minor) version pairs
+var squashVersionStrRegex = regexp.MustCompile(`^s\d+(\.\d+)?-\d+(\.\d+)?$`)
 
 // cmpVersion compares two version strings
 // returns 0 if a == b
@@ -93,31 +95,4 @@ func parseValidateVersion(ver string) (string, error) {
 		return "", fmt.Errorf("invalid version, expected format is x.x")
 	}
 	return ver, nil
-}
-
-// getExpectedVersion gets the latest version from the schema directory
-func getExpectedVersion(dir string) (string, error) {
-	subdirs, err := ioutil.ReadDir(dir)
-	if err != nil {
-		return "", err
-	}
-
-	var result string
-	for _, subdir := range subdirs {
-		if !subdir.IsDir() {
-			continue
-		}
-		dirname := subdir.Name()
-		if !versionStrRegex.MatchString(dirname) {
-			continue
-		}
-		ver := dirToVersion(dirname)
-		if len(result) == 0 || cmpVersion(ver, result) > 0 {
-			result = ver
-		}
-	}
-	if len(result) == 0 {
-		return "", fmt.Errorf("no valid schemas found in dir: %s", dir)
-	}
-	return result, nil
 }

@@ -22,15 +22,14 @@ package archiver
 
 import (
 	"bytes"
-	"context"
-	"encoding/gob"
+	"encoding/json"
 	"time"
 
 	"github.com/dgryski/go-farm"
+	"go.uber.org/cadence/activity"
+
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
-	"go.uber.org/cadence"
-	"go.uber.org/cadence/activity"
 )
 
 // MaxArchivalIterationTimeout returns the max allowed timeout for a single iteration of archival workflow
@@ -40,7 +39,9 @@ func MaxArchivalIterationTimeout() time.Duration {
 
 func hash(i interface{}) uint64 {
 	var b bytes.Buffer
-	gob.NewEncoder(&b).Encode(i)
+	// please make sure encoder is deterministic (especially when encoding map objects)
+	// use json not gob here as json will sort map keys, while gob is non-deterministic
+	json.NewEncoder(&b).Encode(i) //nolint:errcheck
 	return farm.Fingerprint64(b.Bytes())
 }
 
@@ -62,17 +63,26 @@ func hashesEqual(a []uint64, b []uint64) bool {
 	return true
 }
 
-func tagLoggerWithRequest(logger log.Logger, request ArchiveRequest) log.Logger {
+func tagLoggerWithHistoryRequest(logger log.Logger, request *ArchiveRequest) log.Logger {
 	return logger.WithTags(
 		tag.ShardID(request.ShardID),
 		tag.ArchivalRequestDomainID(request.DomainID),
 		tag.ArchivalRequestDomainName(request.DomainName),
 		tag.ArchivalRequestWorkflowID(request.WorkflowID),
 		tag.ArchivalRequestRunID(request.RunID),
-		tag.ArchivalRequestEventStoreVersion(request.EventStoreVersion),
 		tag.ArchivalRequestBranchToken(request.BranchToken),
 		tag.ArchivalRequestNextEventID(request.NextEventID),
 		tag.ArchivalRequestCloseFailoverVersion(request.CloseFailoverVersion),
+		tag.ArchivalURI(request.URI),
+	)
+}
+
+func tagLoggerWithVisibilityRequest(logger log.Logger, request *ArchiveRequest) log.Logger {
+	return logger.WithTags(
+		tag.ArchivalRequestDomainID(request.DomainID),
+		tag.ArchivalRequestDomainName(request.DomainName),
+		tag.ArchivalRequestWorkflowID(request.WorkflowID),
+		tag.ArchivalRequestRunID(request.RunID),
 		tag.ArchivalURI(request.URI),
 	)
 }
@@ -84,20 +94,10 @@ func tagLoggerWithActivityInfo(logger log.Logger, activityInfo activity.Info) lo
 		tag.Attempt(activityInfo.Attempt))
 }
 
-func contextExpired(ctx context.Context) bool {
-	select {
-	case <-ctx.Done():
-		return true
-	default:
-		return false
+func convertSearchAttributesToString(searchAttr map[string][]byte) map[string]string {
+	searchAttrStr := make(map[string]string)
+	for k, v := range searchAttr {
+		searchAttrStr[k] = string(v)
 	}
-}
-
-func errorDetails(err error) string {
-	var details string
-	if _, ok := err.(*cadence.CustomError); !ok {
-		return details
-	}
-	err.(*cadence.CustomError).Details(&details)
-	return details
+	return searchAttrStr
 }

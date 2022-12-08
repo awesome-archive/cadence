@@ -21,48 +21,117 @@
 package cli
 
 import (
-	"bufio"
+	"encoding/json"
 	"fmt"
+
 	"github.com/fatih/color"
-	"github.com/uber/cadence/.gen/go/admin"
-	"github.com/uber/cadence/.gen/go/shared"
+	"github.com/pborman/uuid"
 	"github.com/urfave/cli"
-	"os"
-	"strings"
+
+	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/service/worker/failovermanager"
+
+	"github.com/uber/cadence/common/types"
 )
+
+// An indirection for the prompt function so that it can be mocked in the unit tests
+var promptFn = prompt
 
 // AdminAddSearchAttribute to whitelist search attribute
 func AdminAddSearchAttribute(c *cli.Context) {
 	key := getRequiredOption(c, FlagSearchAttributesKey)
 	valType := getRequiredIntOption(c, FlagSearchAttributesType)
-	if valType < 0 || valType >= 5 {
+	if !isValueTypeValid(valType) {
 		ErrorAndExit("Unknown Search Attributes value type.", nil)
 	}
 
 	// ask user for confirmation
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Printf("Are you trying to add key [%s] with Type [%s]? Y/N\n",
+	promptMsg := fmt.Sprintf("Are you trying to add key [%s] with Type [%s]? Y/N",
 		color.YellowString(key), color.YellowString(intValTypeToString(valType)))
-	text, _ := reader.ReadString('\n')
-	textLower := strings.ToLower(strings.TrimRight(text, "\n"))
-	if textLower != "y" && textLower != "yes" {
-		return
-	}
+	promptFn(promptMsg)
 
 	adminClient := cFactory.ServerAdminClient(c)
 	ctx, cancel := newContext(c)
 	defer cancel()
-	request := &admin.AddSearchAttributeRequest{
-		SearchAttribute: map[string]shared.IndexedValueType{
-			key: shared.IndexedValueType(valType),
+	request := &types.AddSearchAttributeRequest{
+		SearchAttribute: map[string]types.IndexedValueType{
+			key: types.IndexedValueType(valType),
 		},
+		SecurityToken: c.String(FlagSecurityToken),
 	}
 
 	err := adminClient.AddSearchAttribute(ctx, request)
 	if err != nil {
 		ErrorAndExit("Add search attribute failed.", err)
 	}
-	fmt.Println("Success")
+	fmt.Println("Success. Note that for a multil-node Cadence cluster, DynamicConfig MUST be updated separately to whitelist the new attributes.")
+}
+
+// AdminDescribeCluster is used to dump information about the cluster
+func AdminDescribeCluster(c *cli.Context) {
+	adminClient := cFactory.ServerAdminClient(c)
+
+	ctx, cancel := newContext(c)
+	defer cancel()
+	response, err := adminClient.DescribeCluster(ctx)
+	if err != nil {
+		ErrorAndExit("Operation DescribeCluster failed.", err)
+	}
+
+	prettyPrintJSONObject(response)
+}
+
+func AdminRebalanceStart(c *cli.Context) {
+	client := getCadenceClient(c)
+	tcCtx, cancel := newContext(c)
+	defer cancel()
+
+	workflowID := failovermanager.RebalanceWorkflowID
+	rbParams := &failovermanager.RebalanceParams{
+		BatchFailoverSize:              100,
+		BatchFailoverWaitTimeInSeconds: 10,
+	}
+	input, err := json.Marshal(rbParams)
+	if err != nil {
+		ErrorAndExit("Failed to serialize params for failover workflow", err)
+	}
+	memo, err := getWorkflowMemo(map[string]interface{}{
+		common.MemoKeyForOperator: getOperator(),
+	})
+	if err != nil {
+		ErrorAndExit("Failed to serialize memo", err)
+	}
+	request := &types.StartWorkflowExecutionRequest{
+		Domain:                              common.SystemLocalDomainName,
+		WorkflowID:                          workflowID,
+		RequestID:                           uuid.New(),
+		Identity:                            getCliIdentity(),
+		WorkflowIDReusePolicy:               types.WorkflowIDReusePolicyAllowDuplicate.Ptr(),
+		ExecutionStartToCloseTimeoutSeconds: common.Int32Ptr(60),
+		TaskStartToCloseTimeoutSeconds:      common.Int32Ptr(int32(defaultDecisionTimeoutInSeconds)),
+		Input:                               input,
+		TaskList: &types.TaskList{
+			Name: failovermanager.TaskListName,
+		},
+		Memo: memo,
+		WorkflowType: &types.WorkflowType{
+			Name: failovermanager.RebalanceWorkflowTypeName,
+		},
+	}
+
+	resp, err := client.StartWorkflowExecution(tcCtx, request)
+	if err != nil {
+		ErrorAndExit("Failed to start failover workflow", err)
+	}
+	fmt.Println("Rebalance workflow started")
+	fmt.Println("wid: " + workflowID)
+	fmt.Println("rid: " + resp.GetRunID())
+}
+
+func AdminRebalanceList(c *cli.Context) {
+	c.Set(FlagWorkflowID, failovermanager.RebalanceWorkflowID)
+	c.GlobalSet(FlagDomain, common.SystemLocalDomainName)
+	ListWorkflow(c)
 }
 
 func intValTypeToString(valType int) string {
@@ -82,4 +151,8 @@ func intValTypeToString(valType int) string {
 	default:
 		return ""
 	}
+}
+
+func isValueTypeValid(valType int) bool {
+	return valType >= 0 && valType <= 5
 }

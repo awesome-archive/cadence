@@ -27,11 +27,12 @@ import (
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/cadence/testsuite"
+	"go.uber.org/cadence/workflow"
+
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/metrics"
 	mmocks "github.com/uber/cadence/common/metrics/mocks"
-	"go.uber.org/cadence/testsuite"
-	"go.uber.org/cadence/workflow"
 )
 
 var (
@@ -233,8 +234,8 @@ func signalAndCarryoverPumpWorkflow(ctx workflow.Context, requestLimit int, carr
 }
 
 func sendRequestsToChannel(ctx workflow.Context, ch workflow.Channel, numRequests int) ([]ArchiveRequest, []uint64) {
-	requests := make([]ArchiveRequest, numRequests, numRequests)
-	hashes := make([]uint64, numRequests, numRequests)
+	requests := make([]ArchiveRequest, numRequests)
+	hashes := make([]uint64, numRequests)
 	workflow.Go(ctx, func(ctx workflow.Context) {
 		for i := 0; i < numRequests; i++ {
 			requests[i], hashes[i] = randomArchiveRequest()
@@ -245,8 +246,8 @@ func sendRequestsToChannel(ctx workflow.Context, ch workflow.Channel, numRequest
 }
 
 func sendRequestsToChannelBlocking(ctx workflow.Context, ch workflow.Channel, numRequests int) ([]ArchiveRequest, []uint64) {
-	requests := make([]ArchiveRequest, numRequests, numRequests)
-	hashes := make([]uint64, numRequests, numRequests)
+	requests := make([]ArchiveRequest, numRequests)
+	hashes := make([]uint64, numRequests)
 	for i := 0; i < numRequests; i++ {
 		requests[i], hashes[i] = randomArchiveRequest()
 		ch.Send(ctx, requests[i])
@@ -264,15 +265,12 @@ func channelContainsExpected(ctx workflow.Context, ch workflow.Channel, expected
 			return false
 		}
 	}
-	if ch.Receive(ctx, nil) {
-		return false
-	}
-	return true
+	return !ch.Receive(ctx, nil)
 }
 
 func randomCarryover(count int) ([]ArchiveRequest, []uint64) {
-	carryover := make([]ArchiveRequest, count, count)
-	hashes := make([]uint64, count, count)
+	carryover := make([]ArchiveRequest, count)
+	hashes := make([]uint64, count)
 	for i := 0; i < count; i++ {
 		carryover[i], hashes[i] = randomArchiveRequest()
 	}

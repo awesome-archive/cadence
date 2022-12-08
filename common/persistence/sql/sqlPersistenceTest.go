@@ -21,64 +21,63 @@
 package sql
 
 import (
+	"context"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"strings"
 
-	"github.com/jmoiron/sqlx"
 	log "github.com/sirupsen/logrus"
+
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/service/config"
-	"github.com/uber/cadence/common/service/dynamicconfig"
+	"github.com/uber/cadence/common/config"
+	"github.com/uber/cadence/common/dynamicconfig"
+	"github.com/uber/cadence/common/persistence/persistence-tests/testcluster"
 	"github.com/uber/cadence/environment"
 )
 
-const (
-	testUser      = "uber"
-	testPassword  = "uber"
-	testSchemaDir = "schema/mysql/v57"
-)
-
-// TestCluster allows executing cassandra operations in testing.
-type TestCluster struct {
+// testCluster allows executing cassandra operations in testing.
+type testCluster struct {
 	dbName    string
 	schemaDir string
-	db        *sqlx.DB
 	cfg       config.SQL
 }
 
+var _ testcluster.PersistenceTestCluster = (*testCluster)(nil)
+
 // NewTestCluster returns a new SQL test cluster
-func NewTestCluster(dbName string, port int, schemaDir string) *TestCluster {
-	var result TestCluster
+func NewTestCluster(pluginName, dbName, username, password, host string, port int, schemaDir string) testcluster.PersistenceTestCluster {
+	var result testCluster
 	result.dbName = dbName
 	if port == 0 {
 		port = environment.GetMySQLPort()
 	}
 	if schemaDir == "" {
-		schemaDir = testSchemaDir
+		panic("must provide schema dir")
 	}
 	result.schemaDir = schemaDir
 	result.cfg = config.SQL{
-		User:            testUser,
-		Password:        testPassword,
-		ConnectAddr:     fmt.Sprintf("%v:%v", environment.GetMySQLAddress(), port),
+		User:            username,
+		Password:        password,
+		ConnectAddr:     fmt.Sprintf("%v:%v", host, port),
 		ConnectProtocol: "tcp",
-		DriverName:      defaultDriverName,
+		PluginName:      pluginName,
 		DatabaseName:    dbName,
 		NumShards:       4,
+		EncodingType:    "thriftrw",
+		DecodingTypes:   []string{"thriftrw"},
 	}
 	return &result
 }
 
 // DatabaseName from PersistenceTestCluster interface
-func (s *TestCluster) DatabaseName() string {
+func (s *testCluster) DatabaseName() string {
 	return s.dbName
 }
 
 // SetupTestDatabase from PersistenceTestCluster interface
-func (s *TestCluster) SetupTestDatabase() {
-	s.CreateDatabase()
-	s.CreateSession()
+func (s *testCluster) SetupTestDatabase() {
+	s.createDatabase()
 
 	schemaDir := s.schemaDir + "/"
 	if !strings.HasPrefix(schemaDir, "/") && !strings.HasPrefix(schemaDir, "../") {
@@ -88,12 +87,12 @@ func (s *TestCluster) SetupTestDatabase() {
 		}
 		schemaDir = cadencePackageDir + schemaDir
 	}
-	s.LoadSchema([]string{"schema.sql"}, schemaDir)
-	s.LoadVisibilitySchema([]string{"schema.sql"}, schemaDir)
+	s.loadSchema([]string{"schema.sql"}, schemaDir)
+	s.loadVisibilitySchema([]string{"schema.sql"}, schemaDir)
 }
 
 // Config returns the persistence config for connecting to this test cluster
-func (s *TestCluster) Config() config.Persistence {
+func (s *testCluster) Config() config.Persistence {
 	cfg := s.cfg
 	return config.Persistence{
 		DefaultStore:    "test",
@@ -102,53 +101,70 @@ func (s *TestCluster) Config() config.Persistence {
 			"test": {SQL: &cfg},
 		},
 		TransactionSizeLimit: dynamicconfig.GetIntPropertyFn(common.DefaultTransactionSizeLimit),
+		ErrorInjectionRate:   dynamicconfig.GetFloatPropertyFn(0),
 	}
 }
 
 // TearDownTestDatabase from PersistenceTestCluster interface
-func (s *TestCluster) TearDownTestDatabase() {
-	s.DropDatabase()
-	s.db.Close()
+func (s *testCluster) TearDownTestDatabase() {
+	s.dropDatabase()
 }
 
-// CreateSession from PersistenceTestCluster interface
-func (s *TestCluster) CreateSession() {
-	var err error
-	s.db, err = newConnection(s.cfg)
+// createDatabase from PersistenceTestCluster interface
+func (s *testCluster) createDatabase() {
+	cfg2 := s.cfg
+	// NOTE need to connect with empty name to create new database
+	cfg2.DatabaseName = ""
+	db, err := NewSQLAdminDB(&cfg2)
 	if err != nil {
-		log.Fatal(`CreateSession`, err)
+		panic(err)
+	}
+	defer func() {
+		err := db.Close()
+		if err != nil {
+			panic(err)
+		}
+	}()
+	err = db.CreateDatabase(s.cfg.DatabaseName)
+	if err != nil {
+		panic(err)
 	}
 }
 
-// CreateDatabase from PersistenceTestCluster interface
-func (s *TestCluster) CreateDatabase() {
-	err := createDatabase(s.cfg.DriverName, s.cfg.ConnectAddr, testUser, testPassword, s.dbName, true)
+// dropDatabase from PersistenceTestCluster interface
+func (s *testCluster) dropDatabase() {
+	cfg2 := s.cfg
+	// NOTE need to connect with empty name to drop the database
+	cfg2.DatabaseName = ""
+	db, err := NewSQLAdminDB(&cfg2)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
+	}
+	defer func() {
+		err := db.Close()
+		if err != nil {
+			panic(err)
+		}
+	}()
+	err = db.DropDatabase(s.cfg.DatabaseName)
+	if err != nil {
+		panic(err)
 	}
 }
 
-// DropDatabase from PersistenceTestCluster interface
-func (s *TestCluster) DropDatabase() {
-	err := dropDatabase(s.db, s.dbName)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-// LoadSchema from PersistenceTestCluster interface
-func (s *TestCluster) LoadSchema(fileNames []string, schemaDir string) {
+// loadSchema from PersistenceTestCluster interface
+func (s *testCluster) loadSchema(fileNames []string, schemaDir string) {
 	workflowSchemaDir := schemaDir + "/cadence"
-	err := loadDatabaseSchema(workflowSchemaDir, fileNames, s.db, true)
+	err := s.loadDatabaseSchema(workflowSchemaDir, fileNames, true)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-// LoadVisibilitySchema from PersistenceTestCluster interface
-func (s *TestCluster) LoadVisibilitySchema(fileNames []string, schemaDir string) {
+// loadVisibilitySchema from PersistenceTestCluster interface
+func (s *testCluster) loadVisibilitySchema(fileNames []string, schemaDir string) {
 	workflowSchemaDir := schemaDir + "/visibility"
-	err := loadDatabaseSchema(workflowSchemaDir, fileNames, s.db, true)
+	err := s.loadDatabaseSchema(workflowSchemaDir, fileNames, true)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -161,8 +177,33 @@ func getCadencePackageDir() (string, error) {
 	}
 	cadenceIndex := strings.LastIndex(cadencePackageDir, "/cadence/")
 	cadencePackageDir = cadencePackageDir[:cadenceIndex+len("/cadence/")]
+	return cadencePackageDir, err
+}
+
+// loadDatabaseSchema loads the schema from the given .sql files on this database
+func (s *testCluster) loadDatabaseSchema(dir string, fileNames []string, override bool) (err error) {
+	db, err := NewSQLAdminDB(&s.cfg)
 	if err != nil {
 		panic(err)
 	}
-	return cadencePackageDir, err
+	defer func() {
+		err := db.Close()
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	for _, file := range fileNames {
+		// This is only used in tests. Excluding it from security scanners
+		// #nosec
+		content, err := ioutil.ReadFile(dir + "/" + file)
+		if err != nil {
+			return fmt.Errorf("error reading contents of file %v:%v", file, err.Error())
+		}
+		err = db.ExecSchemaOperationQuery(context.Background(), string(content))
+		if err != nil {
+			return fmt.Errorf("error loading schema from %v: %v", file, err.Error())
+		}
+	}
+	return nil
 }

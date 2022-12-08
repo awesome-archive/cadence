@@ -24,22 +24,19 @@ import (
 	"context"
 	"time"
 
-	"github.com/uber/cadence/common/log/tag"
-	"github.com/uber/cadence/service/worker/scanner/history"
-	"github.com/uber/cadence/service/worker/scanner/tasklist"
 	"go.uber.org/cadence"
 	"go.uber.org/cadence/activity"
 	cclient "go.uber.org/cadence/client"
 	"go.uber.org/cadence/workflow"
-)
 
-type (
-	contextKey int
+	"github.com/uber/cadence/common/log/tag"
+	"github.com/uber/cadence/service/worker/scanner/executions"
+	"github.com/uber/cadence/service/worker/scanner/history"
+	"github.com/uber/cadence/service/worker/scanner/tasklist"
+	"github.com/uber/cadence/service/worker/scanner/timers"
 )
 
 const (
-	scannerContextKey = contextKey(0)
-
 	maxConcurrentActivityExecutionSize     = 10
 	maxConcurrentDecisionTaskExecutionSize = 10
 	infiniteDuration                       = 20 * 365 * 24 * time.Hour
@@ -82,57 +79,105 @@ var (
 		TaskList:                     historyScannerTaskListName,
 		ExecutionStartToCloseTimeout: infiniteDuration,
 		WorkflowIDReusePolicy:        cclient.WorkflowIDReusePolicyAllowDuplicate,
+		CronSchedule:                 "0 */12 * * *",
 	}
 )
 
 func init() {
 	workflow.RegisterWithOptions(TaskListScannerWorkflow, workflow.RegisterOptions{Name: tlScannerWFTypeName})
-	workflow.RegisterWithOptions(HistoryScannerWorkflow, workflow.RegisterOptions{Name: historyScannerWFTypeName})
 	activity.RegisterWithOptions(TaskListScavengerActivity, activity.RegisterOptions{Name: taskListScavengerActivityName})
+
+	workflow.RegisterWithOptions(HistoryScannerWorkflow, workflow.RegisterOptions{Name: historyScannerWFTypeName})
 	activity.RegisterWithOptions(HistoryScavengerActivity, activity.RegisterOptions{Name: historyScavengerActivityName})
+
+	workflow.RegisterWithOptions(executions.ConcreteScannerWorkflow, workflow.RegisterOptions{Name: executions.ConcreteExecutionsScannerWFTypeName})
+	workflow.RegisterWithOptions(executions.CurrentScannerWorkflow, workflow.RegisterOptions{Name: executions.CurrentExecutionsScannerWFTypeName})
+	workflow.RegisterWithOptions(executions.ConcreteFixerWorkflow, workflow.RegisterOptions{Name: executions.ConcreteExecutionsFixerWFTypeName})
+	workflow.RegisterWithOptions(executions.CurrentFixerWorkflow, workflow.RegisterOptions{Name: executions.CurrentExecutionsFixerWFTypeName})
+	workflow.RegisterWithOptions(timers.ScannerWorkflow, workflow.RegisterOptions{Name: timers.ScannerWFTypeName})
+	workflow.RegisterWithOptions(timers.FixerWorkflow, workflow.RegisterOptions{Name: timers.FixerWFTypeName})
 }
 
 // TaskListScannerWorkflow is the workflow that runs the task-list scanner background daemon
-func TaskListScannerWorkflow(ctx workflow.Context) error {
+func TaskListScannerWorkflow(
+	ctx workflow.Context,
+) error {
 
 	future := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, activityOptions), taskListScavengerActivityName)
 	return future.Get(ctx, nil)
 }
 
 // HistoryScannerWorkflow is the workflow that runs the history scanner background daemon
-func HistoryScannerWorkflow(ctx workflow.Context) error {
-	future := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, activityOptions), historyScavengerActivityName)
+func HistoryScannerWorkflow(
+	ctx workflow.Context,
+) error {
+
+	future := workflow.ExecuteActivity(
+		workflow.WithActivityOptions(ctx, activityOptions),
+		historyScavengerActivityName,
+	)
 	return future.Get(ctx, nil)
 }
 
 // HistoryScavengerActivity is the activity that runs history scavenger
-func HistoryScavengerActivity(aCtx context.Context) (history.ScavengerHeartbeatDetails, error) {
-	ctx := aCtx.Value(scannerContextKey).(scannerContext)
-	rps := ctx.cfg.PersistenceMaxQPS()
+func HistoryScavengerActivity(
+	activityCtx context.Context,
+) (history.ScavengerHeartbeatDetails, error) {
 
-	hbd := history.ScavengerHeartbeatDetails{}
-	if activity.HasHeartbeatDetails(aCtx) {
-		if err := activity.GetHeartbeatDetails(aCtx, &hbd); err != nil {
-			ctx.logger.Error("Failed to recover from last heartbeat, start over from beginning", tag.Error(err))
-		}
+	ctx, err := getScannerContext(activityCtx)
+	if err != nil {
+		return history.ScavengerHeartbeatDetails{}, err
 	}
 
-	scavenger := history.NewScavenger(ctx.historyDB, rps, ctx.clientBean.GetHistoryClient(), hbd, ctx.metricsClient, ctx.logger)
-	return scavenger.Run(aCtx)
+	rps := ctx.cfg.ScannerPersistenceMaxQPS()
+	res := ctx.resource
+
+	hbd := history.ScavengerHeartbeatDetails{}
+	if activity.HasHeartbeatDetails(activityCtx) {
+		if err := activity.GetHeartbeatDetails(activityCtx, &hbd); err != nil {
+			res.GetLogger().Error("Failed to recover from last heartbeat, start over from beginning", tag.Error(err))
+		}
+	}
+	cache := res.GetDomainCache()
+	scavenger := history.NewScavenger(
+		res.GetHistoryManager(),
+		rps,
+		res.GetHistoryClient(),
+		hbd,
+		res.GetMetricsClient(),
+		res.GetLogger(),
+		ctx.cfg.MaxWorkflowRetentionInDays,
+		cache,
+	)
+	return scavenger.Run(activityCtx)
 }
 
 // TaskListScavengerActivity is the activity that runs task list scavenger
-func TaskListScavengerActivity(aCtx context.Context) error {
-	ctx := aCtx.Value(scannerContextKey).(scannerContext)
-	scavenger := tasklist.NewScavenger(ctx.taskDB, ctx.metricsClient, ctx.logger)
-	ctx.logger.Info("Starting task list scavenger")
+func TaskListScavengerActivity(
+	activityCtx context.Context,
+) error {
+	ctx, err := getScannerContext(activityCtx)
+	if err != nil {
+		return err
+	}
+	res := ctx.resource
+	scavenger := tasklist.NewScavenger(
+		activityCtx,
+		res.GetTaskManager(),
+		res.GetMetricsClient(),
+		res.GetLogger(),
+		&ctx.cfg.TaskListScannerOptions,
+		res.GetDomainCache(),
+	)
+
+	res.GetLogger().Info("Starting task list scavenger")
 	scavenger.Start()
 	for scavenger.Alive() {
-		activity.RecordHeartbeat(aCtx)
-		if aCtx.Err() != nil {
-			ctx.logger.Info("activity context error, stopping scavenger", tag.Error(aCtx.Err()))
+		activity.RecordHeartbeat(activityCtx)
+		if activityCtx.Err() != nil {
+			res.GetLogger().Info("activity context error, stopping scavenger", tag.Error(activityCtx.Err()))
 			scavenger.Stop()
-			return aCtx.Err()
+			return activityCtx.Err()
 		}
 		time.Sleep(tlScavengerHBInterval)
 	}

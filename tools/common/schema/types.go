@@ -47,12 +47,11 @@ type (
 		Overwrite         bool // overwrite previous data
 		DisableVersioning bool // do not use schema versioning
 	}
-	// DB is the database interface that's required to be implemented
+	// SchemaClient is the database interface that's required to be implemented
 	// for the schema-tool to work
-	DB interface {
-		// Exec executes a cql statement
-		Exec(stmt string) error
-		//ListTables() ([]string, error)
+	SchemaClient interface {
+		// ExecDDLQuery executes a schema statement
+		ExecDDLQuery(stmt string, args ...interface{}) error
 		// DropAllTables drops all tables
 		DropAllTables() error
 		// CreateSchemaVersionTables sets up the schema version tables
@@ -77,14 +76,22 @@ const (
 	CLIOptUser = "user"
 	// CLIOptPassword is the cli option for password
 	CLIOptPassword = "password"
+	// CLIOptAllowedAuthenticatorsis the cli option for cassandra allowed authenticators
+	CLIOptAllowedAuthenticators = "allowed-authenticators"
 	// CLIOptTimeout is the cli option for timeout
 	CLIOptTimeout = "timeout"
+	// CLIOptConnectTimeout is the cli option for connection timeout
+	CLIOptConnectTimeout = "connect-timeout"
 	// CLIOptKeyspace is the cli option for keyspace
 	CLIOptKeyspace = "keyspace"
+	// CLIOptDatabase is the cli option for datacenter
+	CLIOptDatacenter = "datacenter"
 	// CLIOptDatabase is the cli option for database
 	CLIOptDatabase = "database"
-	// CLIOptDriverName is the cli option for driver name
-	CLIOptDriverName = "driver"
+	// CLIOptPluginName is the cli option for plugin name
+	CLIOptPluginName = "plugin"
+	// CLIOptConnectAttributes is the cli option for connect attributes (key/values via a url query string)
+	CLIOptConnectAttributes = "connect-attributes"
 	// CLIOptVersion is the cli option for version
 	CLIOptVersion = "version"
 	// CLIOptSchemaFile is the cli option for schema file
@@ -103,6 +110,8 @@ const (
 	CLIOptReplicationFactor = "replication-factor"
 	// CLIOptQuiet is the cli option for quiet mode
 	CLIOptQuiet = "quiet"
+	// CLIOptProtoVersion is the cli option for protocol version
+	CLIOptProtoVersion = "protocol-version"
 
 	// CLIFlagEndpoint is the cli flag for endpoint
 	CLIFlagEndpoint = CLIOptEndpoint + ", ep"
@@ -112,14 +121,22 @@ const (
 	CLIFlagUser = CLIOptUser + ", u"
 	// CLIFlagPassword is the cli flag for password
 	CLIFlagPassword = CLIOptPassword + ", pw"
+	// CLIFlagAllowedAuthenticators is the cli flag for whitelisting custom authenticators
+	CLIFlagAllowedAuthenticators = CLIOptAllowedAuthenticators + ", aa"
+	// CLIFlagConnectTimeout is the cli flag for connection timeout
+	CLIFlagConnectTimeout = CLIOptConnectTimeout + ", ct"
 	// CLIFlagTimeout is the cli flag for timeout
 	CLIFlagTimeout = CLIOptTimeout + ", t"
 	// CLIFlagKeyspace is the cli flag for keyspace
 	CLIFlagKeyspace = CLIOptKeyspace + ", k"
+	// CLIFlagDatacenter is the cli flag for datacenter
+	CLIFlagDatacenter = CLIOptDatacenter + ", dc"
 	// CLIFlagDatabase is the cli flag for database
 	CLIFlagDatabase = CLIOptDatabase + ", db"
-	// CLIFlagDriverName is the cli flag for driver name
-	CLIFlagDriverName = CLIOptDriverName + ", dr"
+	// CLIFlagPluginName is the cli flag for plugin name
+	CLIFlagPluginName = CLIOptPluginName + ", pl"
+	// CLIFlagConnectAttributes allows arbitrary connect attributes
+	CLIFlagConnectAttributes = CLIOptConnectAttributes + ", ca"
 	// CLIFlagVersion is the cli flag for version
 	CLIFlagVersion = CLIOptVersion + ", v"
 	// CLIFlagSchemaFile is the cli flag for schema file
@@ -131,19 +148,32 @@ const (
 	// CLIFlagTargetVersion is the cli flag for target version
 	CLIFlagTargetVersion = CLIOptTargetVersion + ", v"
 	// CLIFlagDryrun is the cli flag for dryrun
-	CLIFlagDryrun = CLIOptDryrun + ", y"
+	CLIFlagDryrun = CLIOptDryrun
 	// CLIFlagSchemaDir is the cli flag for schema directory
 	CLIFlagSchemaDir = CLIOptSchemaDir + ", d"
 	// CLIFlagReplicationFactor is the cli flag for replication factor
 	CLIFlagReplicationFactor = CLIOptReplicationFactor + ", rf"
 	// CLIFlagQuiet is the cli flag for quiet mode
 	CLIFlagQuiet = CLIOptQuiet + ", q"
+	// CLIFlagProtoVersion is the cli flag for protocol version
+	CLIFlagProtoVersion = CLIOptProtoVersion + ", pv"
+
+	// CLIFlagEnableTLS enables cassandra client TLS
+	CLIFlagEnableTLS = "tls"
+	// CLIFlagTLSCertFile is the optional tls cert file (tls must be enabled)
+	CLIFlagTLSCertFile = "tls-cert-file"
+	// CLIFlagTLSKeyFile is the optional tls key file (tls must be enabled)
+	CLIFlagTLSKeyFile = "tls-key-file"
+	// CLIFlagTLSCaFile is the optional tls CA file (tls must be enabled)
+	CLIFlagTLSCaFile = "tls-ca-file"
+	// CLIFlagTLSEnableHostVerification enables tls host verification (tls must be enabled)
+	CLIFlagTLSEnableHostVerification = "tls-enable-host-verification"
+	// CLIFlagTLSServerName is the Server Name Indication to verify the hostname on the returned certificates.
+	// It is also included in the client's handshake to support virtual hosting unless it is an IP address.
+	CLIFlagTLSServerName = "tls-server-name"
 )
 
-// DryrunDBName is the db name used for dryrun
-const DryrunDBName = "_cadence_dryrun_"
-
-var rmspaceRegex = regexp.MustCompile("\\s+")
+var rmspaceRegex = regexp.MustCompile(`\s+`)
 
 // NewConfigError creates and returns an instance of ConfigError
 func NewConfigError(msg string) error {

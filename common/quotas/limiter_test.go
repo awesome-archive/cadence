@@ -36,10 +36,62 @@ const (
 )
 
 func TestNewRateLimiter(t *testing.T) {
-	maxDispatch := float64(0.01)
+	t.Parallel()
+	maxDispatch := 0.01
 	rl := NewRateLimiter(&maxDispatch, time.Second, _minBurst)
-	limiter := rl.globalLimiter.Load().(*rate.Limiter)
+	limiter := rl.goRateLimiter.Load().(*rate.Limiter)
 	assert.Equal(t, _minBurst, limiter.Burst())
+}
+
+func TestMultiStageRateLimiterBlockedByDomainRps(t *testing.T) {
+	t.Parallel()
+	policy := newFixedRpsMultiStageRateLimiter(2, 1)
+	check := func(suffix string) {
+		assert.True(t, policy.Allow(Info{Domain: defaultDomain}), "first should work"+suffix)
+		assert.False(t, policy.Allow(Info{Domain: defaultDomain}), "second should be limited"+suffix) // smaller local limit applies
+		assert.False(t, policy.Allow(Info{Domain: defaultDomain}), "third should be limited"+suffix)
+	}
+
+	check("")
+	// allow bucket to refill
+	time.Sleep(time.Second)
+	check(" after refresh")
+}
+
+func TestMultiStageRateLimiterBlockedByGlobalRps(t *testing.T) {
+	t.Parallel()
+	policy := newFixedRpsMultiStageRateLimiter(1, 2)
+	check := func(suffix string) {
+		assert.True(t, policy.Allow(Info{Domain: defaultDomain}), "first should work"+suffix)
+		assert.False(t, policy.Allow(Info{Domain: defaultDomain}), "second should be limited"+suffix) // smaller global limit applies
+		assert.False(t, policy.Allow(Info{Domain: defaultDomain}), "third should be limited"+suffix)
+	}
+
+	check("")
+	// allow bucket to refill
+	time.Sleep(time.Second)
+	check(" after refill")
+}
+
+func TestMultiStageRateLimitingMultipleDomains(t *testing.T) {
+	t.Parallel()
+	policy := newFixedRpsMultiStageRateLimiter(2, 1) // should allow 1/s per domain, 2/s total
+
+	check := func(suffix string) {
+		assert.True(t, policy.Allow(Info{Domain: "one"}), "1:1 should work"+suffix)
+		assert.False(t, policy.Allow(Info{Domain: "one"}), "1:2 should be limited"+suffix) // per domain limited
+
+		assert.True(t, policy.Allow(Info{Domain: "two"}), "2:1 should work"+suffix)
+		assert.False(t, policy.Allow(Info{Domain: "two"}), "2:2 should be limited"+suffix) // per domain limited + global limited
+
+		// third domain should be entirely cut off by global and cannot perform any requests
+		assert.False(t, policy.Allow(Info{Domain: "three"}), "3:1 should be limited"+suffix) // allowed by domain, but limited by global
+	}
+
+	check("")
+	// allow bucket to refill
+	time.Sleep(time.Second)
+	check(" after refill")
 }
 
 func BenchmarkRateLimiter(b *testing.B) {
@@ -51,7 +103,7 @@ func BenchmarkRateLimiter(b *testing.B) {
 }
 
 func BenchmarkMultiStageRateLimiter(b *testing.B) {
-	policy := getPolicy()
+	policy := newFixedRpsMultiStageRateLimiter(defaultRps, defaultRps)
 	for n := 0; n < b.N; n++ {
 		policy.Allow(Info{Domain: defaultDomain})
 	}
@@ -59,7 +111,7 @@ func BenchmarkMultiStageRateLimiter(b *testing.B) {
 
 func BenchmarkMultiStageRateLimiter20Domains(b *testing.B) {
 	numDomains := 20
-	policy := getPolicy()
+	policy := newFixedRpsMultiStageRateLimiter(defaultRps, defaultRps)
 	domains := getDomains(numDomains)
 	for n := 0; n < b.N; n++ {
 		policy.Allow(Info{Domain: domains[n%numDomains]})
@@ -68,7 +120,7 @@ func BenchmarkMultiStageRateLimiter20Domains(b *testing.B) {
 
 func BenchmarkMultiStageRateLimiter100Domains(b *testing.B) {
 	numDomains := 100
-	policy := getPolicy()
+	policy := newFixedRpsMultiStageRateLimiter(defaultRps, defaultRps)
 	domains := getDomains(numDomains)
 	for n := 0; n < b.N; n++ {
 		policy.Allow(Info{Domain: domains[n%numDomains]})
@@ -77,21 +129,21 @@ func BenchmarkMultiStageRateLimiter100Domains(b *testing.B) {
 
 func BenchmarkMultiStageRateLimiter1000Domains(b *testing.B) {
 	numDomains := 1000
-	policy := getPolicy()
+	policy := newFixedRpsMultiStageRateLimiter(defaultRps, defaultRps)
 	domains := getDomains(numDomains)
 	for n := 0; n < b.N; n++ {
 		policy.Allow(Info{Domain: domains[n%numDomains]})
 	}
 }
 
-func getPolicy() Policy {
+func newFixedRpsMultiStageRateLimiter(globalRps, domainRps float64) Policy {
 	return NewMultiStageRateLimiter(
-		func() float64 {
-			return float64(defaultRps)
-		},
-		func(domain string) float64 {
-			return float64(defaultRps)
-		},
+		NewDynamicRateLimiter(func() float64 {
+			return globalRps
+		}),
+		NewCollection(DynamicRateLimiterFactory(func(domain string) float64 {
+			return domainRps
+		})),
 	)
 }
 func getDomains(n int) []string {

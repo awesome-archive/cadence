@@ -1,22 +1,37 @@
 CREATE TYPE shard (
-  shard_id                    int,
-  owner                       text, -- Host identifier processing the shard
+  shard_id                          int,
+  owner                             text, -- Host identifier processing the shard
   -- Range identifier used for generating ack ids for tasks within shard.
   -- Also used for optimistic concurrency and all writes to a shard are conditional on this value.
-  range_id                    bigint,
+  range_id                          bigint, -- TO BE DEPRECATED, IN FAVOR OF range_id column in executions table
   -- This field keeps track of number of times owner for a shard changes before updating range_id or ack_levels
-  stolen_since_renew          int,
-  updated_at                  timestamp,
-  replication_ack_level       bigint,
-  transfer_ack_level          bigint, -- TO BE DEPRECATED, IN FAVOR OF cluster_transfer_ack_level
-  timer_ack_level             timestamp, -- TO BE DEPRECATED, IN FAVOR OF cluster_timer_ack_level
+  stolen_since_renew                int,
+  updated_at                        timestamp,
+  replication_ack_level             bigint,
+  transfer_ack_level                bigint, -- TO BE DEPRECATED, IN FAVOR OF cluster_transfer_ack_level
+  timer_ack_level                   timestamp, -- TO BE DEPRECATED, IN FAVOR OF cluster_timer_ack_level
   -- Mapping of cluster to corresponding transfer ack level
-  cluster_transfer_ack_level  map<text, bigint>,
+  cluster_transfer_ack_level        map<text, bigint>, -- TO BE DEPRECATED, IN FAVOR OF transfer_processing_queue_states
   -- Mapping of cluster to corresponding timer ack level
-  cluster_timer_ack_level     map<text, timestamp>,
-  domain_notification_version bigint, -- the global domain change version this shard is aware of
+  cluster_timer_ack_level           map<text, timestamp>, -- TO BE DEPRECATED, IN FAVOR OF timer_processing_queue_states
+  domain_notification_version       bigint, -- the global domain change version this shard is aware of
+  -- Mapping of cluster to corresponding list of transfer queue processing states
+  transfer_processing_queue_states  blob,
+  transfer_processing_queue_states_encoding  text,
+  -- Mapping of cluster to corresponding list of cross-cluster queue processing states
+  cross_cluster_processing_queue_states blob,
+  cross_cluster_processing_queue_states_encoding text,
+  -- Mapping of cluster to corresponding list of timer queue processing states
+  timer_processing_queue_states     blob,
+  timer_processing_queue_states_encoding     text,
   -- Mapping of (remote) cluster to corresponding replication level (last replicated task_id)
-  cluster_replication_level   map<text, bigint>,
+  cluster_replication_level         map<text, bigint>,
+  -- Mapping of (remote) cluster to corresponding replication DLQ ack level (last replicated task_id)
+  replication_dlq_ack_level         map<text, bigint>,
+  -- Data blob of pending failover markers
+  pending_failover_markers          blob,
+  pending_failover_markers_encoding text
+
 );
 
 --- Workflow execution and mutable state ---
@@ -24,6 +39,7 @@ CREATE TYPE workflow_execution (
   domain_id                        uuid,
   workflow_id                      text,
   run_id                           uuid,
+  first_run_id                     uuid,   -- Run ID of the first run of a ContinuedAsNew workflow
   parent_domain_id                 uuid,   -- Domain ID of parent workflow which started the workflow execution
   parent_workflow_id               text,   -- ID of parent workflow which started the workflow execution
   parent_run_id                    uuid,   -- RunID of parent workflow which started the workflow execution
@@ -34,7 +50,7 @@ CREATE TYPE workflow_execution (
   task_list                        text,
   workflow_type_name               text,
   workflow_timeout                 int,  -- Workflow ExecutionStartToCloseTimeoutSeconds
-  decision_task_timeout            int,
+  decision_task_timeout            int,  -- decision start to close timeout
   execution_context                blob,
   state                            int,  -- enum WorkflowState {Created, Running, Completed}
   close_status                     int,  -- enum WorkflowCloseStatus {None, Completed, Failed, Canceled, Terminated, ContinuedAsNew, TimedOut}
@@ -98,20 +114,21 @@ CREATE TYPE replication_state (
 
 -- TODO: Remove fields that are left over from activity and workflow tasks.
 CREATE TYPE transfer_task (
-  domain_id                  uuid,   -- The domain ID that this transfer task belongs to
-  workflow_id                text,   -- The workflow ID that this transfer task belongs to
-  run_id                     uuid,   -- The run ID that this transfer task belongs to
+  domain_id                  uuid,         -- The domain ID that this transfer task belongs to
+  workflow_id                text,         -- The workflow ID that this transfer task belongs to
+  run_id                     uuid,         -- The run ID that this transfer task belongs to
   task_id                    bigint,
-  visibility_ts              timestamp, -- The timestamp when the transfer task is generated
-  target_domain_id           uuid,   -- The external domain ID that this transfer task is doing work for.
-  target_workflow_id         text,   -- The external workflow ID that this transfer task is doing work for.
-  target_run_id              uuid,   -- The external run ID that this transfer task is doing work for.
-  target_child_workflow_only boolean, -- The whether target child workflow only.
+  visibility_ts              timestamp,    -- The timestamp when the transfer task is generated
+  target_domain_id           uuid,         -- The external domain ID that this transfer task is doing work for.
+  target_domain_ids          set<uuid>,    -- The external domain ID that this transfer task is doing work for.
+  target_workflow_id         text,         -- The external workflow ID that this transfer task is doing work for.
+  target_run_id              uuid,         -- The external run ID that this transfer task is doing work for.
+  target_child_workflow_only boolean,      -- The whether target child workflow only.
   task_list                  text,
-  type                       int,    -- enum TaskType {ActivityTask, DecisionTask, DeleteExecution, CancelExecution, StartChildExecution, ReplicationTask}
+  type                       int,          -- enum TaskType For local: {Decision, Activity, CloseExecution, CancelExecution, StartChildExecution, SignalExecution, RecordWorkflowStarted, ResetWorkflow, UpsertWorkflowSearchAttributes}, or for crossCluster {StartChildExecution, CancelExecution, SignalExecution}
   schedule_id                bigint,
-  version                    bigint, -- the failover version when this task is created, used to compare against the mutable state, in case the events got overwritten
-  record_visibility          boolean, -- indicates whether or not to create a visibility record
+  version                    bigint,       -- the failover version when this task is created, used to compare against the mutable state, in case the events got overwritten
+  record_visibility          boolean,      -- indicates whether or not to create a visibility record
 );
 
 CREATE TYPE replication_task (
@@ -119,7 +136,7 @@ CREATE TYPE replication_task (
   workflow_id                text,   -- The workflow ID that this replication task belongs to
   run_id                     uuid,   -- The run ID that this replication task belongs to
   task_id                    bigint,
-  type                       int,    -- enum TaskType {History, Heartbeat}
+  type                       int,    -- enum TaskType {History, SyncActivity, FailoverMarker}
   first_event_id             bigint,  -- Used by ReplicationTask to set the first event ID of the applied transaction
   next_event_id              bigint,  -- Used by ReplicationTask to set the next event ID of the applied transaction
   version                    bigint,  -- Used by ReplicationTask to set the failover version of the applied transaction
@@ -130,6 +147,7 @@ CREATE TYPE replication_task (
   new_run_event_store_version        int, -- indicates which version of event store to query for new run(continueAsNew)
   new_run_branch_token               blob, -- if eventV2, then query with this token for new run(continueAsNew)
   reset_workflow             boolean, -- whether the task is for resetWorkflowExecution
+  created_time               bigint, -- task creation timestamp
 );
 
 CREATE TYPE timer_task (
@@ -188,7 +206,10 @@ CREATE TYPE timer_info (
   timer_id      text,      -- User defined timer ID
   started_id    bigint,    -- The event ID corresponding to timer started.
   expiry_time   timestamp, -- Timestamp at which this timer expires or fires
-  task_id       bigint,    -- The task ID if we have one created for this timer
+  -- task_id is a misleading variable, it actually serves
+  -- the purpose of indicating whether a timer task is
+  -- generated for this timer info
+  task_id       bigint,
 );
 
 -- Child execution in progress mutable state
@@ -203,7 +224,8 @@ CREATE TYPE child_execution_info (
   started_event             blob, -- deprecated
   create_request_id         uuid,
   event_data_encoding       text, -- Protocol used for history serialization
-  domain_name               text,
+  domain_id                 uuid,
+  domain_name               text, -- deprecated
   workflow_type_name        text,
   parent_close_policy       int,
 );
@@ -299,9 +321,15 @@ CREATE TYPE branch_range (
   end_node_id bigint, -- exclusive node_id to represent the stopping point for this range
 );
 
+CREATE TYPE checksum (
+  version int,  -- version of the payload used to generate checksum
+  flavor  int,  -- type of checksum e.g crc32OverThrift
+  value   blob, -- checksum bytes
+);
+
 CREATE TABLE executions (
   shard_id                       int,
-  type                           int, -- enum RowType { Shard, Execution, TransferTask, TimerTask, ReplicationTask}
+  type                           int, -- enum RowType { Shard, Execution, TransferTask, TimerTask, ReplicationTask, CrossClusterTask}
   domain_id                      uuid,
   workflow_id                    text,
   run_id                         uuid,
@@ -311,6 +339,7 @@ CREATE TABLE executions (
   shard                          frozen<shard>,
   execution                      frozen<workflow_execution>,
   transfer                       frozen<transfer_task>,
+  cross_cluster                  frozen<transfer_task>, -- reuse the transfer_task type
   replication                    frozen<replication_task>,
   timer                          frozen<timer_task>,
   next_event_id                  bigint,  -- This is needed to make conditional updates on session history
@@ -326,26 +355,10 @@ CREATE TABLE executions (
   buffered_replication_tasks_map map<bigint, frozen<buffered_replication_task_info>>,
   workflow_last_write_version    bigint,
   workflow_state                 int,
+  version_histories              blob, -- the metadata of history branching
+  version_histories_encoding     text,
+  checksum                       frozen<checksum>,
   PRIMARY KEY  (shard_id, type, domain_id, workflow_id, run_id, visibility_ts, task_id)
-) WITH COMPACTION = {
-    'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
-  };
-
--- events table is deprecated in favor of v2 tables: history_node/history_tree
-CREATE TABLE events (
-  domain_id           uuid,
-  workflow_id         text,
-  run_id              uuid,
-  -- We insert a batch of events with each append transaction.
-  -- This field stores the event id of first event in the batch.
-  first_event_id      bigint,
-  event_batch_version bigint,
-  range_id            bigint,
-  tx_id               bigint,
-  data                blob, -- Batch of workflow execution history events as a blob
-  data_encoding       text, -- Protocol used for history serialization
-  data_version        int,  -- history blob version
-  PRIMARY KEY ((domain_id, workflow_id, run_id), first_event_id)
 ) WITH COMPACTION = {
     'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
   };
@@ -367,7 +380,6 @@ CREATE TABLE history_tree (
   tree_id           uuid,
   branch_id         uuid,
   ancestors         list<frozen<branch_range>>,
-  in_progress       boolean, -- For fork operation to prevent race condition to leak event data when forking branches
   fork_time         timestamp, -- For fork operation to prevent race condition to leak event data when forking branches
   info              text, -- For background cleanup when fork operation cannot finish self cleanup due to crash
   PRIMARY KEY ((tree_id), branch_id )
@@ -400,20 +412,6 @@ CREATE TABLE domains (
     'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
   };
 
-CREATE TABLE domains_by_name (
-  name               text,
-  domain             frozen<domain>,
-  config             frozen<domain_config>,
-  replication_config frozen<domain_replication_config>, -- indicating active cluster and standby cluster used for replication
-  is_global_domain   boolean, -- indicating whether a domain is a global domain
-  config_version     bigint, -- indicating the version of domain config, excluding the failover / change of active cluster name
-  failover_version   bigint, -- indicating the version of active domain only, used for domain failover
-  db_version         bigint, -- indicate the version of the record, used for update
-  PRIMARY KEY (name)
-)  WITH COMPACTION = {
-     'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
-   };
-
 CREATE TABLE domains_by_name_v2 (
   domains_partition             int,
   name                          text,
@@ -424,17 +422,27 @@ CREATE TABLE domains_by_name_v2 (
   config_version                bigint, -- indicating the version of domain config, excluding the failover / change of active cluster name
   failover_version              bigint, -- indicating the version of active domain only, used for domain failover
   failover_notification_version bigint, -- indicating the last change related to domain failover
+  previous_failover_version     bigint, -- indicating the previouse failover version for graceful failover
+  failover_end_time             bigint, -- indicating domain failover state
+  last_updated_time             bigint, -- indicating the domain last update timestamp
   notification_version          bigint,
   PRIMARY KEY (domains_partition, name)
 )  WITH COMPACTION = {
      'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
    };
 
-INSERT INTO domains_by_name (
+INSERT INTO domains_by_name_v2 (
+   domains_partition,
    name,
    domain,
-   config
+   config,
+   is_global_domain,
+   config_version,
+   failover_version,
+   failover_notification_version,
+   notification_version
 ) VALUES (
+   0,
    'cadence-system',
    {
        id: 32049b68-7872-4094-8e63-d0dd59896a83,
@@ -445,7 +453,12 @@ INSERT INTO domains_by_name (
    {
        retention:3,
        emit_metric:False
-   }
+   },
+   False,
+   0,
+   -24,
+   -1,
+   -1
 ) IF NOT EXISTS;
 
 INSERT INTO domains (
@@ -457,3 +470,30 @@ INSERT INTO domains (
        name: 'cadence-system'
    }
 ) IF NOT EXISTS;
+
+CREATE TABLE queue (
+  queue_type      int,
+  message_id      bigint,
+  message_payload blob,
+  PRIMARY KEY  (queue_type, message_id)
+) WITH COMPACTION = {
+    'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
+  };
+
+CREATE TABLE queue_metadata (
+  queue_type        int,
+  cluster_ack_level map<text, bigint>,
+  version           bigint,
+PRIMARY KEY (queue_type)
+)  WITH COMPACTION = {
+     'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy'
+   };
+
+CREATE TABLE cluster_config (
+  row_type int,
+  version int,
+  timestamp timestamp,
+  values blob,
+  encoding text,
+PRIMARY KEY (row_type, version)
+) WITH CLUSTERING ORDER BY (version DESC);

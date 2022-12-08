@@ -21,8 +21,9 @@
 package metrics
 
 import (
-	"github.com/uber-go/tally"
 	"time"
+
+	"github.com/uber-go/tally"
 )
 
 type nopStopwatchRecorder struct{}
@@ -33,4 +34,34 @@ func (n *nopStopwatchRecorder) RecordStopwatch(stopwatchStart time.Time) {}
 // NopStopwatch return a fake tally stop watch
 func NopStopwatch() tally.Stopwatch {
 	return tally.NewStopwatch(time.Now(), &nopStopwatchRecorder{})
+}
+
+type noopClientImpl struct{}
+
+func (n noopClientImpl) IncCounter(scope int, counter int) {
+}
+
+func (n noopClientImpl) AddCounter(scope int, counter int, delta int64) {
+}
+
+func (n noopClientImpl) StartTimer(scope int, timer int) tally.Stopwatch {
+	return NopStopwatch()
+}
+
+func (n noopClientImpl) RecordTimer(scope int, timer int, d time.Duration) {
+}
+
+func (n *noopClientImpl) RecordHistogramDuration(scope int, timer int, d time.Duration) {
+}
+
+func (n noopClientImpl) UpdateGauge(scope int, gauge int, value float64) {
+}
+
+func (n noopClientImpl) Scope(scope int, tags ...Tag) Scope {
+	return NoopScope(Common)
+}
+
+// NewNoopMetricsClient initialize new no-op metrics client
+func NewNoopMetricsClient() Client {
+	return &noopClientImpl{}
 }

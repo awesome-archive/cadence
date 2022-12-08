@@ -24,18 +24,19 @@ import (
 	"context"
 	"time"
 
-	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/archiver/provider"
-	"github.com/uber/cadence/common/cache"
-	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/log/tag"
-	"github.com/uber/cadence/common/metrics"
-	"github.com/uber/cadence/common/persistence"
-	"github.com/uber/cadence/common/service/dynamicconfig"
 	"go.uber.org/cadence/.gen/go/cadence/workflowserviceclient"
 	"go.uber.org/cadence/activity"
 	"go.uber.org/cadence/worker"
 	"go.uber.org/cadence/workflow"
+
+	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/archiver/provider"
+	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/dynamicconfig"
+	"github.com/uber/cadence/common/log"
+	"github.com/uber/cadence/common/log/tag"
+	"github.com/uber/cadence/common/metrics"
+	"github.com/uber/cadence/common/persistence"
 )
 
 type (
@@ -55,8 +56,7 @@ type (
 		PublicClient     workflowserviceclient.Interface
 		MetricsClient    metrics.Client
 		Logger           log.Logger
-		HistoryManager   persistence.HistoryManager
-		HistoryV2Manager persistence.HistoryV2Manager
+		HistoryV2Manager persistence.HistoryManager
 		DomainCache      cache.DomainCache
 		Config           *Config
 		ArchiverProvider provider.ArchiverProvider
@@ -64,9 +64,10 @@ type (
 
 	// Config for ClientWorker
 	Config struct {
-		ArchiverConcurrency           dynamicconfig.IntPropertyFn
-		ArchivalsPerIteration         dynamicconfig.IntPropertyFn
-		TimeLimitPerArchivalIteration dynamicconfig.DurationPropertyFn
+		ArchiverConcurrency             dynamicconfig.IntPropertyFn
+		ArchivalsPerIteration           dynamicconfig.IntPropertyFn
+		TimeLimitPerArchivalIteration   dynamicconfig.DurationPropertyFn
+		AllowArchivingIncompleteHistory dynamicconfig.BoolPropertyFn
 	}
 
 	contextKey int
@@ -94,6 +95,7 @@ func init() {
 	workflow.RegisterWithOptions(archivalWorkflow, workflow.RegisterOptions{Name: archivalWorkflowFnName})
 	activity.RegisterWithOptions(uploadHistoryActivity, activity.RegisterOptions{Name: uploadHistoryActivityFnName})
 	activity.RegisterWithOptions(deleteHistoryActivity, activity.RegisterOptions{Name: deleteHistoryActivityFnName})
+	activity.RegisterWithOptions(archiveVisibilityActivity, activity.RegisterOptions{Name: archiveVisibilityActivityFnName})
 }
 
 // NewClientWorker returns a new ClientWorker

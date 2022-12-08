@@ -25,16 +25,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
-	"github.com/uber-go/tally"
-	"github.com/uber/cadence/common/log/loggerimpl"
+
+	"github.com/uber/cadence/common/dynamicconfig"
 	"github.com/uber/cadence/common/metrics"
-	"github.com/uber/cadence/common/mocks"
 	p "github.com/uber/cadence/common/persistence"
+	"github.com/uber/cadence/common/resource"
+	"github.com/uber/cadence/service/worker/scanner/tasklist"
+
 	"go.uber.org/cadence/testsuite"
 	"go.uber.org/cadence/worker"
-	"go.uber.org/zap"
 )
 
 type scannerWorkflowTestSuite struct {
@@ -55,18 +57,26 @@ func (s *scannerWorkflowTestSuite) TestWorkflow() {
 
 func (s *scannerWorkflowTestSuite) TestScavengerActivity() {
 	env := s.NewTestActivityEnvironment()
-	taskDB := &mocks.TaskManager{}
-	taskDB.On("ListTaskList", mock.Anything).Return(&p.ListTaskListResponse{}, nil)
+	controller := gomock.NewController(s.T())
+	defer controller.Finish()
+	mockResource := resource.NewTest(controller, metrics.Worker)
+	defer mockResource.Finish(s.T())
+
+	mockResource.TaskMgr.On("ListTaskList", mock.Anything, mock.Anything).Return(&p.ListTaskListResponse{}, nil)
+	mockResource.TaskMgr.On("GetOrphanTasks", mock.Anything, mock.Anything).Return(&p.GetOrphanTasksResponse{}, nil)
 	ctx := scannerContext{
-		taskDB:        taskDB,
-		domainDB:      &mocks.MetadataManager{},
-		metricsClient: metrics.NewClient(tally.NoopScope, metrics.Worker),
-		zapLogger:     zap.NewNop(),
-		logger:        loggerimpl.NewLogger(zap.NewNop()),
+		resource: mockResource,
+		cfg: Config{
+			TaskListScannerOptions: tasklist.Options{
+				GetOrphanTasksPageSizeFn: dynamicconfig.GetIntPropertyFn(dynamicconfig.ScannerGetOrphanTasksPageSize.DefaultInt()),
+				EnableCleaning:           dynamicconfig.GetBoolPropertyFn(true),
+				ExecutorPollInterval:     time.Millisecond * 50,
+			},
+		},
 	}
 	env.SetTestTimeout(time.Second * 5)
 	env.SetWorkerOptions(worker.Options{
-		BackgroundActivityContext: context.WithValue(context.Background(), scannerContextKey, ctx),
+		BackgroundActivityContext: NewScannerContext(context.Background(), "default-test-workflow-type-name", ctx),
 	})
 	tlScavengerHBInterval = time.Millisecond * 10
 	_, err := env.ExecuteActivity(taskListScavengerActivityName)

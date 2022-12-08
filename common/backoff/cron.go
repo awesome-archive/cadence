@@ -22,10 +22,12 @@ package backoff
 
 import (
 	"math"
+	"math/rand"
 	"time"
 
 	"github.com/robfig/cron"
-	workflow "github.com/uber/cadence/.gen/go/shared"
+
+	"github.com/uber/cadence/common/types"
 )
 
 // NoBackoff is used to represent backoff when no cron backoff is needed
@@ -37,14 +39,19 @@ func ValidateSchedule(cronSchedule string) error {
 		return nil
 	}
 	if _, err := cron.ParseStandard(cronSchedule); err != nil {
-		return &workflow.BadRequestError{Message: "Invalid CronSchedule."}
+		return &types.BadRequestError{Message: "Invalid CronSchedule."}
 	}
 	return nil
 }
 
 // GetBackoffForNextSchedule calculates the backoff time for the next run given
 // a cronSchedule, workflow start time and workflow close time
-func GetBackoffForNextSchedule(cronSchedule string, startTime time.Time, closeTime time.Time) time.Duration {
+func GetBackoffForNextSchedule(
+	cronSchedule string,
+	startTime time.Time,
+	closeTime time.Time,
+	jitterStartSeconds int32,
+) time.Duration {
 	if len(cronSchedule) == 0 {
 		return NoBackoff
 	}
@@ -62,13 +69,24 @@ func GetBackoffForNextSchedule(cronSchedule string, startTime time.Time, closeTi
 	}
 	backoffInterval := nextScheduleTime.Sub(closeUTCTime)
 	roundedInterval := time.Second * time.Duration(math.Ceil(backoffInterval.Seconds()))
-	return roundedInterval
+
+	var jitter time.Duration
+	if jitterStartSeconds > 0 {
+		jitter = time.Duration(rand.Int31n(jitterStartSeconds+1)) * time.Second
+	}
+
+	return roundedInterval + jitter
 }
 
 // GetBackoffForNextScheduleInSeconds calculates the backoff time in seconds for the
 // next run given a cronSchedule and current time
-func GetBackoffForNextScheduleInSeconds(cronSchedule string, startTime time.Time, closeTime time.Time) int32 {
-	backoffDuration := GetBackoffForNextSchedule(cronSchedule, startTime, closeTime)
+func GetBackoffForNextScheduleInSeconds(
+	cronSchedule string,
+	startTime time.Time,
+	closeTime time.Time,
+	jitterStartSeconds int32,
+) int32 {
+	backoffDuration := GetBackoffForNextSchedule(cronSchedule, startTime, closeTime, jitterStartSeconds)
 	if backoffDuration == NoBackoff {
 		return 0
 	}

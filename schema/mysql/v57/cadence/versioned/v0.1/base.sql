@@ -3,14 +3,16 @@ CREATE TABLE domains(
   id BINARY(16) NOT NULL,
   name VARCHAR(255) UNIQUE NOT NULL,
   --
-	data BLOB NOT NULL,
-	data_encoding VARCHAR(16) NOT NULL,
-	is_global TINYINT(1) NOT NULL,
+  data BLOB NOT NULL,
+  data_encoding VARCHAR(16) NOT NULL,
+  is_global TINYINT(1) NOT NULL,
   PRIMARY KEY(shard_id, id)
 );
 
 CREATE TABLE domain_metadata (
-  notification_version BIGINT NOT NULL
+  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  notification_version BIGINT NOT NULL,
+  PRIMARY KEY (`id`)
 );
 
 INSERT INTO domain_metadata (notification_version) VALUES (1);
@@ -241,7 +243,6 @@ CREATE TABLE history_tree (
   tree_id        BINARY(16) NOT NULL,
   branch_id      BINARY(16) NOT NULL,
   --
-  in_progress    BOOLEAN NOT NULL,
   data           BLOB NOT NULL,
   data_encoding  VARCHAR(16) NOT NULL,
   PRIMARY KEY (shard_id, tree_id, branch_id)

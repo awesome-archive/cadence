@@ -3,31 +3,12 @@ ARG TARGET=server
 # Can be used in case a proxy is necessary
 ARG GOPROXY
 
-# Build tcheck binary
-FROM golang:1.12.7-alpine AS tcheck
-
-RUN apk add --update --no-cache ca-certificates git curl
-
-ENV GO111MODULE=off
-
-RUN curl https://glide.sh/get | sh
-
-ENV TCHECK_VERSION=v1.1.0
-
-RUN go get -d github.com/uber/tcheck
-RUN cd /go/src/github.com/uber/tcheck && git checkout ${TCHECK_VERSION}
-
-WORKDIR /go/src/github.com/uber/tcheck
-
-RUN glide install
-
-RUN go install
-
-
 # Build Cadence binaries
-FROM golang:1.12.7-alpine AS builder
+FROM golang:1.17.13-alpine3.15 AS builder
 
-RUN apk add --update --no-cache ca-certificates make git curl mercurial bzr
+ARG RELEASE_VERSION
+
+RUN apk add --update --no-cache ca-certificates make git curl mercurial unzip bash
 
 WORKDIR /cadence
 
@@ -39,11 +20,17 @@ COPY go.* ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 make copyright cadence-cassandra-tool cadence-sql-tool cadence cadence-server
+RUN rm -fr .bin .build
+
+ENV CADENCE_RELEASE_VERSION=$RELEASE_VERSION
+
+# bypass codegen, use committed files.  must be run separately, before building things.
+RUN make .fake-codegen
+RUN CGO_ENABLED=0 make copyright cadence-cassandra-tool cadence-sql-tool cadence cadence-server cadence-bench cadence-canary
 
 
 # Download dockerize
-FROM alpine:3.10 AS dockerize
+FROM alpine:3.15 AS dockerize
 
 RUN apk add --no-cache openssl
 
@@ -54,8 +41,9 @@ RUN wget https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSI
     && echo "**** fix for host id mapping error ****" \
     && chown root:root /usr/local/bin/dockerize
 
+
 # Alpine base image
-FROM alpine:3.10 AS alpine
+FROM alpine:3.15 AS alpine
 
 RUN apk add --update --no-cache ca-certificates tzdata bash curl
 
@@ -72,7 +60,6 @@ FROM alpine AS cadence-server
 ENV CADENCE_HOME /etc/cadence
 RUN mkdir -p /etc/cadence
 
-COPY --from=tcheck /go/bin/tcheck /usr/local/bin
 COPY --from=dockerize /usr/local/bin/dockerize /usr/local/bin
 COPY --from=builder /cadence/cadence-cassandra-tool /usr/local/bin
 COPY --from=builder /cadence/cadence-sql-tool /usr/local/bin
@@ -82,6 +69,7 @@ COPY --from=builder /cadence/schema /etc/cadence/schema
 
 COPY docker/entrypoint.sh /docker-entrypoint.sh
 COPY config/dynamicconfig /etc/cadence/config/dynamicconfig
+COPY config/credentials /etc/cadence/config/credentials
 COPY docker/config_template.yaml /etc/cadence/config
 COPY docker/start-cadence.sh /start-cadence.sh
 
@@ -97,8 +85,8 @@ CMD /start-cadence.sh
 # All-in-one Cadence server
 FROM cadence-server AS cadence-auto-setup
 
-RUN apk add --update --no-cache ca-certificates py-pip mysql-client
-RUN pip install cqlsh
+RUN apk add --update --no-cache ca-certificates py3-pip mysql-client
+RUN pip3 install cqlsh && cqlsh --version
 
 COPY docker/start.sh /start.sh
 
@@ -108,11 +96,25 @@ CMD /start.sh
 # Cadence CLI
 FROM alpine AS cadence-cli
 
-COPY --from=tcheck /go/bin/tcheck /usr/local/bin
 COPY --from=builder /cadence/cadence /usr/local/bin
 
 ENTRYPOINT ["cadence"]
 
+# Cadence Canary
+FROM alpine AS cadence-canary
+
+COPY --from=builder /cadence/cadence-canary /usr/local/bin
+COPY --from=builder /cadence/cadence /usr/local/bin
+
+CMD ["/usr/local/bin/cadence-canary", "--root", "/etc/cadence-canary", "start"]
+
+# Cadence Bench
+FROM alpine AS cadence-bench
+
+COPY --from=builder /cadence/cadence-bench /usr/local/bin
+COPY --from=builder /cadence/cadence /usr/local/bin
+
+CMD ["/usr/local/bin/cadence-bench", "--root", "/etc/cadence-bench", "start"]
 
 # Final image
 FROM cadence-${TARGET}

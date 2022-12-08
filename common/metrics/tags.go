@@ -20,107 +20,183 @@
 
 package metrics
 
+import (
+	"strconv"
+)
+
 const (
-	revisionTag     = "revision"
-	branchTag       = "branch"
-	buildDateTag    = "build_date"
-	buildVersionTag = "build_version"
-	goVersionTag    = "go_version"
+	revisionTag       = "revision"
+	branchTag         = "branch"
+	buildDateTag      = "build_date"
+	buildVersionTag   = "build_version"
+	goVersionTag      = "go_version"
+	cadenceVersionTag = "cadence_version"
 
-	instance      = "instance"
-	domain        = "domain"
-	targetCluster = "target_cluster"
+	instance               = "instance"
+	domain                 = "domain"
+	domainType             = "domain_type"
+	clusterGroup           = "cluster_group"
+	sourceCluster          = "source_cluster"
+	targetCluster          = "target_cluster"
+	activeCluster          = "active_cluster"
+	taskList               = "tasklist"
+	taskListType           = "tasklistType"
+	workflowType           = "workflowType"
+	activityType           = "activityType"
+	decisionType           = "decisionType"
+	invariantType          = "invariantType"
+	shardScannerScanResult = "shardscanner_scan_result"
+	shardScannerFixResult  = "shardscanner_fix_result"
+	kafkaPartition         = "kafkaPartition"
+	transport              = "transport"
+	caller                 = "caller"
+	signalName             = "signalName"
 
-	domainAllValue = "all"
-	unknownValue   = "_unknown_"
+	allValue     = "all"
+	unknownValue = "_unknown_"
 )
 
 // Tag is an interface to define metrics tags
-type Tag interface {
-	Key() string
-	Value() string
-}
-
 type (
-	domainTag struct {
-		value string
+	Tag interface {
+		Key() string
+		Value() string
 	}
 
-	domainUnknownTag struct{}
-
-	instanceTag struct {
-		value string
-	}
-
-	targetClusterTag struct {
+	simpleMetric struct {
+		key   string
 		value string
 	}
 )
+
+func (s simpleMetric) Key() string   { return s.key }
+func (s simpleMetric) Value() string { return s.value }
+
+func metricWithUnknown(key, value string) Tag {
+	if len(value) == 0 {
+		value = unknownValue
+	}
+	return simpleMetric{key: key, value: value}
+}
 
 // DomainTag returns a new domain tag. For timers, this also ensures that we
 // dual emit the metric with the all tag. If a blank domain is provided then
 // this converts that to an unknown domain.
 func DomainTag(value string) Tag {
-	if len(value) == 0 {
-		value = unknownValue
+	return metricWithUnknown(domain, value)
+}
+
+// DomainTypeTag returns a tag for domain type.
+// This allows differentiating between global/local domains.
+func DomainTypeTag(isGlobal bool) Tag {
+	var value string
+	if isGlobal {
+		value = "global"
+	} else {
+		value = "local"
 	}
-	return domainTag{value}
-}
-
-// Key returns the key of the domain tag
-func (d domainTag) Key() string {
-	return domain
-}
-
-// Value returns the value of a domain tag
-func (d domainTag) Value() string {
-	return d.value
+	return simpleMetric{key: domainType, value: value}
 }
 
 // DomainUnknownTag returns a new domain:unknown tag-value
 func DomainUnknownTag() Tag {
-	return domainUnknownTag{}
+	return DomainTag("")
 }
 
-// Key returns the key of the domain unknown tag
-func (d domainUnknownTag) Key() string {
-	return domain
-}
-
-// Value returns the value of the domain unknown tag
-func (d domainUnknownTag) Value() string {
-	return unknownValue
+// ClusterGroupTag return a new cluster group tag
+func ClusterGroupTag(value string) Tag {
+	return simpleMetric{key: clusterGroup, value: value}
 }
 
 // InstanceTag returns a new instance tag
 func InstanceTag(value string) Tag {
-	return instanceTag{value}
+	return simpleMetric{key: instance, value: value}
 }
 
-// Key returns the key of the instance tag
-func (i instanceTag) Key() string {
-	return instance
-}
-
-// Value returns the value of a instance tag
-func (i instanceTag) Value() string {
-	return i.value
+// SourceClusterTag returns a new source cluster tag.
+func SourceClusterTag(value string) Tag {
+	return metricWithUnknown(sourceCluster, value)
 }
 
 // TargetClusterTag returns a new target cluster tag.
 func TargetClusterTag(value string) Tag {
+	return metricWithUnknown(targetCluster, value)
+}
+
+// ActiveClusterTag returns a new active cluster type tag.
+func ActiveClusterTag(value string) Tag {
+	return metricWithUnknown(activeCluster, value)
+}
+
+// TaskListTag returns a new task list tag.
+func TaskListTag(value string) Tag {
 	if len(value) == 0 {
 		value = unknownValue
 	}
-	return targetClusterTag{value}
+	return simpleMetric{key: taskList, value: sanitizer.Value(value)}
 }
 
-// Key returns the key of the target cluster tag
-func (d targetClusterTag) Key() string {
-	return targetCluster
+// TaskListUnknownTag returns a new tasklist:unknown tag-value
+func TaskListUnknownTag() Tag {
+	return simpleMetric{key: taskList, value: unknownValue}
 }
 
-// Value returns the value of a target cluster tag
-func (d targetClusterTag) Value() string {
-	return d.value
+// TaskListTypeTag returns a new task list type tag.
+func TaskListTypeTag(value string) Tag {
+	return metricWithUnknown(taskListType, value)
+}
+
+// WorkflowTypeTag returns a new workflow type tag.
+func WorkflowTypeTag(value string) Tag {
+	return metricWithUnknown(workflowType, value)
+}
+
+// ActivityTypeTag returns a new activity type tag.
+func ActivityTypeTag(value string) Tag {
+	return metricWithUnknown(activityType, value)
+}
+
+// DecisionTypeTag returns a new decision type tag.
+func DecisionTypeTag(value string) Tag {
+	return metricWithUnknown(decisionType, value)
+}
+
+// ShardScannerScanResult returns a new shardscanner scan result type tag.
+func ShardScannerScanResult(value string) Tag {
+	return metricWithUnknown(shardScannerScanResult, value)
+}
+
+// ShardScannerFixResult returns a new shardscanner fix result type tag.
+func ShardScannerFixResult(value string) Tag {
+	return metricWithUnknown(shardScannerFixResult, value)
+}
+
+// InvariantTypeTag returns a new invariant type tag.
+func InvariantTypeTag(value string) Tag {
+	return metricWithUnknown(invariantType, value)
+}
+
+// KafkaPartitionTag returns a new KafkaPartition type tag.
+func KafkaPartitionTag(value int32) Tag {
+	return simpleMetric{key: kafkaPartition, value: strconv.Itoa(int(value))}
+}
+
+// TransportTag returns a new RPC Transport type tag.
+func TransportTag(value string) Tag {
+	return simpleMetric{key: transport, value: value}
+}
+
+// CallerTag returns a new RPC Caller type tag.
+func CallerTag(value string) Tag {
+	return simpleMetric{key: caller, value: value}
+}
+
+// SignalNameTag returns a new SignalName tag
+func SignalNameTag(value string) Tag {
+	return metricWithUnknown(signalName, value)
+}
+
+// SignalNameAllTag returns a new SignalName tag with all value
+func SignalNameAllTag() Tag {
+	return metricWithUnknown(signalName, allValue)
 }

@@ -22,21 +22,44 @@ package cli
 
 import (
 	"os"
+	"time"
 
-	"github.com/olekukonko/tablewriter"
+	"github.com/uber/cadence/common/types"
+
 	"github.com/urfave/cli"
-	s "go.uber.org/cadence/.gen/go/shared"
+)
+
+type (
+	TaskListPollerRow struct {
+		ActivityIdentity string    `header:"Activity Poller Identity"`
+		DecisionIdentity string    `header:"Decision Poller Identity"`
+		LastAccessTime   time.Time `header:"Last Access Time"`
+	}
+	TaskListPartitionRow struct {
+		ActivityPartition string `header:"Activity Task List Partition"`
+		DecisionPartition string `header:"Decision Task List Partition"`
+		Host              string `header:"Host"`
+	}
 )
 
 // DescribeTaskList show pollers info of a given tasklist
 func DescribeTaskList(c *cli.Context) {
 	wfClient := getWorkflowClient(c)
+	domain := getRequiredGlobalOption(c, FlagDomain)
 	taskList := getRequiredOption(c, FlagTaskList)
 	taskListType := strToTaskListType(c.String(FlagTaskListType)) // default type is decision
 
 	ctx, cancel := newContext(c)
 	defer cancel()
-	response, err := wfClient.DescribeTaskList(ctx, taskList, taskListType)
+
+	request := &types.DescribeTaskListRequest{
+		Domain: domain,
+		TaskList: &types.TaskList{
+			Name: taskList,
+		},
+		TaskListType: &taskListType,
+	}
+	response, err := wfClient.DescribeTaskList(ctx, request)
 	if err != nil {
 		ErrorAndExit("Operation DescribeTaskList failed.", err)
 	}
@@ -46,18 +69,59 @@ func DescribeTaskList(c *cli.Context) {
 		ErrorAndExit(colorMagenta("No poller for tasklist: "+taskList), nil)
 	}
 
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetBorder(false)
-	table.SetColumnSeparator("|")
-	if taskListType == s.TaskListTypeActivity {
-		table.SetHeader([]string{"Activity Poller Identity", "Last Access Time"})
-	} else {
-		table.SetHeader([]string{"Decision Poller Identity", "Last Access Time"})
+	printTaskListPollers(pollers, taskListType)
+}
+
+// ListTaskListPartitions gets all the tasklist partition and host information.
+func ListTaskListPartitions(c *cli.Context) {
+	frontendClient := cFactory.ServerFrontendClient(c)
+	domain := getRequiredGlobalOption(c, FlagDomain)
+	taskList := getRequiredOption(c, FlagTaskList)
+
+	ctx, cancel := newContext(c)
+	defer cancel()
+	request := &types.ListTaskListPartitionsRequest{
+		Domain:   domain,
+		TaskList: &types.TaskList{Name: taskList},
 	}
-	table.SetHeaderLine(false)
-	table.SetHeaderColor(tableHeaderBlue, tableHeaderBlue)
+
+	response, err := frontendClient.ListTaskListPartitions(ctx, request)
+	if err != nil {
+		ErrorAndExit("Operation ListTaskListPartitions failed.", err)
+	}
+	if len(response.DecisionTaskListPartitions) > 0 {
+		printTaskListPartitions("Decision", response.DecisionTaskListPartitions)
+	}
+	if len(response.ActivityTaskListPartitions) > 0 {
+		printTaskListPartitions("Activity", response.ActivityTaskListPartitions)
+	}
+}
+
+func printTaskListPollers(pollers []*types.PollerInfo, taskListType types.TaskListType) {
+	table := []TaskListPollerRow{}
 	for _, poller := range pollers {
-		table.Append([]string{poller.GetIdentity(), convertTime(poller.GetLastAccessTime(), false)})
+		table = append(table, TaskListPollerRow{
+			ActivityIdentity: poller.GetIdentity(),
+			DecisionIdentity: poller.GetIdentity(),
+			LastAccessTime:   time.Unix(0, poller.GetLastAccessTime())})
 	}
-	table.Render()
+	RenderTable(os.Stdout, table, RenderOptions{Color: true, PrintDateTime: true, OptionalColumns: map[string]bool{
+		"Activity Poller Identity": taskListType == types.TaskListTypeActivity,
+		"Decision Poller Identity": taskListType == types.TaskListTypeDecision,
+	}})
+}
+
+func printTaskListPartitions(taskListType string, partitions []*types.TaskListPartitionMetadata) {
+	table := []TaskListPartitionRow{}
+	for _, partition := range partitions {
+		table = append(table, TaskListPartitionRow{
+			ActivityPartition: partition.GetKey(),
+			DecisionPartition: partition.GetKey(),
+			Host:              partition.GetOwnerHostName(),
+		})
+	}
+	RenderTable(os.Stdout, table, RenderOptions{Color: true, OptionalColumns: map[string]bool{
+		"Activity Task List Partition": taskListType == "Activity",
+		"Decision Task List Partition": taskListType == "Decision",
+	}})
 }

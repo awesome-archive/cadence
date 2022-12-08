@@ -23,13 +23,26 @@ package cli
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 
-	"github.com/olekukonko/tablewriter"
-	s "github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common"
 	"github.com/urfave/cli"
+
+	"github.com/uber/cadence/common/types"
+)
+
+type (
+	TaskListRow struct {
+		Name        string `header:"Task List Name"`
+		Type        string `header:"Type"`
+		PollerCount int    `header:"Poller Count"`
+	}
+	TaskListStatusRow struct {
+		ReadLevel int64 `header:"Read Level"`
+		AckLevel  int64 `header:"Ack Level"`
+		Backlog   int64 `header:"Backlog"`
+		StartID   int64 `header:"Lease Start TaskID"`
+		EndID     int64 `header:"Lease End TaskID"`
+	}
 )
 
 // AdminDescribeTaskList displays poller and status information of task list.
@@ -37,18 +50,18 @@ func AdminDescribeTaskList(c *cli.Context) {
 	frontendClient := cFactory.ServerFrontendClient(c)
 	domain := getRequiredGlobalOption(c, FlagDomain)
 	taskList := getRequiredOption(c, FlagTaskList)
-	taskListType := s.TaskListTypeDecision
+	taskListType := types.TaskListTypeDecision
 	if strings.ToLower(c.String(FlagTaskListType)) == "activity" {
-		taskListType = s.TaskListTypeActivity
+		taskListType = types.TaskListTypeActivity
 	}
 
 	ctx, cancel := newContext(c)
 	defer cancel()
-	request := &s.DescribeTaskListRequest{
-		Domain:                common.StringPtr(domain),
-		TaskList:              &s.TaskList{Name: common.StringPtr(taskList)},
+	request := &types.DescribeTaskListRequest{
+		Domain:                domain,
+		TaskList:              &types.TaskList{Name: taskList},
 		TaskListType:          &taskListType,
-		IncludeTaskListStatus: common.BoolPtr(true),
+		IncludeTaskListStatus: true,
 	}
 
 	response, err := frontendClient.DescribeTaskList(ctx, request)
@@ -67,39 +80,43 @@ func AdminDescribeTaskList(c *cli.Context) {
 	if len(pollers) == 0 {
 		ErrorAndExit(colorMagenta("No poller for tasklist: "+taskList), nil)
 	}
-	printPollerInfo(pollers, taskListType)
+	printTaskListPollers(pollers, taskListType)
 }
 
-func printTaskListStatus(taskListStatus *s.TaskListStatus) {
-	taskIDBlock := taskListStatus.GetTaskIDBlock()
+// AdminListTaskList displays all task lists under a domain.
+func AdminListTaskList(c *cli.Context) {
+	frontendClient := cFactory.ServerFrontendClient(c)
+	domain := getRequiredGlobalOption(c, FlagDomain)
 
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetBorder(false)
-	table.SetColumnSeparator("|")
-	table.SetHeader([]string{"Read Level", "Ack Level", "Backlog", "Lease Start TaskID", "Lease End TaskID"})
-	table.SetHeaderLine(false)
-	table.SetHeaderColor(tableHeaderBlue, tableHeaderBlue, tableHeaderBlue, tableHeaderBlue, tableHeaderBlue)
-	table.Append([]string{strconv.FormatInt(taskListStatus.GetReadLevel(), 10),
-		strconv.FormatInt(taskListStatus.GetAckLevel(), 10),
-		strconv.FormatInt(taskListStatus.GetBacklogCountHint(), 10),
-		strconv.FormatInt(taskIDBlock.GetStartID(), 10),
-		strconv.FormatInt(taskIDBlock.GetEndID(), 10)})
-	table.Render()
+	ctx, cancel := newContext(c)
+	defer cancel()
+	request := &types.GetTaskListsByDomainRequest{
+		Domain: domain,
+	}
+
+	response, err := frontendClient.GetTaskListsByDomain(ctx, request)
+	if err != nil {
+		ErrorAndExit("Operation GetTaskListByDomain failed.", err)
+	}
+
+	fmt.Println("Task Lists for domain " + domain + ":")
+	table := []TaskListRow{}
+	for name, taskList := range response.GetDecisionTaskListMap() {
+		table = append(table, TaskListRow{name, "Decision", len(taskList.GetPollers())})
+	}
+	for name, taskList := range response.GetActivityTaskListMap() {
+		table = append(table, TaskListRow{name, "Activity", len(taskList.GetPollers())})
+	}
+	RenderTable(os.Stdout, table, RenderOptions{Color: true, Border: true})
 }
 
-func printPollerInfo(pollers []*s.PollerInfo, taskListType s.TaskListType) {
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetBorder(false)
-	table.SetColumnSeparator("|")
-	if taskListType == s.TaskListTypeActivity {
-		table.SetHeader([]string{"Activity Poller Identity", "Last Access Time"})
-	} else {
-		table.SetHeader([]string{"Decision Poller Identity", "Last Access Time"})
-	}
-	table.SetHeaderLine(false)
-	table.SetHeaderColor(tableHeaderBlue, tableHeaderBlue)
-	for _, poller := range pollers {
-		table.Append([]string{poller.GetIdentity(), convertTime(poller.GetLastAccessTime(), false)})
-	}
-	table.Render()
+func printTaskListStatus(taskListStatus *types.TaskListStatus) {
+	table := []TaskListStatusRow{{
+		ReadLevel: taskListStatus.GetReadLevel(),
+		AckLevel:  taskListStatus.GetAckLevel(),
+		Backlog:   taskListStatus.GetBacklogCountHint(),
+		StartID:   taskListStatus.GetTaskIDBlock().GetStartID(),
+		EndID:     taskListStatus.GetTaskIDBlock().GetEndID(),
+	}}
+	RenderTable(os.Stdout, table, RenderOptions{Color: true})
 }

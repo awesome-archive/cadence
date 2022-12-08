@@ -18,6 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+//go:generate mockgen -package $GOPACKAGE -source $GOFILE -destination handler_mock.go -package matching github.com/uber/cadence/service/matching Handler
+
 package matching
 
 import (
@@ -25,316 +27,438 @@ import (
 	"sync"
 	"time"
 
-	"github.com/uber-go/tally"
-	"github.com/uber/cadence/.gen/go/health"
-	m "github.com/uber/cadence/.gen/go/matching"
-	"github.com/uber/cadence/.gen/go/matching/matchingserviceserver"
-	gen "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/metrics"
-	"github.com/uber/cadence/common/persistence"
 	"github.com/uber/cadence/common/quotas"
-	"github.com/uber/cadence/common/service"
+	"github.com/uber/cadence/common/types"
 )
 
-var _ matchingserviceserver.Interface = (*Handler)(nil)
+var _ Handler = (*handlerImpl)(nil)
 
-// Handler - Thrift handler inteface for history service
-type Handler struct {
-	taskPersistence persistence.TaskManager
-	metadataMgr     persistence.MetadataManager
-	engine          Engine
-	config          *Config
-	metricsClient   metrics.Client
-	startWG         sync.WaitGroup
-	domainCache     cache.DomainCache
-	rateLimiter     quotas.Limiter
-	service.Service
-}
+type (
+	// Handler interface for matching service
+	Handler interface {
+		common.Daemon
+
+		Health(context.Context) (*types.HealthStatus, error)
+		AddActivityTask(context.Context, *types.AddActivityTaskRequest) error
+		AddDecisionTask(context.Context, *types.AddDecisionTaskRequest) error
+		CancelOutstandingPoll(context.Context, *types.CancelOutstandingPollRequest) error
+		DescribeTaskList(context.Context, *types.MatchingDescribeTaskListRequest) (*types.DescribeTaskListResponse, error)
+		ListTaskListPartitions(context.Context, *types.MatchingListTaskListPartitionsRequest) (*types.ListTaskListPartitionsResponse, error)
+		GetTaskListsByDomain(context.Context, *types.GetTaskListsByDomainRequest) (*types.GetTaskListsByDomainResponse, error)
+		PollForActivityTask(context.Context, *types.MatchingPollForActivityTaskRequest) (*types.PollForActivityTaskResponse, error)
+		PollForDecisionTask(context.Context, *types.MatchingPollForDecisionTaskRequest) (*types.MatchingPollForDecisionTaskResponse, error)
+		QueryWorkflow(context.Context, *types.MatchingQueryWorkflowRequest) (*types.QueryWorkflowResponse, error)
+		RespondQueryTaskCompleted(context.Context, *types.MatchingRespondQueryTaskCompletedRequest) error
+	}
+
+	// handlerImpl is an implementation for matching service independent of wire protocol
+	handlerImpl struct {
+		engine            Engine
+		metricsClient     metrics.Client
+		startWG           sync.WaitGroup
+		userRateLimiter   quotas.Policy
+		workerRateLimiter quotas.Policy
+		logger            log.Logger
+		throttledLogger   log.Logger
+		domainCache       cache.DomainCache
+	}
+)
 
 var (
-	errMatchingHostThrottle = &gen.ServiceBusyError{Message: "Matching host rps exceeded"}
+	errMatchingHostThrottle = &types.ServiceBusyError{Message: "Matching host rps exceeded"}
 )
 
 // NewHandler creates a thrift handler for the history service
-func NewHandler(sVice service.Service, config *Config, taskPersistence persistence.TaskManager, metadataMgr persistence.MetadataManager) *Handler {
-	handler := &Handler{
-		Service:         sVice,
-		taskPersistence: taskPersistence,
-		metadataMgr:     metadataMgr,
-		config:          config,
-		rateLimiter: quotas.NewDynamicRateLimiter(func() float64 {
-			return float64(config.RPS())
-		}),
+func NewHandler(
+	engine Engine,
+	config *Config,
+	domainCache cache.DomainCache,
+	metricsClient metrics.Client,
+	logger log.Logger,
+	throttledLogger log.Logger,
+) Handler {
+	handler := &handlerImpl{
+		metricsClient: metricsClient,
+		userRateLimiter: quotas.NewMultiStageRateLimiter(
+			quotas.NewDynamicRateLimiter(config.UserRPS.AsFloat64()),
+			quotas.NewCollection(quotas.DynamicRateLimiterFactory(
+				func(domain string) float64 {
+					domainRPS := float64(config.DomainUserRPS(domain))
+					if domainRPS > 0 {
+						return domainRPS
+					}
+					// if domain rps not set, use host rps to keep the old behavior
+					return float64(config.UserRPS())
+				})),
+		),
+		workerRateLimiter: quotas.NewMultiStageRateLimiter(
+			quotas.NewDynamicRateLimiter(config.WorkerRPS.AsFloat64()),
+			quotas.NewCollection(quotas.DynamicRateLimiterFactory(
+				func(domain string) float64 {
+					domainRPS := float64(config.DomainWorkerRPS(domain))
+					if domainRPS > 0 {
+						return domainRPS
+					}
+					// if domain rps not set, use host rps to keep the old behavior
+					return float64(config.WorkerRPS())
+				})),
+		),
+		engine:          engine,
+		logger:          logger,
+		throttledLogger: throttledLogger,
+		domainCache:     domainCache,
 	}
 	// prevent us from trying to serve requests before matching engine is started and ready
 	handler.startWG.Add(1)
 	return handler
 }
 
-// RegisterHandler register this handler, must be called before Start()
-func (h *Handler) RegisterHandler() {
-	h.Service.GetDispatcher().Register(matchingserviceserver.New(h))
-}
-
 // Start starts the handler
-func (h *Handler) Start() error {
-	h.Service.Start()
-
-	h.domainCache = cache.NewDomainCache(h.metadataMgr, h.GetClusterMetadata(), h.GetMetricsClient(), h.GetLogger())
-	h.domainCache.Start()
-	h.metricsClient = h.Service.GetMetricsClient()
-	client, err := h.Service.GetClientBean().GetMatchingClient(h.domainCache.GetDomainName)
-	if err != nil {
-		return err
-	}
-	h.engine = NewEngine(
-		h.taskPersistence,
-		h.GetClientBean().GetHistoryClient(),
-		client,
-		h.config,
-		h.Service.GetLogger(),
-		h.Service.GetMetricsClient(),
-		h.domainCache,
-	)
+func (h *handlerImpl) Start() {
 	h.startWG.Done()
-	return nil
 }
 
 // Stop stops the handler
-func (h *Handler) Stop() {
+func (h *handlerImpl) Stop() {
 	h.engine.Stop()
-	h.domainCache.Stop()
-	h.taskPersistence.Close()
-	h.metadataMgr.Close()
-	h.Service.Stop()
 }
 
 // Health is for health check
-func (h *Handler) Health(ctx context.Context) (*health.HealthStatus, error) {
+func (h *handlerImpl) Health(ctx context.Context) (*types.HealthStatus, error) {
 	h.startWG.Wait()
-	h.GetLogger().Debug("Matching service health check endpoint reached.")
-	hs := &health.HealthStatus{Ok: true, Msg: common.StringPtr("matching good")}
+	h.logger.Debug("Matching service health check endpoint reached.")
+	hs := &types.HealthStatus{Ok: true, Msg: "matching good"}
 	return hs, nil
 }
 
-// startRequestProfile initiates recording of request metrics
-func (h *Handler) startRequestProfile(api string, scope int) tally.Stopwatch {
-	h.startWG.Wait()
-	sw := h.metricsClient.StartTimer(scope, metrics.CadenceLatency)
-	h.metricsClient.IncCounter(scope, metrics.CadenceRequests)
-	return sw
+func (h *handlerImpl) newHandlerContext(
+	ctx context.Context,
+	domainName string,
+	taskList *types.TaskList,
+	scope int,
+) *handlerContext {
+	return newHandlerContext(
+		ctx,
+		domainName,
+		taskList,
+		h.metricsClient,
+		scope,
+		h.logger,
+	)
 }
 
 // AddActivityTask - adds an activity task.
-func (h *Handler) AddActivityTask(ctx context.Context, addRequest *m.AddActivityTaskRequest) (retError error) {
-	defer log.CapturePanic(h.GetLogger(), &retError)
+func (h *handlerImpl) AddActivityTask(
+	ctx context.Context,
+	request *types.AddActivityTaskRequest,
+) (retError error) {
+	defer func() { log.CapturePanic(recover(), h.logger, &retError) }()
+
 	startT := time.Now()
-	scope := metrics.MatchingAddActivityTaskScope
-	sw := h.startRequestProfile("AddActivityTask", scope)
+	domainName := h.domainName(request.GetDomainUUID())
+	hCtx := h.newHandlerContext(
+		ctx,
+		domainName,
+		request.GetTaskList(),
+		metrics.MatchingAddActivityTaskScope,
+	)
+
+	sw := hCtx.startProfiling(&h.startWG)
 	defer sw.Stop()
 
-	if addRequest.GetForwardedFrom() != "" {
-		h.metricsClient.IncCounter(scope, metrics.ForwardedCounter)
+	if request.GetForwardedFrom() != "" {
+		hCtx.scope.IncCounter(metrics.ForwardedPerTaskListCounter)
 	}
 
-	if ok := h.rateLimiter.Allow(); !ok {
-		return h.handleErr(errMatchingHostThrottle, scope)
+	if ok := h.workerRateLimiter.Allow(quotas.Info{Domain: domainName}); !ok {
+		return hCtx.handleErr(errMatchingHostThrottle)
 	}
 
-	syncMatch, err := h.engine.AddActivityTask(ctx, addRequest)
+	syncMatch, err := h.engine.AddActivityTask(hCtx, request)
 	if syncMatch {
-		h.metricsClient.RecordTimer(scope, metrics.SyncMatchLatency, time.Since(startT))
+		hCtx.scope.RecordTimer(metrics.SyncMatchLatencyPerTaskList, time.Since(startT))
 	}
 
-	return h.handleErr(err, scope)
+	return hCtx.handleErr(err)
 }
 
 // AddDecisionTask - adds a decision task.
-func (h *Handler) AddDecisionTask(ctx context.Context, addRequest *m.AddDecisionTaskRequest) (retError error) {
-	defer log.CapturePanic(h.GetLogger(), &retError)
+func (h *handlerImpl) AddDecisionTask(
+	ctx context.Context,
+	request *types.AddDecisionTaskRequest,
+) (retError error) {
+	defer func() { log.CapturePanic(recover(), h.logger, &retError) }()
+
 	startT := time.Now()
-	scope := metrics.MatchingAddDecisionTaskScope
-	sw := h.startRequestProfile("AddDecisionTask", scope)
+	domainName := h.domainName(request.GetDomainUUID())
+	hCtx := h.newHandlerContext(
+		ctx,
+		domainName,
+		request.GetTaskList(),
+		metrics.MatchingAddDecisionTaskScope,
+	)
+
+	sw := hCtx.startProfiling(&h.startWG)
 	defer sw.Stop()
 
-	if addRequest.GetForwardedFrom() != "" {
-		h.metricsClient.IncCounter(scope, metrics.ForwardedCounter)
+	if request.GetForwardedFrom() != "" {
+		hCtx.scope.IncCounter(metrics.ForwardedPerTaskListCounter)
 	}
 
-	if ok := h.rateLimiter.Allow(); !ok {
-		return h.handleErr(errMatchingHostThrottle, scope)
+	if ok := h.workerRateLimiter.Allow(quotas.Info{Domain: domainName}); !ok {
+		return hCtx.handleErr(errMatchingHostThrottle)
 	}
 
-	syncMatch, err := h.engine.AddDecisionTask(ctx, addRequest)
+	syncMatch, err := h.engine.AddDecisionTask(hCtx, request)
 	if syncMatch {
-		h.metricsClient.RecordTimer(scope, metrics.SyncMatchLatency, time.Since(startT))
+		hCtx.scope.RecordTimer(metrics.SyncMatchLatencyPerTaskList, time.Since(startT))
 	}
-	return h.handleErr(err, scope)
+	return hCtx.handleErr(err)
 }
 
 // PollForActivityTask - long poll for an activity task.
-func (h *Handler) PollForActivityTask(ctx context.Context,
-	pollRequest *m.PollForActivityTaskRequest) (resp *gen.PollForActivityTaskResponse, retError error) {
-	defer log.CapturePanic(h.GetLogger(), &retError)
+func (h *handlerImpl) PollForActivityTask(
+	ctx context.Context,
+	request *types.MatchingPollForActivityTaskRequest,
+) (resp *types.PollForActivityTaskResponse, retError error) {
+	defer func() { log.CapturePanic(recover(), h.logger, &retError) }()
 
-	scope := metrics.MatchingPollForActivityTaskScope
-	sw := h.startRequestProfile("PollForActivityTask", scope)
+	domainName := h.domainName(request.GetDomainUUID())
+	hCtx := h.newHandlerContext(
+		ctx,
+		domainName,
+		request.GetPollRequest().GetTaskList(),
+		metrics.MatchingPollForActivityTaskScope,
+	)
+
+	sw := hCtx.startProfiling(&h.startWG)
 	defer sw.Stop()
 
-	if pollRequest.GetForwardedFrom() != "" {
-		h.metricsClient.IncCounter(scope, metrics.ForwardedCounter)
+	if request.GetForwardedFrom() != "" {
+		hCtx.scope.IncCounter(metrics.ForwardedPerTaskListCounter)
 	}
 
-	if ok := h.rateLimiter.Allow(); !ok {
-		return nil, h.handleErr(errMatchingHostThrottle, scope)
+	if ok := h.workerRateLimiter.Allow(quotas.Info{Domain: domainName}); !ok {
+		return nil, hCtx.handleErr(errMatchingHostThrottle)
 	}
 
-	if _, err := common.ValidateLongPollContextTimeoutIsSet(
-		ctx,
+	if _, err := common.ValidateLongPollContextTimeoutIsSet(ctx,
 		"PollForActivityTask",
-		h.Service.GetThrottledLogger(),
+		h.throttledLogger,
 	); err != nil {
-		return nil, h.handleErr(err, scope)
+		return nil, hCtx.handleErr(err)
 	}
 
-	response, err := h.engine.PollForActivityTask(ctx, pollRequest)
-	return response, h.handleErr(err, scope)
+	response, err := h.engine.PollForActivityTask(hCtx, request)
+	return response, hCtx.handleErr(err)
 }
 
 // PollForDecisionTask - long poll for a decision task.
-func (h *Handler) PollForDecisionTask(ctx context.Context,
-	pollRequest *m.PollForDecisionTaskRequest) (resp *m.PollForDecisionTaskResponse, retError error) {
-	defer log.CapturePanic(h.GetLogger(), &retError)
+func (h *handlerImpl) PollForDecisionTask(
+	ctx context.Context,
+	request *types.MatchingPollForDecisionTaskRequest,
+) (resp *types.MatchingPollForDecisionTaskResponse, retError error) {
+	defer func() { log.CapturePanic(recover(), h.logger, &retError) }()
 
-	scope := metrics.MatchingPollForDecisionTaskScope
-	sw := h.startRequestProfile("PollForDecisionTask", scope)
+	domainName := h.domainName(request.GetDomainUUID())
+	hCtx := h.newHandlerContext(
+		ctx,
+		domainName,
+		request.GetPollRequest().GetTaskList(),
+		metrics.MatchingPollForDecisionTaskScope,
+	)
+
+	sw := hCtx.startProfiling(&h.startWG)
 	defer sw.Stop()
 
-	if pollRequest.GetForwardedFrom() != "" {
-		h.metricsClient.IncCounter(scope, metrics.ForwardedCounter)
+	if request.GetForwardedFrom() != "" {
+		hCtx.scope.IncCounter(metrics.ForwardedPerTaskListCounter)
 	}
 
-	if ok := h.rateLimiter.Allow(); !ok {
-		return nil, h.handleErr(errMatchingHostThrottle, scope)
+	if ok := h.workerRateLimiter.Allow(quotas.Info{Domain: domainName}); !ok {
+		return nil, hCtx.handleErr(errMatchingHostThrottle)
 	}
 
 	if _, err := common.ValidateLongPollContextTimeoutIsSet(
 		ctx,
 		"PollForDecisionTask",
-		h.Service.GetThrottledLogger(),
+		h.throttledLogger,
 	); err != nil {
-		return nil, h.handleErr(err, scope)
+		return nil, hCtx.handleErr(err)
 	}
 
-	response, err := h.engine.PollForDecisionTask(ctx, pollRequest)
-	return response, h.handleErr(err, scope)
+	response, err := h.engine.PollForDecisionTask(hCtx, request)
+	return response, hCtx.handleErr(err)
 }
 
 // QueryWorkflow queries a given workflow synchronously and return the query result.
-func (h *Handler) QueryWorkflow(ctx context.Context,
-	queryRequest *m.QueryWorkflowRequest) (resp *gen.QueryWorkflowResponse, retError error) {
-	defer log.CapturePanic(h.GetLogger(), &retError)
-	scope := metrics.MatchingQueryWorkflowScope
-	sw := h.startRequestProfile("QueryWorkflow", scope)
+func (h *handlerImpl) QueryWorkflow(
+	ctx context.Context,
+	request *types.MatchingQueryWorkflowRequest,
+) (resp *types.QueryWorkflowResponse, retError error) {
+	defer func() { log.CapturePanic(recover(), h.logger, &retError) }()
+
+	domainName := h.domainName(request.GetDomainUUID())
+	hCtx := h.newHandlerContext(
+		ctx,
+		domainName,
+		request.GetTaskList(),
+		metrics.MatchingQueryWorkflowScope,
+	)
+
+	sw := hCtx.startProfiling(&h.startWG)
 	defer sw.Stop()
 
-	if queryRequest.GetForwardedFrom() != "" {
-		h.metricsClient.IncCounter(scope, metrics.ForwardedCounter)
+	if request.GetForwardedFrom() != "" {
+		hCtx.scope.IncCounter(metrics.ForwardedPerTaskListCounter)
 	}
 
-	if ok := h.rateLimiter.Allow(); !ok {
-		return nil, h.handleErr(errMatchingHostThrottle, scope)
+	if ok := h.userRateLimiter.Allow(quotas.Info{Domain: domainName}); !ok {
+		return nil, hCtx.handleErr(errMatchingHostThrottle)
 	}
 
-	response, err := h.engine.QueryWorkflow(ctx, queryRequest)
-	return response, h.handleErr(err, scope)
+	response, err := h.engine.QueryWorkflow(hCtx, request)
+	return response, hCtx.handleErr(err)
 }
 
 // RespondQueryTaskCompleted responds a query task completed
-func (h *Handler) RespondQueryTaskCompleted(ctx context.Context, request *m.RespondQueryTaskCompletedRequest) (retError error) {
-	defer log.CapturePanic(h.GetLogger(), &retError)
-	scope := metrics.MatchingRespondQueryTaskCompletedScope
-	sw := h.startRequestProfile("RespondQueryTaskCompleted", scope)
+func (h *handlerImpl) RespondQueryTaskCompleted(
+	ctx context.Context,
+	request *types.MatchingRespondQueryTaskCompletedRequest,
+) (retError error) {
+	defer func() { log.CapturePanic(recover(), h.logger, &retError) }()
+
+	domainName := h.domainName(request.GetDomainUUID())
+	hCtx := h.newHandlerContext(
+		ctx,
+		domainName,
+		request.GetTaskList(),
+		metrics.MatchingRespondQueryTaskCompletedScope,
+	)
+
+	sw := hCtx.startProfiling(&h.startWG)
 	defer sw.Stop()
 
 	// Count the request in the RPS, but we still accept it even if RPS is exceeded
-	h.rateLimiter.Allow()
+	h.workerRateLimiter.Allow(quotas.Info{Domain: domainName})
 
-	err := h.engine.RespondQueryTaskCompleted(ctx, request)
-	return h.handleErr(err, scope)
+	err := h.engine.RespondQueryTaskCompleted(hCtx, request)
+	return hCtx.handleErr(err)
 }
 
 // CancelOutstandingPoll is used to cancel outstanding pollers
-func (h *Handler) CancelOutstandingPoll(ctx context.Context,
-	request *m.CancelOutstandingPollRequest) (retError error) {
-	defer log.CapturePanic(h.GetLogger(), &retError)
-	scope := metrics.MatchingCancelOutstandingPollScope
-	sw := h.startRequestProfile("CancelOutstandingPoll", scope)
+func (h *handlerImpl) CancelOutstandingPoll(ctx context.Context,
+	request *types.CancelOutstandingPollRequest) (retError error) {
+	defer func() { log.CapturePanic(recover(), h.logger, &retError) }()
+
+	domainName := h.domainName(request.GetDomainUUID())
+	hCtx := h.newHandlerContext(
+		ctx,
+		domainName,
+		request.GetTaskList(),
+		metrics.MatchingCancelOutstandingPollScope,
+	)
+
+	sw := hCtx.startProfiling(&h.startWG)
 	defer sw.Stop()
 
 	// Count the request in the RPS, but we still accept it even if RPS is exceeded
-	h.rateLimiter.Allow()
+	h.workerRateLimiter.Allow(quotas.Info{Domain: domainName})
 
-	err := h.engine.CancelOutstandingPoll(ctx, request)
-	return h.handleErr(err, scope)
+	err := h.engine.CancelOutstandingPoll(hCtx, request)
+	return hCtx.handleErr(err)
 }
 
 // DescribeTaskList returns information about the target tasklist, right now this API returns the
 // pollers which polled this tasklist in last few minutes. If includeTaskListStatus field is true,
 // it will also return status of tasklist's ackManager (readLevel, ackLevel, backlogCountHint and taskIDBlock).
-func (h *Handler) DescribeTaskList(ctx context.Context, request *m.DescribeTaskListRequest) (resp *gen.DescribeTaskListResponse, retError error) {
-	defer log.CapturePanic(h.GetLogger(), &retError)
-	scope := metrics.MatchingDescribeTaskListScope
-	sw := h.startRequestProfile("DescribeTaskList", scope)
+func (h *handlerImpl) DescribeTaskList(
+	ctx context.Context,
+	request *types.MatchingDescribeTaskListRequest,
+) (resp *types.DescribeTaskListResponse, retError error) {
+	defer func() { log.CapturePanic(recover(), h.logger, &retError) }()
+
+	domainName := h.domainName(request.GetDomainUUID())
+	hCtx := h.newHandlerContext(
+		ctx,
+		domainName,
+		request.GetDescRequest().GetTaskList(),
+		metrics.MatchingDescribeTaskListScope,
+	)
+
+	sw := hCtx.startProfiling(&h.startWG)
 	defer sw.Stop()
 
-	if ok := h.rateLimiter.Allow(); !ok {
-		return nil, h.handleErr(errMatchingHostThrottle, scope)
+	if ok := h.userRateLimiter.Allow(quotas.Info{Domain: domainName}); !ok {
+		return nil, hCtx.handleErr(errMatchingHostThrottle)
 	}
 
-	response, err := h.engine.DescribeTaskList(ctx, request)
-	return response, h.handleErr(err, scope)
+	response, err := h.engine.DescribeTaskList(hCtx, request)
+	return response, hCtx.handleErr(err)
 }
 
-func (h *Handler) handleErr(err error, scope int) error {
+// ListTaskListPartitions returns information about partitions for a taskList
+func (h *handlerImpl) ListTaskListPartitions(
+	ctx context.Context,
+	request *types.MatchingListTaskListPartitionsRequest,
+) (resp *types.ListTaskListPartitionsResponse, retError error) {
+	defer func() { log.CapturePanic(recover(), h.logger, &retError) }()
 
-	if err == nil {
-		return nil
+	hCtx := newHandlerContext(
+		ctx,
+		request.GetDomain(),
+		request.GetTaskList(),
+		h.metricsClient,
+		metrics.MatchingListTaskListPartitionsScope,
+		h.logger,
+	)
+
+	sw := hCtx.startProfiling(&h.startWG)
+	defer sw.Stop()
+
+	if ok := h.userRateLimiter.Allow(quotas.Info{Domain: request.GetDomain()}); !ok {
+		return nil, hCtx.handleErr(errMatchingHostThrottle)
 	}
 
-	switch err.(type) {
-	case *gen.InternalServiceError:
-		h.metricsClient.IncCounter(scope, metrics.CadenceFailures)
-		return err
-	case *gen.BadRequestError:
-		h.metricsClient.IncCounter(scope, metrics.CadenceErrBadRequestCounter)
-		return err
-	case *gen.EntityNotExistsError:
-		h.metricsClient.IncCounter(scope, metrics.CadenceErrEntityNotExistsCounter)
-		return err
-	case *gen.WorkflowExecutionAlreadyStartedError:
-		h.metricsClient.IncCounter(scope, metrics.CadenceErrExecutionAlreadyStartedCounter)
-		return err
-	case *gen.DomainAlreadyExistsError:
-		h.metricsClient.IncCounter(scope, metrics.CadenceErrDomainAlreadyExistsCounter)
-		return err
-	case *gen.QueryFailedError:
-		h.metricsClient.IncCounter(scope, metrics.CadenceErrQueryFailedCounter)
-		return err
-	case *gen.LimitExceededError:
-		h.metricsClient.IncCounter(scope, metrics.CadenceErrLimitExceededCounter)
-		return err
-	case *gen.ServiceBusyError:
-		h.metricsClient.IncCounter(scope, metrics.CadenceErrServiceBusyCounter)
-		return err
-	case *gen.DomainNotActiveError:
-		h.metricsClient.IncCounter(scope, metrics.CadenceErrDomainNotActiveCounter)
-		return err
-	default:
-		h.metricsClient.IncCounter(scope, metrics.CadenceFailures)
-		return &gen.InternalServiceError{Message: err.Error()}
+	response, err := h.engine.ListTaskListPartitions(hCtx, request)
+	return response, hCtx.handleErr(err)
+}
+
+// GetTaskListsByDomain returns information about partitions for a taskList
+func (h *handlerImpl) GetTaskListsByDomain(
+	ctx context.Context,
+	request *types.GetTaskListsByDomainRequest,
+) (resp *types.GetTaskListsByDomainResponse, retError error) {
+	defer func() { log.CapturePanic(recover(), h.logger, &retError) }()
+
+	hCtx := newHandlerContext(
+		ctx,
+		request.GetDomain(),
+		nil,
+		h.metricsClient,
+		metrics.MatchingGetTaskListsByDomainScope,
+		h.logger,
+	)
+
+	sw := hCtx.startProfiling(&h.startWG)
+	defer sw.Stop()
+
+	if ok := h.userRateLimiter.Allow(quotas.Info{Domain: request.GetDomain()}); !ok {
+		return nil, hCtx.handleErr(errMatchingHostThrottle)
 	}
+
+	response, err := h.engine.GetTaskListsByDomain(hCtx, request)
+	return response, hCtx.handleErr(err)
+}
+
+func (h *handlerImpl) domainName(id string) string {
+	domainName, err := h.domainCache.GetDomainName(id)
+	if err != nil {
+		return ""
+	}
+	return domainName
 }

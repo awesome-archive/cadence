@@ -21,99 +21,123 @@
 package validator
 
 import (
-	"github.com/stretchr/testify/suite"
-	"github.com/uber/cadence/.gen/go/shared"
-	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/definition"
-	"github.com/uber/cadence/common/service/dynamicconfig"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/uber/cadence/common/definition"
+	"github.com/uber/cadence/common/dynamicconfig"
 )
 
-type queryValidatorSuite struct {
-	suite.Suite
-}
+func TestValidateQuery(t *testing.T) {
+	tests := []struct {
+		msg       string
+		query     string
+		validated string
+		err       string
+	}{
+		{
+			msg:       "empty query",
+			query:     "",
+			validated: "",
+		},
+		{
+			msg:       "simple query",
+			query:     "WorkflowID = 'wid'",
+			validated: "WorkflowID = 'wid'",
+		},
+		{
+			msg:       "custom field",
+			query:     "CustomStringField = 'custom'",
+			validated: "`Attr.CustomStringField` = 'custom'",
+		},
+		{
+			msg:       "complex query",
+			query:     "WorkflowID = 'wid' and ((CustomStringField = 'custom') or CustomIntField between 1 and 10)",
+			validated: "WorkflowID = 'wid' and ((`Attr.CustomStringField` = 'custom') or `Attr.CustomIntField` between 1 and 10)",
+		},
+		{
+			msg:   "invalid SQL",
+			query: "Invalid SQL",
+			err:   "Invalid query.",
+		},
+		{
+			msg:   "invalid where expression",
+			query: "InvalidWhereExpr",
+			err:   "invalid where clause",
+		},
+		{
+			msg:   "invalid comparison",
+			query: "WorkflowID = 'wid' and 1 < 2",
+			err:   "invalid comparison expression",
+		},
+		{
+			msg:   "invalid range",
+			query: "1 between 1 and 2 or WorkflowID = 'wid'",
+			err:   "invalid range expression",
+		},
+		{
+			msg:   "invalid search attribute in comparison",
+			query: "Invalid = 'a' and 1 < 2",
+			err:   "invalid search attribute \"Invalid\"",
+		},
+		{
+			msg:   "invalid search attribute in range",
+			query: "Invalid between 1 and 2 or WorkflowID = 'wid'",
+			err:   "invalid search attribute \"Invalid\"",
+		},
+		{
+			msg:       "only order by",
+			query:     "order by CloseTime desc",
+			validated: " order by CloseTime desc",
+		},
+		{
+			msg:       "only order by search attribute",
+			query:     "order by CustomIntField desc",
+			validated: " order by `Attr.CustomIntField` desc",
+		},
+		{
+			msg:       "condition + order by",
+			query:     "WorkflowID = 'wid' order by CloseTime desc",
+			validated: "WorkflowID = 'wid' order by CloseTime desc",
+		},
+		{
+			msg:   "invalid order by attribute",
+			query: "order by InvalidField desc",
+			err:   "invalid order by attribute",
+		},
+		{
+			msg:   "invalid order by attribute expr",
+			query: "order by 123",
+			err:   "invalid order by expression",
+		},
+		{
+			msg:   "security SQL injection - with another statement",
+			query: "WorkflowID = 'wid'; SELECT * FROM important_table;",
+			err:   "Invalid query.",
+		},
+		{
+			msg:   "security SQL injection - with always true expression",
+			query: "WorkflowID = 'wid' and (RunID = 'rid' or 1 = 1)",
+			err:   "invalid comparison expression",
+		},
+		{
+			msg:   "security SQL injection - with union",
+			query: "WorkflowID = 'wid' union select * from dummy",
+			err:   "Invalid select query.",
+		},
+	}
 
-func TestQueryValidatorSuite(t *testing.T) {
-	s := new(queryValidatorSuite)
-	suite.Run(t, s)
-}
-
-func (s *queryValidatorSuite) TestValidateListRequestForQuery() {
-	validSearchAttr := dynamicconfig.GetMapPropertyFn(definition.GetDefaultIndexedKeys())
-	qv := NewQueryValidator(validSearchAttr)
-
-	listRequest := &shared.ListWorkflowExecutionsRequest{}
-	s.Nil(qv.ValidateListRequestForQuery(listRequest))
-	s.Equal("", listRequest.GetQuery())
-
-	query := "WorkflowID = 'wid'"
-	listRequest.Query = common.StringPtr(query)
-	s.Nil(qv.ValidateListRequestForQuery(listRequest))
-	s.Equal(query, listRequest.GetQuery())
-
-	query = "CustomStringField = 'custom'"
-	listRequest.Query = common.StringPtr(query)
-	s.Nil(qv.ValidateListRequestForQuery(listRequest))
-	s.Equal("`Attr.CustomStringField` = 'custom'", listRequest.GetQuery())
-
-	query = "WorkflowID = 'wid' and ((CustomStringField = 'custom') or CustomIntField between 1 and 10)"
-	listRequest.Query = common.StringPtr(query)
-	s.Nil(qv.ValidateListRequestForQuery(listRequest))
-	s.Equal("WorkflowID = 'wid' and ((`Attr.CustomStringField` = 'custom') or `Attr.CustomIntField` between 1 and 10)", listRequest.GetQuery())
-
-	query = "Invalid SQL"
-	listRequest.Query = common.StringPtr(query)
-	s.Equal("BadRequestError{Message: Invalid query.}", qv.ValidateListRequestForQuery(listRequest).Error())
-
-	query = "InvalidWhereExpr"
-	listRequest.Query = common.StringPtr(query)
-	s.Equal("BadRequestError{Message: invalid where clause}", qv.ValidateListRequestForQuery(listRequest).Error())
-
-	// Invalid comparison
-	query = "WorkflowID = 'wid' and 1 < 2"
-	listRequest.Query = common.StringPtr(query)
-	s.Equal("BadRequestError{Message: invalid comparison expression}", qv.ValidateListRequestForQuery(listRequest).Error())
-
-	// Invalid range
-	query = "1 between 1 and 2 or WorkflowID = 'wid'"
-	listRequest.Query = common.StringPtr(query)
-	s.Equal("BadRequestError{Message: invalid range expression}", qv.ValidateListRequestForQuery(listRequest).Error())
-
-	// Invalid search attribute in comparison
-	query = "Invalid = 'a' and 1 < 2"
-	listRequest.Query = common.StringPtr(query)
-	s.Equal("BadRequestError{Message: invalid search attribute}", qv.ValidateListRequestForQuery(listRequest).Error())
-
-	// Invalid search attribute in range
-	query = "Invalid between 1 and 2 or WorkflowID = 'wid'"
-	listRequest.Query = common.StringPtr(query)
-	s.Equal("BadRequestError{Message: invalid search attribute}", qv.ValidateListRequestForQuery(listRequest).Error())
-
-	// only order by
-	query = "order by CloseTime desc"
-	listRequest.Query = common.StringPtr(query)
-	s.Nil(qv.ValidateListRequestForQuery(listRequest))
-	s.Equal(" "+query, listRequest.GetQuery())
-
-	// only order by search attribute
-	query = "order by CustomIntField desc"
-	listRequest.Query = common.StringPtr(query)
-	s.Nil(qv.ValidateListRequestForQuery(listRequest))
-	s.Equal(" order by `Attr.CustomIntField` desc", listRequest.GetQuery())
-
-	// condition + order by
-	query = "WorkflowID = 'wid' order by CloseTime desc"
-	listRequest.Query = common.StringPtr(query)
-	s.Nil(qv.ValidateListRequestForQuery(listRequest))
-	s.Equal(query, listRequest.GetQuery())
-
-	// invalid order by attribute
-	query = "order by InvalidField desc"
-	listRequest.Query = common.StringPtr(query)
-	s.Equal("BadRequestError{Message: invalid order by attribute}", qv.ValidateListRequestForQuery(listRequest).Error())
-
-	// invalid order by attribute expr
-	query = "order by 123"
-	listRequest.Query = common.StringPtr(query)
-	s.Equal("BadRequestError{Message: invalid order by expression}", qv.ValidateListRequestForQuery(listRequest).Error())
+	for _, tt := range tests {
+		t.Run(tt.msg, func(t *testing.T) {
+			validSearchAttr := dynamicconfig.GetMapPropertyFn(definition.GetDefaultIndexedKeys())
+			qv := NewQueryValidator(validSearchAttr)
+			validated, err := qv.ValidateQuery(tt.query)
+			if err != nil {
+				assert.Equal(t, tt.err, err.Error())
+			} else {
+				assert.Equal(t, tt.validated, validated)
+			}
+		})
+	}
 }
